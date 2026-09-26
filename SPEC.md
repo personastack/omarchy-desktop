@@ -1,0 +1,29 @@
+# PersonaStack for Omarchy specification
+
+## Purpose
+
+Provide a desktop client for PersonaStack on Omarchy with the complete user-visible functionality of `macos-desktop`.
+
+This app is not implemented. No Omarchy profile or feature is currently certified. The full required behavior and completion evidence live in the active workspace plan. This spec records the repository's ownership boundaries and current desired outcome.
+
+## Authority
+
+- `personastack-api` owns identity, authorization, workspaces, personas, product state, enrollment and revocation.
+- `my.personastack.ai` owns authenticated hosted pages, OAuth callbacks, browser-facing composition, notifications event data and pop-out routes.
+- `mcp` and `agent-gateway` own reviewed Desktop Control tools, typed request contracts, transport and routing.
+- This client will own Linux window presentation, the finite native bridge, local harness setup, protected machine credential custody, outbound connection lifecycle, and bounded GUI, filesystem and process execution.
+- Hyprland and Cua own their compositor and device-control interfaces. This application must use a pinned supported driver/plugin contract and must not claim support for behavior that the tested target profile cannot provide.
+
+The client must not create a second login, authorization service, integration store, product database, realtime event authority, MCP catalog or gateway protocol.
+
+## Supported environment
+
+No environment is currently supported. The first candidate is Omarchy Edge on x86_64 with an exact Omarchy, Hyprland, Electron, Cua Driver, Cua Hyprland input plugin and Secret Service profile recorded by the feasibility gate. ARM64, other Linux distributions, other compositors, stable-channel Omarchy and unsupported Cua applications are outside the initial claim until separately proven.
+
+## Security boundary
+
+Remote content receives only finite presentation messages from registered top-level windows at the configured PersonaStack app origin. Machine credentials stay in protected OS storage and native process memory. The API authorizes each workspace, persona and Desktop Control operation. Native execution accepts only reviewed typed operations under the current lease and scope. A failed or uncertain mutation is not replayed automatically.
+
+## Parity outcome
+
+Implement the required journeys in the active plan: hosted app/login and notifications; chat, stack and activity windows; Codex and Claude setup; installation enrollment and status; all reviewed GUI actions; bounded files and managed processes; lock, revocation, reconnect, packaging and lifecycle. Completion requires native evidence for the advertised Omarchy profile. A passing source test or tool response alone does not certify native behavior.

@@ -26,7 +26,7 @@ The detailed parity inventory and implementation checklist are maintained with t
 
 ## Security
 
-The client must not put machine credentials in a web renderer, browser storage, URLs, process arguments, MCP payloads, or logs. The hosted app and API remain responsible for user, workspace, persona, and integration authorization. Local commands and files are exposed only through PersonaStack's finite, authorized Desktop Control operations.
+The client must not put machine credentials in a web renderer, browser storage, URLs, process arguments, MCP payloads, or logs. The hosted app and API remain responsible for user, workspace, persona, and integration authorization. Local commands and files will be exposed only through PersonaStack's finite, authorized Desktop Control operations.
 
 ## Contributing
 
