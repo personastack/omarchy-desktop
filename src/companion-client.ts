@@ -25,7 +25,7 @@ export type DesktopControlState = Readonly<{
   user_paused: boolean;
 }>;
 
-export type LifecycleAction = "state" | "pause" | "resume";
+export type LifecycleAction = "state" | "pause" | "resume" | "disconnect";
 
 type DesktopControlPrepared = DesktopControlState;
 

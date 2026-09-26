@@ -47,8 +47,8 @@ test("companion client accepts the sync acknowledgment shape", async () => {
   await client.close();
 });
 
-test("companion client accepts typed pause and resume state replies", async () => {
-  for (const action of ["pause", "resume"] as const) {
+test("companion client accepts typed tray lifecycle state replies", async () => {
+  for (const action of ["pause", "resume", "disconnect"] as const) {
     const fake = createFakeChild();
     const client = new CompanionClient(fake.child);
     fake.stdin.on("data", (chunk: Buffer) => {

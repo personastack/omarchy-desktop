@@ -52,6 +52,7 @@ type installationService interface {
 	ReportReadiness(context.Context, string, apicontract.DesktopControlReadiness) error
 	Status(context.Context, string) (installation.Status, error)
 	LocalState(context.Context, string) (installation.LocalState, error)
+	Revoke(context.Context, string) error
 }
 
 type gateway interface {
@@ -127,6 +128,8 @@ type Controller struct {
 	setupDeadline           time.Time
 	recoveryChecked         bool
 	closed                  bool
+	disconnecting           bool
+	disconnected            bool
 	paused                  bool
 	userPaused              bool
 	closeComplete           bool
@@ -199,7 +202,7 @@ func (controller *Controller) Prepare(ctx context.Context, origin, ticket string
 		return installation.LocalState{}, ctx.Err()
 	}
 	controller.mu.Lock()
-	if controller.closed {
+	if controller.closed || controller.disconnecting {
 		controller.mu.Unlock()
 		return installation.LocalState{}, ErrUnavailable
 	}
@@ -250,6 +253,7 @@ func (controller *Controller) Prepare(ctx context.Context, origin, ticket string
 		}
 	}
 	controller.mu.Lock()
+	controller.disconnected = false
 	hadExecutor := controller.executor != nil
 	controller.mu.Unlock()
 	if err := controller.startExecutorAndMonitor(ctx); err != nil {
@@ -268,7 +272,7 @@ func (controller *Controller) Prepare(ctx context.Context, origin, ticket string
 	controller.recoveryChecked = true
 	controller.mu.Unlock()
 	connectErr := controller.reconcileGateway(ctx, installed)
-	controller.startReconnectLoop(installed)
+	controller.startReconnectLoop()
 	if connectErr != nil {
 		return installation.LocalState{}, connectErr
 	}
@@ -297,19 +301,33 @@ func (controller *Controller) Recover(ctx context.Context) error {
 		return ctx.Err()
 	}
 	controller.mu.Lock()
-	if controller.closed || controller.recoveryChecked || controller.executor != nil {
+	if controller.closed || controller.disconnecting || controller.disconnected || controller.recoveryChecked || controller.executor != nil {
 		controller.mu.Unlock()
 		return nil
 	}
-	if controller.userPaused {
+	userPaused := controller.userPaused
+	controller.mu.Unlock()
+	_, err := controller.installations.StoredInstallation(ctx, controller.origin)
+	if errors.Is(err, credentialstore.ErrCredentialMissing) {
+		if userPaused {
+			if err := controller.pausePreference.Save(controller.origin, false); err != nil {
+				return err
+			}
+			controller.mu.Lock()
+			controller.userPaused = false
+			controller.recoveryChecked = true
+			controller.mu.Unlock()
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if userPaused {
+		controller.mu.Lock()
 		controller.recoveryChecked = true
 		controller.mu.Unlock()
 		return nil
-	}
-	controller.mu.Unlock()
-	installed, err := controller.installations.StoredInstallation(ctx, controller.origin)
-	if err != nil {
-		return err
 	}
 	status, err := controller.installations.Status(ctx, controller.origin)
 	if err != nil || !status.RelayActive || !status.CredentialValid {
@@ -319,7 +337,7 @@ func (controller *Controller) Recover(ctx context.Context) error {
 		}
 		controller.mu.Unlock()
 		if err == nil && status.CredentialValid {
-			controller.startReconnectLoop(installed)
+			controller.startReconnectLoop()
 		}
 		return err
 	}
@@ -340,7 +358,7 @@ func (controller *Controller) Recover(ctx context.Context) error {
 	controller.paused = false
 	controller.recoveryChecked = true
 	controller.mu.Unlock()
-	controller.startReconnectLoop(installed)
+	controller.startReconnectLoop()
 	return nil
 }
 
@@ -349,7 +367,7 @@ func (controller *Controller) Recover(ctx context.Context) error {
 // active mapping or after restoring the local runtime.
 func (controller *Controller) StartRecovery() {
 	controller.mu.Lock()
-	if controller.closed || controller.recoveryChecked {
+	if controller.closed || controller.disconnecting || controller.disconnected || controller.recoveryChecked {
 		controller.mu.Unlock()
 		return
 	}
@@ -381,7 +399,7 @@ func (controller *Controller) startExecutorAndMonitor(ctx context.Context) error
 	defer controller.lockStateMu.Unlock()
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
-	if controller.closed {
+	if controller.closed || controller.disconnecting || controller.disconnected {
 		return ErrUnavailable
 	}
 	if controller.executor == nil {
@@ -492,7 +510,7 @@ func (controller *Controller) Pause(ctx context.Context) (installation.LocalStat
 		return installation.LocalState{}, ctx.Err()
 	}
 	controller.mu.Lock()
-	if controller.closed {
+	if controller.closed || controller.disconnecting || controller.disconnected {
 		controller.mu.Unlock()
 		return installation.LocalState{}, ErrUnavailable
 	}
@@ -502,9 +520,8 @@ func (controller *Controller) Pause(ctx context.Context) (installation.LocalStat
 	}
 	connection := controller.connection
 	controller.mu.Unlock()
-	installed, err := controller.installations.StoredInstallation(ctx, controller.origin)
-	if err != nil || installed.Validate(controller.origin) != nil {
-		return installation.LocalState{}, ErrUnavailable
+	if _, err := controller.installations.StoredInstallation(ctx, controller.origin); err != nil {
+		return installation.LocalState{}, err
 	}
 	if err := controller.pausePreference.Save(controller.origin, true); err != nil {
 		return installation.LocalState{}, err
@@ -534,6 +551,132 @@ func (controller *Controller) Pause(ctx context.Context) (installation.LocalStat
 	return controller.LocalState(ctx, controller.origin)
 }
 
+// Disconnect revokes every workspace mapping for this installation and then
+// removes its protected local credential. A failed revoke leaves execution
+// fenced and the credential available for a retry.
+func (controller *Controller) Disconnect(ctx context.Context) (installation.LocalState, error) {
+	if ctx == nil {
+		return installation.LocalState{}, ErrUnavailable
+	}
+	select {
+	case controller.prepareGate <- struct{}{}:
+		defer func() { <-controller.prepareGate }()
+	case <-ctx.Done():
+		return installation.LocalState{}, ctx.Err()
+	}
+	controller.mu.Lock()
+	if controller.closed || controller.disconnecting || controller.disconnected {
+		controller.mu.Unlock()
+		return installation.LocalState{}, ErrUnavailable
+	}
+	controller.disconnecting = true
+	controller.mu.Unlock()
+	defer func() {
+		controller.mu.Lock()
+		controller.disconnecting = false
+		controller.mu.Unlock()
+	}()
+	select {
+	case controller.connectGate <- struct{}{}:
+		defer func() { <-controller.connectGate }()
+	case <-ctx.Done():
+		return installation.LocalState{}, ctx.Err()
+	}
+	pausePreferenceErr := controller.pausePreference.Save(controller.origin, true)
+	controller.lockStateMu.Lock()
+	controller.mu.Lock()
+	controller.userPaused = true
+	controller.paused = true
+	connection := controller.connection
+	executor := controller.executor
+	stop := controller.monitorStop
+	controller.monitorStop = nil
+	controller.mu.Unlock()
+	fenced := executor == nil || executor.SetSessionLockState(ctx, desktopexecutor.SessionLockUnknown)
+	controller.lockStateMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	controller.runtime.Stop()
+	if connection != nil && connection.Status().Connected {
+		controller.readinessMu.Lock()
+		_ = connection.SetReadiness(string(apicontract.DesktopControlReadinessPaused))
+		controller.readinessMu.Unlock()
+	}
+	_ = controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessPaused)
+	if pausePreferenceErr != nil {
+		state, stateErr := controller.LocalState(ctx, controller.origin)
+		if stateErr != nil {
+			return state, errors.Join(pausePreferenceErr, stateErr)
+		}
+		return state, pausePreferenceErr
+	}
+	if !fenced {
+		state, stateErr := controller.LocalState(ctx, controller.origin)
+		if stateErr != nil {
+			return state, errors.Join(ErrUnavailable, stateErr)
+		}
+		return state, ErrUnavailable
+	}
+	installed, err := controller.installations.StoredInstallation(ctx, controller.origin)
+	if err != nil {
+		if errors.Is(err, credentialstore.ErrCredentialMissing) {
+			if connection != nil {
+				connection.Close()
+			}
+			controller.mu.Lock()
+			if controller.connection == connection {
+				controller.connection = nil
+			}
+			controller.disconnected = true
+			controller.userPaused = false
+			controller.paused = true
+			controller.recoveryChecked = true
+			controller.mu.Unlock()
+			preferenceErr := controller.pausePreference.Save(controller.origin, false)
+			state, stateErr := controller.LocalState(ctx, controller.origin)
+			return state, errors.Join(err, preferenceErr, stateErr)
+		}
+		state, stateErr := controller.LocalState(ctx, controller.origin)
+		if stateErr != nil {
+			return state, errors.Join(err, stateErr)
+		}
+		return state, err
+	}
+	if installed.Validate(controller.origin) != nil {
+		state, stateErr := controller.LocalState(ctx, controller.origin)
+		if stateErr != nil {
+			return state, errors.Join(ErrUnavailable, stateErr)
+		}
+		return state, ErrUnavailable
+	}
+	if err := controller.installations.Revoke(ctx, controller.origin); err != nil {
+		state, stateErr := controller.LocalState(ctx, controller.origin)
+		if stateErr != nil {
+			return state, errors.Join(err, stateErr)
+		}
+		return state, err
+	}
+	if connection != nil {
+		connection.Close()
+	}
+	controller.mu.Lock()
+	if controller.connection == connection {
+		controller.connection = nil
+	}
+	controller.disconnected = true
+	controller.userPaused = false
+	controller.paused = true
+	controller.recoveryChecked = true
+	controller.mu.Unlock()
+	preferenceErr := controller.pausePreference.Save(controller.origin, false)
+	state, stateErr := controller.LocalState(ctx, controller.origin)
+	if preferenceErr != nil {
+		return state, preferenceErr
+	}
+	return state, stateErr
+}
+
 // Resume only restores execution from a saved user pause after confirming the
 // compositor session is unlocked and the API still recognizes the install.
 func (controller *Controller) Resume(ctx context.Context) (installation.LocalState, error) {
@@ -549,7 +692,7 @@ func (controller *Controller) Resume(ctx context.Context) (installation.LocalSta
 		return installation.LocalState{}, ctx.Err()
 	}
 	controller.mu.Lock()
-	if controller.closed {
+	if controller.closed || controller.disconnecting || controller.disconnected {
 		controller.mu.Unlock()
 		return installation.LocalState{}, ErrUnavailable
 	}
@@ -652,7 +795,7 @@ func (controller *Controller) Resume(ctx context.Context) (installation.LocalSta
 	controller.paused = false
 	controller.mu.Unlock()
 	controller.lockStateMu.Unlock()
-	controller.startReconnectLoop(installed)
+	controller.startReconnectLoop()
 	state.RelayActive = &status.RelayActive
 	state.RelayPaused = false
 	state.UserPaused = false
@@ -720,9 +863,9 @@ func (controller *Controller) LifecycleState(ctx context.Context, origin string)
 	return state, nil
 }
 
-func (controller *Controller) startReconnectLoop(installed desktopcontrol.Installation) {
+func (controller *Controller) startReconnectLoop() {
 	controller.mu.Lock()
-	if controller.closed || controller.reconnectStarted {
+	if controller.closed || controller.disconnecting || controller.disconnected || controller.reconnectStarted {
 		controller.mu.Unlock()
 		return
 	}
@@ -730,6 +873,29 @@ func (controller *Controller) startReconnectLoop(installed desktopcontrol.Instal
 	controller.mu.Unlock()
 	go func() {
 		for controller.ctx.Err() == nil {
+			controller.mu.Lock()
+			closed := controller.closed
+			blocked := controller.disconnecting || controller.disconnected
+			controller.mu.Unlock()
+			if closed {
+				return
+			}
+			if blocked {
+				if !wait(controller.ctx, controller.reconnectEvery) {
+					return
+				}
+				continue
+			}
+			installed, err := controller.installations.StoredInstallation(controller.ctx, controller.origin)
+			if err != nil {
+				if errors.Is(err, credentialstore.ErrCredentialMissing) {
+					controller.stopIdleRelay()
+				}
+				if !wait(controller.ctx, controller.reconnectEvery) {
+					return
+				}
+				continue
+			}
 			status, err := controller.installations.Status(controller.ctx, controller.origin)
 			controller.mu.Lock()
 			if err == nil && status.RelayActive {
@@ -770,7 +936,7 @@ func (controller *Controller) resumeIdleRelay(ctx context.Context) error {
 		return ctx.Err()
 	}
 	controller.mu.Lock()
-	if controller.closed {
+	if controller.closed || controller.disconnecting || controller.disconnected {
 		controller.mu.Unlock()
 		return ErrUnavailable
 	}
@@ -810,7 +976,7 @@ func (controller *Controller) stopIdleRelay() {
 		return
 	}
 	controller.mu.Lock()
-	if controller.closed || controller.setupMayRunUnconfigured {
+	if controller.closed || controller.disconnecting || controller.disconnected || controller.setupMayRunUnconfigured {
 		controller.mu.Unlock()
 		return
 	}
@@ -821,7 +987,7 @@ func (controller *Controller) stopIdleRelay() {
 	}
 	controller.lockStateMu.Lock()
 	controller.mu.Lock()
-	if controller.closed || controller.setupMayRunUnconfigured {
+	if controller.closed || controller.disconnecting || controller.disconnected || controller.setupMayRunUnconfigured {
 		controller.mu.Unlock()
 		controller.lockStateMu.Unlock()
 		return
@@ -854,8 +1020,12 @@ func (controller *Controller) reconcileGateway(ctx context.Context, installed de
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	current, err := controller.installations.StoredInstallation(ctx, controller.origin)
+	if err != nil || current != installed {
+		return ErrUnavailable
+	}
 	controller.mu.Lock()
-	if controller.closed || controller.executor == nil || !controller.executor.NativeReady() {
+	if controller.closed || controller.disconnecting || controller.disconnected || controller.executor == nil || !controller.executor.NativeReady() {
 		controller.mu.Unlock()
 		return ErrUnavailable
 	}
@@ -875,7 +1045,7 @@ func (controller *Controller) reconcileGateway(ctx context.Context, installed de
 		controller.lockStateMu.Lock()
 		controller.mu.Lock()
 		executor := controller.executor
-		paused := controller.closed || controller.userPaused || controller.paused
+		paused := controller.closed || controller.disconnecting || controller.disconnected || controller.userPaused || controller.paused
 		lockState := controller.currentLock
 		controller.mu.Unlock()
 		controller.lockStateMu.Unlock()
@@ -896,7 +1066,7 @@ func (controller *Controller) reconcileGateway(ctx context.Context, installed de
 	}
 	baseline := connection.Status().ReadinessSequence
 	controller.mu.Lock()
-	if controller.closed || controller.connection != nil {
+	if controller.closed || controller.disconnecting || controller.disconnected || controller.connection != nil {
 		controller.mu.Unlock()
 		connection.Close()
 		return ErrUnavailable

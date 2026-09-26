@@ -63,7 +63,12 @@ type installServiceFake struct {
 	missing           bool
 	active            bool
 	statusErr         error
+	storedErr         error
+	revokeErr         error
+	revoked           int
 	statusDeadline    time.Time
+	statusStarted     chan struct{}
+	statusRelease     chan struct{}
 	localStateErr     error
 	localStateStarted chan struct{}
 	localStateRelease chan struct{}
@@ -80,6 +85,9 @@ type installServiceFake struct {
 func (service *installServiceFake) StoredInstallation(context.Context, string) (desktopcontrol.Installation, error) {
 	service.mu.Lock()
 	defer service.mu.Unlock()
+	if service.storedErr != nil {
+		return desktopcontrol.Installation{}, service.storedErr
+	}
 	if service.missing {
 		return desktopcontrol.Installation{}, credentialstore.ErrCredentialMissing
 	}
@@ -94,8 +102,12 @@ func (service *installServiceFake) Enroll(_ context.Context, _ string, operating
 	}
 	service.enrolled++
 	service.missing = false
+	installationID := "install_01"
+	if service.enrolled > 1 {
+		installationID = "install_02"
+	}
 	service.installation = desktopcontrol.Installation{
-		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		InstallationID: installationID, MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
 		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
 	}
 	return nil
@@ -108,6 +120,18 @@ func (service *installServiceFake) Attach(context.Context, string, string) error
 	return nil
 }
 
+func (service *installServiceFake) Revoke(context.Context, string) error {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.revoked++
+	if service.revokeErr != nil {
+		return service.revokeErr
+	}
+	service.missing = true
+	service.active = false
+	return nil
+}
+
 func (service *installServiceFake) ReportReadiness(_ context.Context, _ string, readiness apicontract.DesktopControlReadiness) error {
 	service.mu.Lock()
 	service.readiness = append(service.readiness, readiness)
@@ -117,14 +141,28 @@ func (service *installServiceFake) ReportReadiness(_ context.Context, _ string, 
 
 func (service *installServiceFake) Status(ctx context.Context, _ string) (installation.Status, error) {
 	service.mu.Lock()
-	defer service.mu.Unlock()
+	started := service.statusStarted
+	release := service.statusRelease
+	service.statusStarted = nil
+	service.statusRelease = nil
 	if deadline, ok := ctx.Deadline(); ok {
 		service.statusDeadline = deadline
 	}
 	if service.statusErr != nil {
+		service.mu.Unlock()
 		return installation.Status{}, service.statusErr
 	}
-	return installation.Status{Enrolled: true, CredentialValid: true, RelayActive: service.active}, nil
+	status := installation.Status{Enrolled: true, CredentialValid: true, RelayActive: service.active}
+	service.mu.Unlock()
+	if started != nil {
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return installation.Status{}, ctx.Err()
+		}
+	}
+	return status, nil
 }
 
 func (service *installServiceFake) PrepareSession(context.Context, string) (int64, error) {
@@ -160,8 +198,12 @@ func (service *installServiceFake) LocalState(ctx context.Context, _ string) (in
 	started := service.localStateStarted
 	release := service.localStateRelease
 	state := service.localState
-	if state.InstallationID == nil && service.installation.InstallationID != "" {
+	missing := service.missing
+	if !missing && state.InstallationID == nil && service.installation.InstallationID != "" {
 		state.InstallationID = &service.installation.InstallationID
+	}
+	if missing {
+		state.InstallationID = nil
 	}
 	service.mu.Unlock()
 	if started != nil {
@@ -539,6 +581,375 @@ func TestPausePersistsAcrossRestartAndResumeRechecksUnlockedActiveInstall(t *tes
 	}
 	if paused, err := preference.Load(testOrigin); err != nil || paused {
 		t.Fatalf("cleared pause = %t, %v", paused, err)
+	}
+}
+
+func TestDisconnectRevokesInstallationAndStopsLocalGateway(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	runtime := &runtimeFake{}
+	service := &installServiceFake{missing: true}
+	var connections []*gatewayFake
+	var connectionsMu sync.Mutex
+	options := Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{},
+		PausePreference: preference,
+		NewLockMonitor:  func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			connection := &gatewayFake{closed: make(chan struct{})}
+			connectionsMu.Lock()
+			connections = append(connections, connection)
+			connectionsMu.Unlock()
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Prepare(context.Background(), testOrigin, "ticket"); err != nil {
+		t.Fatalf("Prepare() = %v", err)
+	}
+	state, err := controller.Disconnect(context.Background())
+	if err != nil {
+		t.Fatalf("Disconnect() = %v", err)
+	}
+	if state.InstallationID != nil || !state.RelayPaused || state.UserPaused || state.GatewayConnected {
+		t.Fatalf("Disconnect() state = %#v", state)
+	}
+	service.mu.Lock()
+	revoked, missing := service.revoked, service.missing
+	service.mu.Unlock()
+	if revoked != 1 || !missing {
+		t.Fatalf("revoked=%d credential missing=%t, want one revoke and deleted credential", revoked, missing)
+	}
+	connectionsMu.Lock()
+	firstConnection := connections[0]
+	connectionsMu.Unlock()
+	if firstConnection.Status().Connected {
+		t.Fatal("Gateway remained connected after successful revoke")
+	}
+	if paused, err := preference.Load(testOrigin); err != nil || paused {
+		t.Fatalf("pause preference after disconnect = %t, %v; want cleared", paused, err)
+	}
+	state, err = controller.Prepare(context.Background(), testOrigin, "ticket-again")
+	connectionsMu.Lock()
+	connectionCount := len(connections)
+	var secondConnection *gatewayFake
+	if connectionCount > 1 {
+		secondConnection = connections[1]
+	}
+	connectionsMu.Unlock()
+	if err != nil || state.InstallationID == nil || state.RelayPaused || !state.GatewayConnected || connectionCount != 2 || secondConnection == nil || !secondConnection.Status().Connected {
+		t.Fatalf("fresh setup after disconnect state=%#v connections=%d err=%v", state, connectionCount, err)
+	}
+	service.mu.Lock()
+	enrolled := service.enrolled
+	service.mu.Unlock()
+	if enrolled != 2 {
+		t.Fatalf("fresh setup enrolled %d times, want two", enrolled)
+	}
+}
+
+func TestDisconnectFailureKeepsCredentialAndGatewayPausedForRetry(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	runtime := &runtimeFake{}
+	revokeErr := errors.New("API revoke failed")
+	service := &installServiceFake{missing: true, revokeErr: revokeErr}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	options := Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{},
+		PausePreference: preference,
+		NewLockMonitor:  func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Prepare(context.Background(), testOrigin, "ticket"); err != nil {
+		t.Fatalf("Prepare() = %v", err)
+	}
+	state, err := controller.Disconnect(context.Background())
+	if !errors.Is(err, revokeErr) || !state.RelayPaused || !state.UserPaused {
+		t.Fatalf("failed Disconnect() state=%#v err=%v", state, err)
+	}
+	service.mu.Lock()
+	stillStored := !service.missing
+	service.revokeErr = nil
+	service.mu.Unlock()
+	if !stillStored || !connection.Status().Connected || connection.Status().Readiness != string(apicontract.DesktopControlReadinessPaused) {
+		t.Fatalf("failed revoke lost retry state: credentialStored=%t gateway=%#v", stillStored, connection.Status())
+	}
+	if _, err := controller.Disconnect(context.Background()); err != nil {
+		t.Fatalf("retry Disconnect() = %v", err)
+	}
+	service.mu.Lock()
+	revoked, missing := service.revoked, service.missing
+	service.mu.Unlock()
+	if revoked != 2 || !missing || connection.Status().Connected {
+		t.Fatalf("retry result revoked=%d missing=%t gateway=%#v", revoked, missing, connection.Status())
+	}
+}
+
+func TestDisconnectKeyringFailureStillFencesAndPausesLocalExecution(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	runtime := &runtimeFake{}
+	service := &installServiceFake{missing: true}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	options := Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{},
+		PausePreference: preference,
+		NewLockMonitor:  func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Prepare(context.Background(), testOrigin, "ticket"); err != nil {
+		t.Fatalf("Prepare() = %v", err)
+	}
+	keyringErr := errors.New("Secret Service unavailable")
+	service.mu.Lock()
+	service.storedErr = keyringErr
+	service.mu.Unlock()
+	state, err := controller.Disconnect(context.Background())
+	if !errors.Is(err, keyringErr) || !state.RelayPaused || !state.UserPaused {
+		t.Fatalf("Disconnect() with unavailable keyring state=%#v err=%v", state, err)
+	}
+	service.mu.Lock()
+	revoked := service.revoked
+	service.mu.Unlock()
+	if revoked != 0 || !connection.Status().Connected || connection.Status().Readiness != string(apicontract.DesktopControlReadinessPaused) {
+		t.Fatalf("keyring failure lost paused retry state: revoked=%d gateway=%#v", revoked, connection.Status())
+	}
+	if paused, err := preference.Load(testOrigin); err != nil || !paused {
+		t.Fatalf("saved pause after keyring failure = %t, %v", paused, err)
+	}
+}
+
+func TestDisconnectCleanupFailureReportsPauseAndDoesNotRevoke(t *testing.T) {
+	t.Parallel()
+	runtime := &runtimeFake{}
+	service := &installServiceFake{missing: true}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	local := &retryCloseLocalOperations{}
+	options := Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: local,
+		PausePreference: &pausePreferenceFake{},
+		NewLockMonitor:  func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Prepare(context.Background(), testOrigin, "ticket"); err != nil {
+		t.Fatalf("Prepare() = %v", err)
+	}
+	state, err := controller.Disconnect(context.Background())
+	if !errors.Is(err, ErrUnavailable) || !state.RelayPaused || !state.UserPaused {
+		t.Fatalf("Disconnect() cleanup failure state=%#v err=%v", state, err)
+	}
+	service.mu.Lock()
+	revoked, lastReadiness := service.revoked, service.readiness[len(service.readiness)-1]
+	service.mu.Unlock()
+	if revoked != 0 || lastReadiness != apicontract.DesktopControlReadinessPaused || connection.Status().Readiness != string(apicontract.DesktopControlReadinessPaused) {
+		t.Fatalf("cleanup failure crossed revoke fence: revoked=%d readiness=%v gateway=%#v", revoked, lastReadiness, connection.Status())
+	}
+}
+
+func TestDisconnectWithMissingCredentialClosesGatewayAndAllowsFreshSetup(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	runtime := &runtimeFake{}
+	service := &installServiceFake{missing: true}
+	var connections []*gatewayFake
+	options := Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{},
+		PausePreference: preference,
+		NewLockMonitor:  func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			connection := &gatewayFake{closed: make(chan struct{})}
+			connections = append(connections, connection)
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Prepare(context.Background(), testOrigin, "ticket"); err != nil {
+		t.Fatalf("Prepare() = %v", err)
+	}
+	service.mu.Lock()
+	service.missing = true
+	service.mu.Unlock()
+	state, err := controller.Disconnect(context.Background())
+	if !errors.Is(err, credentialstore.ErrCredentialMissing) || state.InstallationID != nil || state.UserPaused || !state.RelayPaused {
+		t.Fatalf("Disconnect() without credential state=%#v err=%v", state, err)
+	}
+	if connections[0].Status().Connected {
+		t.Fatal("stale Gateway remained connected without its local credential")
+	}
+	if paused, err := preference.Load(testOrigin); err != nil || paused {
+		t.Fatalf("pause preference after missing credential = %t, %v", paused, err)
+	}
+	state, err = controller.Prepare(context.Background(), testOrigin, "fresh-ticket")
+	if err != nil || state.InstallationID == nil || state.UserPaused || !state.GatewayConnected || len(connections) != 2 {
+		t.Fatalf("fresh setup after missing credential state=%#v connections=%d err=%v", state, len(connections), err)
+	}
+	service.mu.Lock()
+	revoked, enrolled := service.revoked, service.enrolled
+	service.mu.Unlock()
+	if revoked != 0 || enrolled != 2 {
+		t.Fatalf("missing-credential cleanup revoked=%d enrolled=%d, want local cleanup and fresh enrollment", revoked, enrolled)
+	}
+}
+
+func TestDisconnectPreferenceFailureStillFencesBeforeReturning(t *testing.T) {
+	t.Parallel()
+	preferenceErr := errors.New("pause preference is read-only")
+	preference := &pausePreferenceFake{}
+	runtime := &runtimeFake{}
+	service := &installServiceFake{missing: true}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	options := Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{},
+		PausePreference: preference,
+		NewLockMonitor:  func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Prepare(context.Background(), testOrigin, "ticket"); err != nil {
+		t.Fatalf("Prepare() = %v", err)
+	}
+	preference.err = preferenceErr
+	state, err := controller.Disconnect(context.Background())
+	if !errors.Is(err, preferenceErr) || !state.UserPaused || !state.RelayPaused || connection.Status().Readiness != string(apicontract.DesktopControlReadinessPaused) {
+		t.Fatalf("Disconnect() preference failure state=%#v gateway=%#v err=%v", state, connection.Status(), err)
+	}
+	runtime.mu.Lock()
+	stopCalls := runtime.stopCalls
+	runtime.mu.Unlock()
+	service.mu.Lock()
+	revoked := service.revoked
+	service.mu.Unlock()
+	if stopCalls == 0 || revoked != 0 {
+		t.Fatalf("preference failure did not fence before return: stop=%d revoke=%d", stopCalls, revoked)
+	}
+}
+
+func TestReconnectAttemptCannotReuseInstallationAfterDisconnectAndReenroll(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	runtime := &runtimeFake{}
+	reconnectStatusStarted := make(chan struct{})
+	reconnectStatusRelease := make(chan struct{})
+	service := &installServiceFake{
+		missing:       true,
+		statusStarted: reconnectStatusStarted,
+		statusRelease: reconnectStatusRelease,
+	}
+	var connectionsMu sync.Mutex
+	connections := 0
+	options := Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{},
+		PausePreference: preference,
+		NewLockMonitor:  func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			connectionsMu.Lock()
+			connections++
+			connectionsMu.Unlock()
+			return &gatewayFake{closed: make(chan struct{})}, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Prepare(context.Background(), testOrigin, "first-ticket"); err != nil {
+		t.Fatalf("initial Prepare() = %v", err)
+	}
+	select {
+	case <-reconnectStatusStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnect loop did not capture old installation")
+	}
+	service.mu.Lock()
+	oldInstallation := service.installation
+	service.mu.Unlock()
+	service.mu.Lock()
+	service.missing = true
+	service.mu.Unlock()
+	if _, err := controller.Disconnect(context.Background()); !errors.Is(err, credentialstore.ErrCredentialMissing) {
+		t.Fatalf("Disconnect() with missing credential = %v", err)
+	}
+	state, err := controller.Prepare(context.Background(), testOrigin, "second-ticket")
+	if err != nil || state.InstallationID == nil || *state.InstallationID != "install_02" {
+		t.Fatalf("fresh Prepare() state=%#v err=%v", state, err)
+	}
+	if err := controller.reconcileGateway(context.Background(), oldInstallation); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("stale reconnect attempt = %v, want ErrUnavailable", err)
+	}
+	close(reconnectStatusRelease)
+	connectionsMu.Lock()
+	createdConnections := connections
+	connectionsMu.Unlock()
+	if createdConnections != 2 {
+		t.Fatalf("stale attempt created another Gateway: got %d connections, want 2", createdConnections)
+	}
+}
+
+func TestRecoverClearsSavedPauseAfterInstallationCredentialWasRemoved(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{paused: true}
+	controller, err := New(Options{
+		Origin: testOrigin, Runtime: &runtimeFake{}, Installations: &installServiceFake{missing: true},
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{},
+		PausePreference: preference,
+		NewLockMonitor:  func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if err := controller.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() = %v", err)
+	}
+	controller.mu.Lock()
+	userPaused, recoveryChecked := controller.userPaused, controller.recoveryChecked
+	controller.mu.Unlock()
+	if preference.paused || userPaused || !recoveryChecked {
+		t.Fatalf("stale pause remained after credential removal: preference=%t userPaused=%t recoveryChecked=%t", preference.paused, userPaused, recoveryChecked)
 	}
 }
 

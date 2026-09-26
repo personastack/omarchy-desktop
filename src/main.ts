@@ -56,8 +56,9 @@ import {
   beginTrayStateRead,
   isCurrentTrayControlAction,
   sameTrayControlSnapshot,
-  trayControlCanSetUp,
   trayControlAction,
+  trayControlCanDisconnect,
+  trayControlCanSetUp,
   trayControlStatus,
   type TrayControlSnapshot,
 } from "./tray-control.js";
@@ -582,6 +583,13 @@ function updateTrayMenu(): void {
     } else if (trayControlCanSetUp(trayControlSnapshot)) {
       items.push({ label: "Set Up Desktop Control", click: () => openMainWindow(true, "/user/desktop-control") });
     }
+    if (trayControlCanDisconnect(trayControlSnapshot)) {
+      items.push({
+        label: "Disconnect this computer…",
+        enabled: !trayControlActionPending,
+        click: () => { void confirmTrayDisconnect(); },
+      });
+    }
     items.push({ type: "separator" });
   } else {
     items.push({ type: "separator" });
@@ -631,9 +639,27 @@ async function refreshTrayControlState(): Promise<void> {
   }
 }
 
-async function runTrayLifecycleAction(action: "pause" | "resume"): Promise<void> {
+async function confirmTrayDisconnect(): Promise<void> {
+  if (trayControlActionPending || !tray || !trayControlCanDisconnect(trayControlSnapshot)) return;
+  const result = await dialog.showMessageBox({
+    type: "warning",
+    title: "Disconnect this computer?",
+    message: "This revokes Desktop Control for this computer in every workspace.",
+    detail: "Active remote sessions will stop. You can set up this computer again later.",
+    buttons: ["Disconnect", "Cancel"],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (result.response === 0) await runTrayLifecycleAction("disconnect");
+}
+
+async function runTrayLifecycleAction(action: "pause" | "resume" | "disconnect"): Promise<void> {
   if (trayControlActionPending || !tray) return;
-  if (!isCurrentTrayControlAction(trayControlSnapshot, action)) {
+  const current = action === "disconnect"
+    ? trayControlCanDisconnect(trayControlSnapshot)
+    : isCurrentTrayControlAction(trayControlSnapshot, action);
+  if (!current) {
     trayControlSnapshot = { ...trayControlSnapshot, actionError: "unavailable" };
     updateTrayMenu();
     return;

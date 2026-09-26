@@ -88,6 +88,7 @@ test("Desktop Control bridge accepts only hosted lifecycle commands", () => {
   assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "state", scope: "" }), { version: "1", action: "state", scope: "" });
   assert.equal(parseDesktopControlCommand({ version: "1", action: "pause", scope: "workspace:request" }), undefined);
   assert.equal(parseDesktopControlCommand({ version: "1", action: "resume", scope: "workspace:request" }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "disconnect", scope: "desktop:lifecycle" }), undefined);
   assert.equal(parseDesktopControlCommand({ version: "1", action: "state", scope: "desktop:lifecycle" }), undefined);
   assert.equal(parseDesktopControlCommand({ version: "1", action: "sync", scope: "desktop:lifecycle" }), undefined);
   assert.equal(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "desktop:lifecycle", enrollment_ticket: ticket }), undefined);

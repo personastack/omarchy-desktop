@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { DesktopControlState } from "./companion-client.js";
-import { applyTrayActionResult, applyTrayStateRead, beginTrayControlAction, beginTrayStateRead, isCurrentTrayControlAction, sameTrayControlSnapshot, trayControlAction, trayControlCanSetUp, trayControlStatus } from "./tray-control.js";
+import { applyTrayActionResult, applyTrayStateRead, beginTrayControlAction, beginTrayStateRead, isCurrentTrayControlAction, sameTrayControlSnapshot, trayControlAction, trayControlCanDisconnect, trayControlCanSetUp, trayControlStatus } from "./tray-control.js";
 
 const baseState: DesktopControlState = {
   installation_id: "install_01",
@@ -25,6 +25,9 @@ test("tray actions distinguish user pause and allow pausing a degraded active re
   assert.equal(trayControlAction({ state: { ...baseState, installation_id: null, relay_paused: true } }), undefined);
   assert.equal(trayControlCanSetUp({ state: { ...baseState, installation_id: null } }), true);
   assert.equal(trayControlCanSetUp({ state: { ...baseState, installation_id: null, runtime_available: false } }), false);
+  assert.equal(trayControlCanDisconnect({ state: baseState }), true);
+  assert.equal(trayControlCanDisconnect({ state: { ...baseState, installation_id: null } }), false);
+  assert.equal(trayControlCanDisconnect({ state: { ...baseState, runtime_available: false } }), false);
   assert.equal(trayControlAction({ state: { ...baseState, cua_ready: false } }), "pause");
   assert.equal(trayControlAction({ state: { ...baseState, native_executor_ready: false } }), "pause");
   assert.equal(trayControlAction({ state: { ...baseState, gateway_connected: false } }), "pause");
@@ -62,6 +65,7 @@ test("stale user-paused state hides Resume while stale active sessions still all
   const cachedPause = { ...baseState, user_paused: true, relay_paused: true };
   const failed = applyTrayStateRead({ state: cachedPause, stateFresh: true }, { ok: false, error: "unavailable" });
   assert.equal(trayControlAction(failed), undefined);
+  assert.equal(trayControlCanDisconnect(failed), true);
   const pending = beginTrayStateRead({ state: cachedPause, stateFresh: true });
   assert.equal(trayControlAction(pending), undefined);
   assert.equal(trayControlAction({ state: baseState, stateFresh: false, refreshError: "unavailable" }), "pause");

@@ -27,6 +27,7 @@ func TestParseAcceptsHostedDesktopControlCommands(t *testing.T) {
 		{name: "empty state scope", raw: `{"id":2,"version":"1","action":"state","scope":""}`, want: Request{ID: 2, Version: "1", Action: ActionState}},
 		{name: "tray pause", raw: `{"id":3,"version":"1","action":"pause","scope":"` + LifecycleScope + `"}`, want: Request{ID: 3, Version: "1", Action: ActionPause, Scope: LifecycleScope}},
 		{name: "tray resume", raw: `{"id":4,"version":"1","action":"resume","scope":"` + LifecycleScope + `"}`, want: Request{ID: 4, Version: "1", Action: ActionResume, Scope: LifecycleScope}},
+		{name: "tray disconnect", raw: `{"id":6,"version":"1","action":"disconnect","scope":"` + LifecycleScope + `"}`, want: Request{ID: 6, Version: "1", Action: ActionDisconnect, Scope: LifecycleScope}},
 		{name: "tray state without workspace sync", raw: `{"id":5,"version":"1","action":"state","scope":"` + LifecycleScope + `"}`, want: Request{ID: 5, Version: "1", Action: ActionState, Scope: LifecycleScope}},
 		{name: "prepare", raw: `{"id":7,"version":"1","action":"prepare","scope":"workspace:request","enrollment_ticket":"` + ticket + `"}`, want: Request{ID: 7, Version: "1", Action: ActionPrepare, Scope: "workspace:request", EnrollmentTicket: ticket}},
 	}
@@ -55,9 +56,10 @@ func TestLifecycleScopeDoesNotRequireOrReplaceWorkspaceSync(t *testing.T) {
 	}
 	processor.Handle(context.Background(), Request{ID: 2, Version: "1", Action: ActionSync, Scope: "workspace:a"})
 	paused := processor.Handle(context.Background(), Request{ID: 3, Version: "1", Action: ActionPause, Scope: LifecycleScope})
+	wrongScopeResume := processor.Handle(context.Background(), Request{ID: 6, Version: "1", Action: ActionResume, Scope: "workspace:a"})
 	workspaceState := processor.Handle(context.Background(), Request{ID: 4, Version: "1", Action: ActionState, Scope: "workspace:a"})
-	if !paused.OK || !workspaceState.OK || lifecycle.stateCalls != 2 || lifecycle.lifecycleStateCalls != 1 {
-		t.Fatalf("tray pause changed hosted scope: pause=%#v state=%#v local calls=%d lifecycle calls=%d", paused, workspaceState, lifecycle.stateCalls, lifecycle.lifecycleStateCalls)
+	if !paused.OK || wrongScopeResume.Error != ErrorInvalidRequest || !workspaceState.OK || lifecycle.stateCalls != 2 || lifecycle.lifecycleStateCalls != 1 {
+		t.Fatalf("tray pause or scope fence: pause=%#v wrong-scope resume=%#v state=%#v local calls=%d lifecycle calls=%d", paused, wrongScopeResume, workspaceState, lifecycle.stateCalls, lifecycle.lifecycleStateCalls)
 	}
 }
 
@@ -118,6 +120,7 @@ func TestParseRejectsMalformedAndCredentialBearingCommands(t *testing.T) {
 		{name: "reserved lifecycle scope cannot sync a workspace", raw: `{"id":1,"version":"1","action":"sync","scope":"` + LifecycleScope + `"}`},
 		{name: "pause must use lifecycle scope", raw: `{"id":1,"version":"1","action":"pause","scope":"workspace:a"}`},
 		{name: "resume must use lifecycle scope", raw: `{"id":1,"version":"1","action":"resume","scope":"workspace:a"}`},
+		{name: "disconnect must use lifecycle scope", raw: `{"id":1,"version":"1","action":"disconnect","scope":"workspace:a"}`},
 		{name: "extra credential field", raw: `{"id":1,"version":"1","action":"state","scope":"","machine_credential":"secret"}`},
 		{name: "duplicate ID", raw: `{"id":1,"id":2,"version":"1","action":"sync","scope":""}`},
 		{name: "missing scope", raw: `{"id":1,"version":"1","action":"state"}`},
@@ -243,7 +246,7 @@ func TestProcessorPrepareUsesIntegratedRuntimeReadiness(t *testing.T) {
 	}
 }
 
-func TestProcessorRoutesPauseAndResumeToIntegratedRuntime(t *testing.T) {
+func TestProcessorRoutesPauseResumeAndDisconnectToIntegratedRuntime(t *testing.T) {
 	t.Parallel()
 	lifecycle := &controlRuntimeStub{state: installation.LocalState{RelayPaused: true}}
 	processor, err := NewWithControlRuntime(&serviceStub{}, nil, lifecycle, "https://my.personastack.ai")
@@ -251,14 +254,18 @@ func TestProcessorRoutesPauseAndResumeToIntegratedRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	processor.Handle(context.Background(), Request{ID: 1, Version: "1", Action: ActionSync, Scope: "workspace:a"})
-	for _, action := range []Action{ActionPause, ActionResume} {
+	for _, action := range []Action{ActionPause, ActionResume, ActionDisconnect} {
 		result := processor.Handle(context.Background(), Request{ID: uint64(lifecycle.stateCalls + 2), Version: "1", Action: action, Scope: LifecycleScope})
 		if !result.OK || result.Result == nil || !result.Result.RelayPaused {
 			t.Fatalf("%s = %#v", action, result)
 		}
 	}
-	if lifecycle.stateCalls != 2 {
-		t.Fatalf("lifecycle state calls = %d, want pause and resume", lifecycle.stateCalls)
+	if lifecycle.stateCalls != 3 || lifecycle.disconnectCalls != 1 {
+		t.Fatalf("lifecycle calls = %d, disconnect calls=%d, want three actions with one disconnect", lifecycle.stateCalls, lifecycle.disconnectCalls)
+	}
+	wrongScope := processor.Handle(context.Background(), Request{ID: 5, Version: "1", Action: ActionDisconnect, Scope: "workspace:a"})
+	if wrongScope.Error != ErrorInvalidRequest || lifecycle.disconnectCalls != 1 {
+		t.Fatalf("workspace-scoped disconnect = %#v, disconnect calls=%d", wrongScope, lifecycle.disconnectCalls)
 	}
 }
 
@@ -396,6 +403,7 @@ type controlRuntimeStub struct {
 	lifecycleStateCalls int
 	lastTicket          string
 	prepareErr          error
+	disconnectCalls     int
 	pauseStarted        chan struct{}
 	pauseRelease        chan struct{}
 }
@@ -433,6 +441,12 @@ func (runtime *controlRuntimeStub) Pause(ctx context.Context) (installation.Loca
 
 func (runtime *controlRuntimeStub) Resume(context.Context) (installation.LocalState, error) {
 	runtime.stateCalls++
+	return runtime.state, nil
+}
+
+func (runtime *controlRuntimeStub) Disconnect(context.Context) (installation.LocalState, error) {
+	runtime.stateCalls++
+	runtime.disconnectCalls++
 	return runtime.state, nil
 }
 

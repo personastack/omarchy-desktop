@@ -25,6 +25,11 @@ export function trayControlCanSetUp(snapshot: TrayControlSnapshot): boolean {
   return !snapshot.refreshError && snapshot.stateFresh !== false && !!state?.runtime_available && !state.installation_id;
 }
 
+export function trayControlCanDisconnect(snapshot: TrayControlSnapshot): boolean {
+  const state = snapshot.state;
+  return !!state?.installation_id && !!state.runtime_available;
+}
+
 export function trayControlStatus(snapshot: TrayControlSnapshot): string {
   const state = snapshot.state;
   if (snapshot.actionError || snapshot.refreshError) return "Desktop Control: Needs attention";
