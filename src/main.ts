@@ -20,6 +20,8 @@ import {
 } from "electron";
 
 import { getAutostartStatus, setAutostartEnabled, type AutostartStatus } from "./autostart.js";
+import { closePopoutWindows, synchronizePopoutScope } from "./popout-scope.js";
+import { loadAndShowWindow } from "./window-load.js";
 import {
   authorizeBridgeFrame,
   shouldStartInBackground,
@@ -80,6 +82,7 @@ const chats = new Map<string, BrowserWindow>();
 const stackWindows = new Map<string, BrowserWindow>();
 const expandedChatSizes = new Map<BrowserWindow, readonly [number, number]>();
 const programmaticChatClose = new WeakSet<BrowserWindow>();
+const closingWindows = new WeakSet<BrowserWindow>();
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let isQuitting = false;
@@ -390,18 +393,10 @@ function openGoogleOAuthWindow(initialURL: string): void {
 
 function applyChatMainCommand(command: ChatMainCommand): void {
   if (command.action === "sync") {
-    if (chatScope !== command.scope) {
-      chatScope = command.scope;
-      for (const chat of chats.values()) closeWindow(chat);
-      chats.clear();
-    }
+    synchronizeHostedScope(command.scope);
     return;
   }
-  if (command.scope !== chatScope) {
-    chatScope = command.scope;
-    for (const chat of chats.values()) closeWindow(chat);
-    chats.clear();
-  }
+  synchronizeHostedScope(command.scope);
   const existing = chats.get(command.persona_id);
   if (existing && !existing.isDestroyed()) {
     existing.show();
@@ -445,7 +440,7 @@ function createChatWindow(personaID: string): BrowserWindow {
     }).catch(() => closeWindow(window));
   });
   const url = routeURL(appOriginURL().href, "/user/personas/chat/desktop-popout", { persona_id: personaID });
-  void window.loadURL(url).then(() => window.show());
+  showAfterPopoutLoad(window, url);
   return window;
 }
 
@@ -513,13 +508,23 @@ function openStackWindow(command: StackCommand): void {
     icon: nativeImage.createFromDataURL(APP_ICON),
   });
   stackWindows.set(key, window);
+  window.on("close", () => closingWindows.add(window));
   window.on("closed", () => {
     if (stackWindows.get(key) === window) stackWindows.delete(key);
   });
   const url = isStack
     ? routeURL(appOriginURL().href, "/user/stacks/desktop-popout", { stack_id: command.stack_id, view: command.view })
     : routeURL(appOriginURL().href, "/user/personas/activity/desktop-popout", { persona_id: command.persona_id });
-  void window.loadURL(url).then(() => window.show());
+  showAfterPopoutLoad(window, url);
+}
+
+function showAfterPopoutLoad(window: BrowserWindow, url: string): void {
+  void loadAndShowWindow({
+    load: () => window.loadURL(url),
+    isCurrent: () => !window.isDestroyed() && !closingWindows.has(window) && windows.get(window.webContents.id)?.window === window,
+    show: () => window.show(),
+    close: () => closeWindow(window),
+  });
 }
 
 function routeURL(currentURL: string, path: string, query: Record<string, string>): string {
@@ -531,14 +536,22 @@ function routeURL(currentURL: string, path: string, query: Record<string, string
 }
 
 function invalidatePopouts(): void {
-  for (const window of [...chats.values(), ...stackWindows.values()]) closeWindow(window);
-  chats.clear();
-  stackWindows.clear();
+  closePopoutWindows([chats, stackWindows], closeWindow);
   chatScope = "";
+}
+
+function synchronizeHostedScope(scope: string): void {
+  chatScope = synchronizePopoutScope(
+    chatScope,
+    scope,
+    [chats, stackWindows],
+    closeWindow,
+  );
 }
 
 function closeWindow(window: BrowserWindow): void {
   if (window.isDestroyed()) return;
+  closingWindows.add(window);
   programmaticChatClose.add(window);
   window.close();
 }
