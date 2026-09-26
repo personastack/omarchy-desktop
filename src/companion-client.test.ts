@@ -29,8 +29,8 @@ test("companion client correlates local state replies", async () => {
     relay_paused: true,
   });
   assert.equal(client.isOpen, true);
-  client.close();
-  assert.equal(fake.isKilled(), true);
+  await client.close();
+  assert.equal(fake.isKilled(), false);
 });
 
 test("companion client accepts the sync acknowledgment shape", async () => {
@@ -42,7 +42,7 @@ test("companion client accepts the sync acknowledgment shape", async () => {
     fake.stdout.write(`${JSON.stringify({ id: request.id, ok: true })}\n`);
   });
   assert.deepEqual(await client.request({ version: "1", action: "sync", scope: "workspace:request" }), { ok: true });
-  client.close();
+  await client.close();
 });
 
 test("companion client transports local-session commands and validates typed replies", async () => {
@@ -61,7 +61,7 @@ test("companion client transports local-session commands and validates typed rep
   });
   const result = await client.requestLocalSession({ version: "1", action: "state", scope: "scope-a" });
   assert.deepEqual(result, { ok: true, version: "2", harness: "codex" });
-  client.close();
+  await client.close();
 });
 
 test("companion client preserves finite local-session failure codes", async () => {
@@ -70,7 +70,18 @@ test("companion client preserves finite local-session failure codes", async () =
   const pending = client.requestLocalSession({ version: "1", action: "prepare", scope: "scope-a", persona_id: "persona_1", harness: "codex" });
   fake.stdout.write('{"id":1,"ok":false,"error":"missing_harness"}\n');
   assert.deepEqual(await pending, { ok: false, error: "missing_harness" });
-  client.close();
+  await client.close();
+});
+
+test("companion client preserves finite session-lock failures", async () => {
+  for (const error of ["session_locked", "session_state_unknown"] as const) {
+    const fake = createFakeChild();
+    const client = new CompanionClient(fake.child);
+    const pending = client.request({ version: "1", action: "state", scope: "workspace:a" });
+    fake.stdout.write(`${JSON.stringify({ id: 1, ok: false, error })}\n`);
+    assert.deepEqual(await pending, { ok: false, error });
+    await client.close();
+  }
 });
 
 test("companion client rejects credential-bearing or malformed replies", async () => {
@@ -80,7 +91,8 @@ test("companion client rejects credential-bearing or malformed replies", async (
   fake.stdout.write('{"id":1,"ok":true,"machine_credential":"secret"}\n');
   assert.deepEqual(await resultPromise, { ok: false, error: "unavailable" });
   assert.equal(client.isOpen, false);
-  assert.equal(fake.isKilled(), true);
+  await client.close();
+  assert.equal(fake.isKilled(), false);
 });
 
 test("companion client requires response shape to match its request", async () => {
@@ -100,30 +112,59 @@ test("prepare response includes a Linux platform and local readiness", async () 
     fake.stdout.write(`${JSON.stringify({
       id: request.id,
       ok: true,
-      result: { installation_id: "install_01", operating_system: "linux", runtime_available: false, cua_ready: false, native_executor_ready: false, gateway_connected: false, relay_paused: true },
+      result: { installation_id: "install_01", operating_system: "linux", runtime_available: true, cua_ready: true, native_executor_ready: false, gateway_connected: false, relay_paused: false },
     })}\n`);
   });
   const result = await client.request({ version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: "A".repeat(43) });
   assert.deepEqual(result, {
     ok: true,
     installation_id: "install_01",
+    cua_ready: true,
+    native_executor_ready: false,
+    gateway_connected: false,
+    relay_paused: false,
+    operating_system: "linux",
+    runtime_available: true,
+  });
+  await client.close();
+});
+
+test("prepare preserves a finite unavailable-runtime result", async () => {
+  const fake = createFakeChild();
+  const client = new CompanionClient(fake.child);
+  const pending = client.request({ version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: "A".repeat(43) });
+  fake.stdout.write('{"id":1,"ok":true,"result":{"installation_id":null,"operating_system":"linux","runtime_available":false,"cua_ready":false,"native_executor_ready":false,"gateway_connected":false,"relay_paused":true}}\n');
+  assert.deepEqual(await pending, {
+    ok: true,
+    installation_id: null,
+    operating_system: "linux",
+    runtime_available: false,
     cua_ready: false,
     native_executor_ready: false,
     gateway_connected: false,
     relay_paused: true,
-    operating_system: "linux",
-    runtime_available: false,
   });
-  client.close();
+  assert.equal(client.isOpen, true);
+  await client.close();
 });
 
 test("companion client closes pending calls without replay", async () => {
   const fake = createFakeChild();
   const client = new CompanionClient(fake.child);
   const pending = client.request({ version: "1", action: "prepare", scope: "x", enrollment_ticket: "A".repeat(43) });
-  client.close();
+  const closing = client.close();
   assert.deepEqual(await pending, { ok: false, error: "unavailable" });
+  await closing;
   assert.equal(client.isOpen, false);
+});
+
+test("companion client resolves graceful close when spawning fails", async () => {
+  const fake = createFakeChild();
+  const client = new CompanionClient(fake.child);
+  const closing = client.close();
+  fake.failSpawn();
+  await closing;
+  assert.equal(fake.isKilled(), false);
 });
 
 function createFakeChild(): Readonly<{
@@ -131,6 +172,7 @@ function createFakeChild(): Readonly<{
   stdin: PassThrough;
   stdout: PassThrough;
   isKilled: () => boolean;
+  failSpawn: () => void;
 }> {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
@@ -140,10 +182,23 @@ function createFakeChild(): Readonly<{
     stdin,
     stdout,
     stderr: null,
+    exitCode: null,
+    signalCode: null,
     kill: () => {
       killed = true;
+      events.emit("exit", null, "SIGTERM");
       return true;
     },
   }) as unknown as ChildProcess;
-  return { child, stdin, stdout, isKilled: () => killed };
+  stdin.on("finish", () => events.emit("exit", 0, null));
+  return {
+    child,
+    stdin,
+    stdout,
+    isKilled: () => killed,
+    failSpawn: () => {
+      events.emit("error", new Error("spawn failed"));
+      events.emit("close", -2, null);
+    },
+  };
 }

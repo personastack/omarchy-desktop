@@ -61,6 +61,7 @@ const programmaticChatClose = new WeakSet<BrowserWindow>();
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let isQuitting = false;
+let companionShutdownComplete = false;
 let chatScope = "";
 let companionClient: CompanionClient | undefined;
 
@@ -71,9 +72,16 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on("second-instance", () => openMainWindow());
 
-  app.on("before-quit", () => {
+  app.on("before-quit", (event) => {
+    if (companionClient && !companionShutdownComplete) {
+      event.preventDefault();
+      void companionClient.close().then(() => {
+        companionShutdownComplete = true;
+        app.quit();
+      });
+      return;
+    }
     isQuitting = true;
-    companionClient?.close();
   });
 
   app.whenReady().then(() => {
@@ -283,7 +291,7 @@ function registerBridgeHandlers(): void {
 
 function getCompanionClient(): CompanionClient | undefined {
   if (process.platform !== "linux") return undefined;
-  if (companionClient?.isOpen) return companionClient;
+  if (companionClient) return companionClient.isOpen ? companionClient : undefined;
   try {
     const binaryPath = app.isPackaged
       ? join(process.resourcesPath, "bin", "personastack-companion")
@@ -294,8 +302,8 @@ function getCompanionClient(): CompanionClient | undefined {
     const clear = (): void => {
       if (companionClient === client) companionClient = undefined;
     };
-    child.once("error", clear);
     child.once("exit", clear);
+    child.once("close", clear);
     return client;
   } catch {
     return undefined;

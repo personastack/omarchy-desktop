@@ -134,8 +134,18 @@ func New(installation desktopcontrol.Installation, origin string, handler Comman
 }
 
 func (c *Connection) Connect(ctx context.Context) error {
-	if ctx == nil {
+	return c.ConnectWithLifetime(ctx, ctx)
+}
+
+// ConnectWithLifetime uses ctx for the bounded handshake and lifetime for the
+// connected socket. This lets request cancellation stop setup without owning
+// a successfully established desktop session.
+func (c *Connection) ConnectWithLifetime(ctx, lifetime context.Context) error {
+	if ctx == nil || lifetime == nil {
 		return ErrUnavailable
+	}
+	if err := lifetime.Err(); err != nil {
+		return err
 	}
 	c.mu.Lock()
 	if c.closing {
@@ -185,6 +195,16 @@ func (c *Connection) Connect(ctx context.Context) error {
 	}
 	c.connectingSocket = conn
 	c.mu.Unlock()
+	var handshakeMu sync.Mutex
+	handshakeComplete := false
+	stopHandshakeCancel := context.AfterFunc(ctx, func() {
+		handshakeMu.Lock()
+		defer handshakeMu.Unlock()
+		if !handshakeComplete {
+			_ = conn.Close()
+		}
+	})
+	defer stopHandshakeCancel()
 	conn.SetReadLimit(agentgatewayruntime.DesktopControlFrameLimit)
 	if err := conn.SetReadDeadline(c.now().Add(maximumHandshakeWait)); err != nil {
 		_ = conn.Close()
@@ -192,6 +212,13 @@ func (c *Connection) Connect(ctx context.Context) error {
 	}
 	frame, err := readFrame(conn)
 	if err != nil {
+		_ = conn.Close()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		_ = conn.Close()
 		return err
 	}
@@ -215,10 +242,22 @@ func (c *Connection) Connect(ctx context.Context) error {
 		_ = conn.Close()
 		return fmt.Errorf("set desktop gateway heartbeat deadline: %w", err)
 	}
-	connectionContext, connectionCancel := context.WithCancel(ctx)
+	if err := lifetime.Err(); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	connectionContext, connectionCancel := context.WithCancel(lifetime)
+	handshakeMu.Lock()
+	if err := ctx.Err(); err != nil {
+		handshakeMu.Unlock()
+		connectionCancel()
+		_ = conn.Close()
+		return err
+	}
 	c.mu.Lock()
 	if c.closing || c.connected || c.conn != nil {
 		c.mu.Unlock()
+		handshakeMu.Unlock()
 		connectionCancel()
 		_ = conn.Close()
 		return ErrConnectionEnded
@@ -238,6 +277,8 @@ func (c *Connection) Connect(ctx context.Context) error {
 	c.diagnosticsSupported = frame.DiagnosticsSupported
 	c.activeCommands = make(map[string]context.CancelFunc)
 	c.mu.Unlock()
+	handshakeComplete = true
+	handshakeMu.Unlock()
 	go c.readLoop(connectionContext, generation, conn)
 	go c.heartbeatLoop(connectionContext, generation)
 	return nil

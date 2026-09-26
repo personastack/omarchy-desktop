@@ -83,6 +83,18 @@ func TestEnrollPreservesAPIErrorWithoutWritingCredential(t *testing.T) {
 	}
 }
 
+func TestEnrollDoesNotStoreCredentialAfterContextCancellation(t *testing.T) {
+	t.Parallel()
+	store := &memoryStore{}
+	service := mustService(t, &apiRecorder{installation: testInstallation()}, store)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := service.Enroll(ctx, "ticket", apicontract.DesktopControlOperatingSystemLinux)
+	if !errors.Is(err, context.Canceled) || len(store.saved) != 0 {
+		t.Fatalf("Enroll() = %v, saved %#v", err, store.saved)
+	}
+}
+
 func TestStatusSeparatesEnrollmentCredentialAndRelayState(t *testing.T) {
 	t.Parallel()
 	t.Run("not enrolled", func(t *testing.T) {

@@ -48,16 +48,18 @@ type Request struct {
 type ErrorCode string
 
 const (
-	ErrorInvalidRequest     ErrorCode = "invalid_request"
-	ErrorNotEnrolled        ErrorCode = "not_enrolled"
-	ErrorKeyringUnavailable ErrorCode = "keyring_unavailable"
-	ErrorRejected           ErrorCode = "rejected"
-	ErrorUnavailable        ErrorCode = "unavailable"
-	ErrorInvalidBundle      ErrorCode = "invalid_bundle"
-	ErrorStaleRequest       ErrorCode = "stale_request"
-	ErrorMissingHarness     ErrorCode = "missing_harness"
-	ErrorOutdatedHarness    ErrorCode = "outdated_harness"
-	ErrorUnsafeFiles        ErrorCode = "unsafe_files"
+	ErrorInvalidRequest      ErrorCode = "invalid_request"
+	ErrorNotEnrolled         ErrorCode = "not_enrolled"
+	ErrorKeyringUnavailable  ErrorCode = "keyring_unavailable"
+	ErrorRejected            ErrorCode = "rejected"
+	ErrorUnavailable         ErrorCode = "unavailable"
+	ErrorInvalidBundle       ErrorCode = "invalid_bundle"
+	ErrorStaleRequest        ErrorCode = "stale_request"
+	ErrorMissingHarness      ErrorCode = "missing_harness"
+	ErrorOutdatedHarness     ErrorCode = "outdated_harness"
+	ErrorUnsafeFiles         ErrorCode = "unsafe_files"
+	ErrorSessionLocked       ErrorCode = "session_locked"
+	ErrorSessionStateUnknown ErrorCode = "session_state_unknown"
 )
 
 type Result struct {
@@ -83,20 +85,26 @@ type Service interface {
 }
 
 type Processor struct {
-	mu            sync.Mutex
-	service       Service
-	localSessions LocalSessionService
-	origin        string
-	scope         string
-	synced        bool
-	generation    uint64
-	nextCommandID uint64
-	commands      map[uint64]context.CancelFunc
+	mu             sync.Mutex
+	service        Service
+	localSessions  LocalSessionService
+	controlRuntime ControlRuntime
+	origin         string
+	scope          string
+	synced         bool
+	generation     uint64
+	nextCommandID  uint64
+	commands       map[uint64]context.CancelFunc
 }
 
 type LocalSessionService interface {
 	SynchronizeScope(string)
 	Handle(context.Context, string, localsession.Command) (json.RawMessage, error)
+}
+
+type ControlRuntime interface {
+	LocalState(context.Context, string) (installation.LocalState, error)
+	Prepare(context.Context, string, string) (installation.LocalState, error)
 }
 
 func New(service Service, origin string) (*Processor, error) {
@@ -115,6 +123,16 @@ func NewWithLocalSessions(service Service, localSessions LocalSessionService, or
 		return nil, ErrInvalidRequest
 	}
 	processor.localSessions = localSessions
+	return processor, nil
+}
+
+func NewWithControlRuntime(service Service, localSessions LocalSessionService, controlRuntime ControlRuntime, origin string) (*Processor, error) {
+	processor, err := New(service, origin)
+	if err != nil || controlRuntime == nil {
+		return nil, ErrInvalidRequest
+	}
+	processor.localSessions = localSessions
+	processor.controlRuntime = controlRuntime
 	return processor, nil
 }
 
@@ -219,7 +237,15 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 		response.Error = ErrorInvalidRequest
 		return response
 	}
-	state, err := p.service.LocalState(commandCtx, p.origin)
+	var state installation.LocalState
+	var err error
+	if request.Action == ActionPrepare && p.controlRuntime != nil {
+		state, err = p.controlRuntime.Prepare(commandCtx, p.origin, request.EnrollmentTicket)
+	} else if p.controlRuntime != nil {
+		state, err = p.controlRuntime.LocalState(commandCtx, p.origin)
+	} else {
+		state, err = p.service.LocalState(commandCtx, p.origin)
+	}
 	if !p.commandCurrent(request.Scope, generation) {
 		response.Error = ErrorStaleRequest
 		return response
@@ -235,7 +261,7 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 		RelayPaused: state.RelayPaused, OperatingSystem: "linux",
 	}
 	if request.Action == ActionPrepare {
-		runtimeAvailable := false
+		runtimeAvailable := p.controlRuntime != nil
 		result.RuntimeAvailable = &runtimeAvailable
 	}
 	response.Result = result
@@ -295,6 +321,15 @@ func (p *Processor) CancelAll() {
 }
 
 func errorCode(err error) ErrorCode {
+	var coded interface{ DesktopControlErrorCode() string }
+	if errors.As(err, &coded) {
+		switch coded.DesktopControlErrorCode() {
+		case "session_locked":
+			return ErrorSessionLocked
+		case "session_state_unknown":
+			return ErrorSessionStateUnknown
+		}
+	}
 	switch {
 	case errors.Is(err, ErrInvalidRequest), errors.Is(err, desktopcontrol.ErrInvalidRequest):
 		return ErrorInvalidRequest

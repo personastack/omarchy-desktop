@@ -153,6 +153,59 @@ func TestProcessorPrepareReportsUnimplementedRuntimeWithoutEnrollment(t *testing
 	}
 }
 
+func TestProcessorPrepareUsesIntegratedRuntimeReadiness(t *testing.T) {
+	t.Parallel()
+	installationID := "install_01"
+	lifecycle := &controlRuntimeStub{state: installation.LocalState{
+		InstallationID: &installationID, CuaReady: true, NativeExecutorReady: true,
+		GatewayConnected: true,
+	}}
+	processor, err := NewWithControlRuntime(&serviceStub{}, nil, lifecycle, "https://my.personastack.ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor.Handle(context.Background(), Request{ID: 1, Version: "1", Action: ActionSync, Scope: "workspace:a"})
+	result := processor.Handle(context.Background(), Request{
+		ID: 2, Version: "1", Action: ActionPrepare, Scope: "workspace:a", EnrollmentTicket: strings.Repeat("A", 43),
+	})
+	if !result.OK || result.Result == nil || result.Result.RuntimeAvailable == nil || !*result.Result.RuntimeAvailable ||
+		result.Result.InstallationID == nil || *result.Result.InstallationID != installationID || !result.Result.CuaReady ||
+		!result.Result.NativeExecutorReady || !result.Result.GatewayConnected || result.Result.RelayPaused {
+		t.Fatalf("integrated prepare result = %#v", result)
+	}
+	if lifecycle.prepareCalls != 1 || lifecycle.lastTicket != strings.Repeat("A", 43) || lifecycle.stateCalls != 0 {
+		t.Fatalf("lifecycle calls = prepare:%d state:%d", lifecycle.prepareCalls, lifecycle.stateCalls)
+	}
+}
+
+func TestProcessorPreservesFiniteLifecycleLockErrors(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		code string
+		want ErrorCode
+	}{
+		{name: "locked", code: "session_locked", want: ErrorSessionLocked},
+		{name: "unknown", code: "session_state_unknown", want: ErrorSessionStateUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			lifecycle := &controlRuntimeStub{prepareErr: finiteControlError{code: test.code}}
+			processor, err := NewWithControlRuntime(&serviceStub{}, nil, lifecycle, "https://my.personastack.ai")
+			if err != nil {
+				t.Fatal(err)
+			}
+			processor.Handle(context.Background(), Request{ID: 1, Version: "1", Action: ActionSync, Scope: "workspace:a"})
+			result := processor.Handle(context.Background(), Request{
+				ID: 2, Version: "1", Action: ActionPrepare, Scope: "workspace:a", EnrollmentTicket: strings.Repeat("A", 43),
+			})
+			if result.OK || result.Error != test.want {
+				t.Fatalf("prepare = %#v, want error %q", result, test.want)
+			}
+		})
+	}
+}
+
 func TestProcessorScopeChangeCancelsInFlightCommand(t *testing.T) {
 	t.Parallel()
 	service := &blockingService{started: make(chan struct{}), canceled: make(chan struct{})}
@@ -251,6 +304,30 @@ type serviceStub struct {
 	state  installation.LocalState
 	err    error
 }
+
+type controlRuntimeStub struct {
+	state        installation.LocalState
+	prepareCalls int
+	stateCalls   int
+	lastTicket   string
+	prepareErr   error
+}
+
+func (runtime *controlRuntimeStub) LocalState(context.Context, string) (installation.LocalState, error) {
+	runtime.stateCalls++
+	return runtime.state, nil
+}
+
+func (runtime *controlRuntimeStub) Prepare(_ context.Context, _ string, ticket string) (installation.LocalState, error) {
+	runtime.prepareCalls++
+	runtime.lastTicket = ticket
+	return runtime.state, runtime.prepareErr
+}
+
+type finiteControlError struct{ code string }
+
+func (err finiteControlError) Error() string                   { return "finite lifecycle error" }
+func (err finiteControlError) DesktopControlErrorCode() string { return err.code }
 
 type blockingService struct {
 	started  chan struct{}

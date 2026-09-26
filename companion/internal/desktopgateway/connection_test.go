@@ -66,6 +66,46 @@ func TestConnectionConnectsAndDispatchesCommand(t *testing.T) {
 	}
 }
 
+func TestConnectionSetupCancellationClosesPendingHandshake(t *testing.T) {
+	t.Parallel()
+	installation := testInstallation()
+	socket := &fakeSocket{
+		incoming: make(chan socketMessage, 8), outgoing: make(chan socketMessage, 8),
+		closed: make(chan struct{}), readStarted: make(chan struct{}),
+	}
+	client, err := New(installation, installation.EnvironmentOrigin, func(context.Context, agentgatewayruntime.DesktopControlFrame, func(agentgatewayruntime.DesktopControlFrame) error) agentgatewayruntime.DesktopControlFrame {
+		return agentgatewayruntime.DesktopControlFrame{}
+	}, Options{Dial: socketDialer(socket, installation)})
+	if err != nil {
+		t.Fatal("create desktop gateway connection")
+	}
+	setupContext, cancelSetup := context.WithCancel(context.Background())
+	connected := make(chan error, 1)
+	go func() { connected <- client.ConnectWithLifetime(setupContext, context.Background()) }()
+	select {
+	case <-socket.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("gateway handshake did not start")
+	}
+	cancelSetup()
+	select {
+	case err := <-connected:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("connect after setup cancellation = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("setup cancellation did not stop the pending handshake")
+	}
+	if client.Status().Connected {
+		t.Fatal("canceled setup published a gateway connection")
+	}
+	select {
+	case <-socket.closed:
+	default:
+		t.Fatal("canceled handshake socket remained open for Ready")
+	}
+}
+
 func TestConnectionRejectsExpiredCommandWithoutDispatch(t *testing.T) {
 	t.Parallel()
 	installation := testInstallation()
@@ -480,6 +520,43 @@ func TestConnectionClosesWhenItsOwnerContextEnds(t *testing.T) {
 	if client.Status().Connected {
 		t.Fatal("gateway remained connected after its owner stopped")
 	}
+}
+
+func TestConnectionLifetimeOutlivesHandshakeRequestContext(t *testing.T) {
+	t.Parallel()
+	installation := testInstallation()
+	socket := newFakeSocket(t, agentgatewayruntime.DesktopControlFrame{Version: 1, Type: agentgatewayruntime.DesktopControlFrameReady})
+	client, err := New(installation, installation.EnvironmentOrigin, func(context.Context, agentgatewayruntime.DesktopControlFrame, func(agentgatewayruntime.DesktopControlFrame) error) agentgatewayruntime.DesktopControlFrame {
+		return agentgatewayruntime.DesktopControlFrame{}
+	}, Options{Dial: socketDialer(socket, installation)})
+	if err != nil {
+		t.Fatal("create desktop gateway connection")
+	}
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	lifetimeContext, cancelLifetime := context.WithCancel(context.Background())
+	defer cancelLifetime()
+	if err := client.ConnectWithLifetime(requestContext, lifetimeContext); err != nil {
+		t.Fatalf("connect desktop gateway: %v", err)
+	}
+	cancelRequest()
+	if !client.Status().Connected {
+		t.Fatal("request cancellation closed a lifecycle-owned Gateway")
+	}
+	select {
+	case err := <-waitResult(client):
+		t.Fatalf("Gateway ended with its setup request: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancelLifetime()
+	if err := client.Wait(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("lifecycle cancellation result = %v", err)
+	}
+}
+
+func waitResult(client *Connection) <-chan error {
+	result := make(chan error, 1)
+	go func() { result <- client.Wait(context.Background()) }()
+	return result
 }
 
 func TestConnectionCloseCancelsInProgressDial(t *testing.T) {

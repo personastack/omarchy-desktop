@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -8,9 +10,14 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/personastack/omarchy-desktop/companion/internal/credentialstore"
+	"github.com/personastack/omarchy-desktop/companion/internal/cuaruntime"
 	"github.com/personastack/omarchy-desktop/companion/internal/desktopbridge"
+	"github.com/personastack/omarchy-desktop/companion/internal/desktoplifecycle"
+	"github.com/personastack/omarchy-desktop/companion/internal/desktoplocal"
+	"github.com/personastack/omarchy-desktop/companion/internal/hyprlandlock"
 	"github.com/personastack/omarchy-desktop/companion/internal/installation"
 	"github.com/personastack/omarchy-desktop/companion/localsession"
 	"github.com/personastack/personastack-api/pkg/client/desktopcontrol"
@@ -30,11 +37,33 @@ func main() {
 	if err != nil {
 		os.Exit(2)
 	}
+	managedRuntime, runtimeErr := cuaruntime.NewDefault()
+	shell, shellErr := localsession.LoginShell()
+	var controlRuntime *desktoplifecycle.Controller
+	if runtimeErr == nil {
+		if shellErr == nil {
+			controlRuntime, err = desktoplifecycle.New(desktoplifecycle.Options{
+				Origin: os.Args[1], Runtime: managedRuntime, Installations: service,
+				LockProbe: hyprlandlock.NewProbe(), Local: desktoplocal.New(shell),
+			})
+		}
+		if shellErr != nil || err != nil {
+			managedRuntime.Close()
+		}
+	}
 	probe := localsession.NewProbe()
 	installer, installerErr := localsession.DefaultFileInstaller()
 	preferences, preferencesErr := localsession.NewFilePreferences()
 	var processor *desktopbridge.Processor
-	if installerErr == nil && preferencesErr == nil {
+	if controlRuntime != nil {
+		var manager desktopbridge.LocalSessionService
+		if installerErr == nil && preferencesErr == nil {
+			if created, managerErr := localsession.NewManager(probe, installer, preferences); managerErr == nil {
+				manager = created
+			}
+		}
+		processor, err = desktopbridge.NewWithControlRuntime(service, manager, controlRuntime, os.Args[1])
+	} else if installerErr == nil && preferencesErr == nil {
 		manager, managerErr := localsession.NewManager(probe, installer, preferences)
 		if managerErr == nil {
 			processor, err = desktopbridge.NewWithLocalSessions(service, manager, os.Args[1])
@@ -45,10 +74,38 @@ func main() {
 		processor, err = desktopbridge.New(service, os.Args[1])
 	}
 	if err != nil {
+		if controlRuntime != nil {
+			closeControlRuntime(context.Background(), controlRuntime)
+		}
 		os.Exit(2)
 	}
-	if err := serve(os.Stdin, os.Stdout, processor); err != nil {
+	if controlRuntime != nil {
+		controlRuntime.StartRecovery()
+	}
+	serveErr := serve(os.Stdin, os.Stdout, processor)
+	if controlRuntime != nil {
+		closeControlRuntime(context.Background(), controlRuntime)
+	}
+	if serveErr != nil {
 		os.Exit(1)
+	}
+}
+
+func closeControlRuntime(ctx context.Context, runtime *desktoplifecycle.Controller) {
+	for ctx.Err() == nil {
+		closeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+		closed := runtime.Close(closeContext)
+		cancel()
+		if closed {
+			return
+		}
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 }
 

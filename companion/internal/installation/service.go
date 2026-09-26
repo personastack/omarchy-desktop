@@ -59,11 +59,14 @@ func New(api API, store Store) (*Service, error) {
 }
 
 func (s *Service) Enroll(ctx context.Context, ticket string, operatingSystem apicontract.DesktopControlOperatingSystem) error {
-	if operatingSystem != apicontract.DesktopControlOperatingSystemLinux {
+	if ctx == nil || operatingSystem != apicontract.DesktopControlOperatingSystemLinux {
 		return desktopcontrol.ErrInvalidRequest
 	}
 	installation, err := s.api.Enroll(ctx, ticket, operatingSystem)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := installation.Validate(installation.EnvironmentOrigin); err != nil {

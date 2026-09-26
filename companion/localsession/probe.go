@@ -242,6 +242,16 @@ func loginShell() (string, error) {
 	return "", ErrMissingHarness
 }
 
+// LoginShell returns the current user's executable login shell for managed
+// local process execution.
+func LoginShell() (string, error) {
+	shell, err := loginShell()
+	if err != nil || !isExecutable(shell) {
+		return "", ErrMissingHarness
+	}
+	return shell, nil
+}
+
 func isExecutable(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0

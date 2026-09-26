@@ -6,6 +6,7 @@ const MAX_RESPONSE_BYTES = 4 * 1024;
 const MAX_REQUEST_BYTES = 13 * 1024 * 1024;
 const MAX_PENDING_REQUESTS = 8;
 const REQUEST_TIMEOUT_MS = 45_000;
+const DESKTOP_CONTROL_PREPARE_TIMEOUT_MS = 4 * 60_000;
 const LOCAL_SESSION_TIMEOUT_MS = 4 * 60_000;
 const MAX_REQUEST_ID = Number.MAX_SAFE_INTEGER;
 
@@ -18,13 +19,15 @@ export type DesktopControlState = Readonly<{
   relay_paused: boolean;
 }>;
 
-type DesktopControlPrepared = DesktopControlState & Readonly<{ runtime_available: false }>;
+type DesktopControlPrepared = DesktopControlState & Readonly<{ runtime_available: boolean }>;
 
 export type DesktopControlError =
   | "invalid_request"
   | "not_enrolled"
   | "keyring_unavailable"
   | "rejected"
+  | "session_locked"
+  | "session_state_unknown"
   | "unavailable"
   | "unsupported_platform"
   | "stale_request";
@@ -65,6 +68,7 @@ export class CompanionClient {
   private output = "";
   private nextRequestID = 1;
   private closed = false;
+  private closePromise?: Promise<void>;
   private readonly child: ChildProcess;
 
   constructor(child: ChildProcess) {
@@ -110,7 +114,9 @@ export class CompanionClient {
       return Promise.resolve({ ok: false, error: "unavailable" });
     }
     return new Promise((resolve) => {
-      const timeoutMs = localAction === "prepare" || localAction === "configure" ? LOCAL_SESSION_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+      const timeoutMs = action === "prepare"
+        ? DESKTOP_CONTROL_PREPARE_TIMEOUT_MS
+        : localAction === "prepare" || localAction === "configure" ? LOCAL_SESSION_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
       const timeout = setTimeout(() => this.failAll(), timeoutMs);
       this.pending.set(id, { action, localAction, resolve, timeout });
       try {
@@ -123,9 +129,25 @@ export class CompanionClient {
     });
   }
 
-  close(): void {
-    if (this.closed) return;
-    this.failAll();
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
+      pending.resolve({ ok: false, error: "unavailable" });
+    }
+    this.pending.clear();
+    this.closePromise = new Promise((resolve) => {
+      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+        resolve();
+        return;
+      }
+      this.child.once("exit", () => resolve());
+      this.child.once("close", () => resolve());
+      this.child.once("error", () => resolve());
+      this.child.stdin?.end();
+    });
+    return this.closePromise;
   }
 
   private readonly onData = (chunk: Buffer | string): void => {
@@ -168,13 +190,7 @@ export class CompanionClient {
 
   private failAll(): void {
     if (this.closed) return;
-    this.closed = true;
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.timeout);
-      pending.resolve({ ok: false, error: "unavailable" });
-    }
-    this.pending.clear();
-    this.child.kill("SIGTERM");
+    void this.close();
   }
 }
 
@@ -189,7 +205,7 @@ function matchesCommandResponse(action: CompanionAction, localAction: LocalSessi
   }
   if (!result.ok) return isError(result.error);
   if (action === "sync") return !hasLocalState(result);
-  if (action === "prepare") return hasLocalState(result) && "runtime_available" in result && result.runtime_available === false;
+  if (action === "prepare") return hasLocalState(result) && "runtime_available" in result && typeof result.runtime_available === "boolean";
   if ("runtime_available" in result) return false;
   return hasLocalState(result);
 }
@@ -209,8 +225,8 @@ function parseResponse(value: unknown, action: CompanionAction): Readonly<{ id: 
       return { id: Number(value.id), result: { ok: true, ...value.result, operating_system: "linux" } };
     }
     if (hasExactKeys(value.result, ["installation_id", "operating_system", "runtime_available", "cua_ready", "native_executor_ready", "gateway_connected", "relay_paused"]) &&
-        isLocalState(value.result) && value.result.operating_system === "linux" && value.result.runtime_available === false) {
-      return { id: Number(value.id), result: { ok: true, ...value.result, operating_system: "linux", runtime_available: false } };
+        isLocalState(value.result) && value.result.operating_system === "linux" && typeof value.result.runtime_available === "boolean") {
+      return { id: Number(value.id), result: { ok: true, ...value.result, operating_system: "linux", runtime_available: value.result.runtime_available } };
     }
     return undefined;
   }
@@ -249,7 +265,7 @@ function hasLocalState(value: CompanionResult): value is Readonly<{ ok: true }> 
 
 function isError(value: unknown): value is Exclude<DesktopControlError, "unsupported_platform" | "stale_request"> {
   return value === "invalid_request" || value === "not_enrolled" || value === "keyring_unavailable" ||
-    value === "rejected" || value === "unavailable";
+    value === "rejected" || value === "session_locked" || value === "session_state_unknown" || value === "unavailable";
 }
 
 function isLocalSessionError(value: unknown): value is LocalSessionError {

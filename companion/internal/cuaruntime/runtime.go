@@ -251,6 +251,21 @@ func (r *Runtime) Close() {
 	stopClient(client, runCancel)
 }
 
+// Stop releases the managed child while keeping the runtime reusable for a
+// later authorized setup. Close is reserved for process shutdown.
+func (r *Runtime) Stop() {
+	r.prepareGate <- struct{}{}
+	defer func() { <-r.prepareGate }()
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	client, runCancel := r.detachLocked()
+	r.mu.Unlock()
+	stopClient(client, runCancel)
+}
+
 func (r *Runtime) detachLocked() (Client, context.CancelFunc) {
 	client, cancel := r.client, r.runCancel
 	r.client = nil
