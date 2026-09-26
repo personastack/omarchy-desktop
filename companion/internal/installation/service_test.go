@@ -186,6 +186,22 @@ func TestLocalStateReadsOnlyProtectedLocalIdentity(t *testing.T) {
 	})
 }
 
+func TestStoredInstallationKeepsCredentialInsideNativeServiceBoundary(t *testing.T) {
+	t.Parallel()
+	installation := testInstallation()
+	service := mustService(t, &apiRecorder{}, &memoryStore{loaded: installationPointer(installation)})
+	got, err := service.StoredInstallation(context.Background(), installation.EnvironmentOrigin)
+	if err != nil || got != installation {
+		t.Fatalf("StoredInstallation() = %#v, %v", got, err)
+	}
+	if _, err := service.StoredInstallation(context.Background(), "https://personastack.ericgreer.info"); !errors.Is(err, desktopcontrol.ErrInvalidRequest) {
+		t.Fatalf("StoredInstallation() for a different origin = %v", err)
+	}
+	if _, err := service.StoredInstallation(nil, installation.EnvironmentOrigin); !errors.Is(err, credentialstore.ErrUnavailable) {
+		t.Fatalf("StoredInstallation() with nil context = %v", err)
+	}
+}
+
 func TestLifecycleOperationsUseStoredInstallation(t *testing.T) {
 	t.Parallel()
 	installation := testInstallation()

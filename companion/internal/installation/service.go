@@ -126,6 +126,15 @@ func (s *Service) LocalState(ctx context.Context, origin string) (LocalState, er
 	return LocalState{InstallationID: &installation.InstallationID, RelayPaused: true}, nil
 }
 
+// StoredInstallation returns the API-issued machine identity to native
+// lifecycle code. Callers must keep its credential in process memory only.
+func (s *Service) StoredInstallation(ctx context.Context, origin string) (desktopcontrol.Installation, error) {
+	if ctx == nil {
+		return desktopcontrol.Installation{}, credentialstore.ErrUnavailable
+	}
+	return s.load(ctx, origin)
+}
+
 func (s *Service) ReportReadiness(ctx context.Context, origin string, readiness apicontract.DesktopControlReadiness) error {
 	installation, err := s.load(ctx, origin)
 	if err != nil {
