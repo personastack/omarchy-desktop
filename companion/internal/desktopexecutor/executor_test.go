@@ -23,6 +23,7 @@ func TestExecutorRequiresExclusiveScopedLeaseForCuaCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	unlockExecutorForTest(t, executor)
 	command := commandFrame(agentgatewayruntime.DesktopControlOperationObserve, `{"control_token":"missing","tool":"get_desktop_state","arguments":{}}`)
 	denied := executor.Handle(context.Background(), command, nil)
 	if denied.Type != agentgatewayruntime.DesktopControlFrameFailure || runner.calls != 0 {
@@ -50,6 +51,83 @@ func TestExecutorRequiresExclusiveScopedLeaseForCuaCalls(t *testing.T) {
 	release := commandFrame(agentgatewayruntime.DesktopControlOperationRelease, `{"control_token":"`+token+`"}`)
 	if got := executor.Handle(context.Background(), release, nil); got.Type != agentgatewayruntime.DesktopControlFrameResult || string(got.Result) != `{"released":true}` {
 		t.Fatalf("producer-shaped release = %#v", got)
+	}
+}
+
+func TestExecutorStartsFencedUntilSessionUnlockIsKnown(t *testing.T) {
+	t.Parallel()
+	local := &localOperationsStub{closeOK: true}
+	executor, err := NewWithLocalOperations(&runnerStub{response: json.RawMessage(`{}`)}, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { executor.Close(context.Background()) })
+	acquire := commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`)
+	if got := executor.Handle(context.Background(), acquire, nil); got.ErrorCode != "desktop_control_session_state_unknown" || executor.NativeReady() {
+		t.Fatalf("unknown session lock state admitted control: %#v ready=%t", got, executor.NativeReady())
+	}
+	status := executor.Handle(context.Background(), commandFrame(agentgatewayruntime.DesktopControlOperationStatus, `{}`), nil)
+	if string(status.Result) != `{"available":false,"busy":false,"native_executor_ready":false,"session_lock_state":"unknown"}` {
+		t.Fatalf("unknown session status = %s", status.Result)
+	}
+	if !executor.SetSessionLockState(context.Background(), SessionLockLocked) {
+		t.Fatal("locked session state was not accepted")
+	}
+	if got := executor.Handle(context.Background(), acquire, nil); got.ErrorCode != "desktop_control_session_locked" {
+		t.Fatalf("locked session admitted control: %#v", got)
+	}
+	if !executor.SetSessionLockState(context.Background(), SessionLockUnlocked) || !executor.NativeReady() {
+		t.Fatal("confirmed unlocked session did not become ready")
+	}
+	if got := executor.Handle(context.Background(), acquire, nil); got.Type != agentgatewayruntime.DesktopControlFrameResult {
+		t.Fatalf("unlocked session did not admit lease: %#v", got)
+	}
+}
+
+func TestSessionLockFencesActiveWorkAndRevokesLease(t *testing.T) {
+	t.Parallel()
+	local := &localOperationsStub{response: json.RawMessage(`{}`), closeOK: true, entered: make(chan struct{}), waitForContext: true}
+	executor := newLocalExecutor(t, local)
+	token := acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
+	command := commandFrame(agentgatewayruntime.DesktopControlOperationFile,
+		`{"control_token":"`+token+`","action":"search","root":"/tmp","name_contains":"x"}`)
+	finished := make(chan agentgatewayruntime.DesktopControlFrame, 1)
+	go func() { finished <- executor.Handle(context.Background(), command, nil) }()
+	<-local.entered
+	lockContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !executor.SetSessionLockState(lockContext, SessionLockLocked) {
+		t.Fatal("lock transition did not finish cleanup")
+	}
+	if got := <-finished; got.Type != agentgatewayruntime.DesktopControlFrameFailure || got.ErrorCode != "desktop_control_required" {
+		t.Fatalf("late locked-session result = %#v", got)
+	}
+	if local.closeCount() != 1 || executor.NativeReady() {
+		t.Fatalf("lock cleanup calls=%d ready=%t", local.closeCount(), executor.NativeReady())
+	}
+	if got := executor.Handle(lockContext, command, nil); got.ErrorCode != "desktop_control_session_locked" || local.callCount() != 1 {
+		t.Fatalf("locked-session operation = %#v calls=%d", got, local.callCount())
+	}
+	if !executor.SetSessionLockState(lockContext, SessionLockUnlocked) {
+		t.Fatal("unlock after cleanup did not succeed")
+	}
+	if got := executor.Handle(lockContext, command, nil); got.ErrorCode != "desktop_control_required" || local.callCount() != 1 {
+		t.Fatalf("pre-lock lease survived unlock: %#v calls=%d", got, local.callCount())
+	}
+}
+
+func TestUnconfirmedLockCleanupCannotReenableControl(t *testing.T) {
+	t.Parallel()
+	local := &localOperationsStub{closeOK: false}
+	executor := newLocalExecutor(t, local)
+	if token := acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`)); token == "" {
+		t.Fatal("initial lease was not granted")
+	}
+	if executor.SetSessionLockState(context.Background(), SessionLockLocked) {
+		t.Fatal("unconfirmed lock cleanup reported success")
+	}
+	if executor.NativeReady() || executor.SetSessionLockState(context.Background(), SessionLockUnlocked) {
+		t.Fatal("executor accepted unlock after unconfirmed cleanup")
 	}
 }
 
@@ -217,6 +295,7 @@ func TestExecutorRevocationFencesInFlightResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	unlockExecutorForTest(t, executor)
 	acquireFrame := commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`)
 	token := acquire(t, executor, acquireFrame)
 	if repeated := acquire(t, executor, acquireFrame); repeated != token {
@@ -245,10 +324,11 @@ func TestExecutorLeaseExpiresAndStatusStaysUnreadyUntilNativePathsExist(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	unlockExecutorForTest(t, executor)
 	executor.now = func() time.Time { return now }
 	token := acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
 	status := executor.Handle(context.Background(), commandFrame(agentgatewayruntime.DesktopControlOperationStatus, `{}`), nil)
-	if string(status.Result) != `{"available":false,"busy":true,"native_executor_ready":false}` || executor.NativeReady() {
+	if string(status.Result) != `{"available":false,"busy":true,"native_executor_ready":false,"session_lock_state":"unlocked"}` || executor.NativeReady() {
 		t.Fatalf("status=%s ready=%v", status.Result, executor.NativeReady())
 	}
 	now = now.Add(leaseIdleDuration + time.Second)
@@ -266,6 +346,7 @@ func TestExecutorLeaseHasHardMaximumLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	unlockExecutorForTest(t, executor)
 	executor.now = func() time.Time { return now }
 	token := acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
 	executor.mu.Lock()
@@ -337,6 +418,7 @@ func TestExecutorBoundsOversizedCuaImageBeforeGatewayFrameEncoding(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	unlockExecutorForTest(t, executor)
 	token := acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
 	command := commandFrame(agentgatewayruntime.DesktopControlOperationObserve, `{"control_token":"`+token+`","tool":"get_desktop_state","arguments":{}}`)
 	got := executor.Handle(context.Background(), command, nil)
@@ -441,6 +523,7 @@ func TestBindingRevocationDoesNotFenceOtherPersonas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	unlockExecutorForTest(t, executor)
 	first := commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`)
 	token := acquire(t, executor, first)
 	revoke := commandFrame(agentgatewayruntime.DesktopControlOperationRevokeBinding, `{}`)
@@ -469,6 +552,7 @@ func TestRevocationWaitsForActiveCommandBeforeAllowingAnotherLease(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	unlockExecutorForTest(t, executor)
 	token := acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
 	command := commandFrame(agentgatewayruntime.DesktopControlOperationObserve, `{"control_token":"`+token+`","tool":"get_desktop_state","arguments":{}}`)
 	commandDone := make(chan agentgatewayruntime.DesktopControlFrame, 1)
@@ -506,6 +590,7 @@ func TestStatusEnforcesRevocationAndEmptyRequestShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	unlockExecutorForTest(t, executor)
 	revoke := commandFrame(agentgatewayruntime.DesktopControlOperationRevokeConfig, `{}`)
 	revoke.Target = &agentgatewayruntime.DesktopControlTarget{InstallationID: "install", WorkspaceID: "workspace", ConfigID: "config", ConfigVersion: 2}
 	executor.Handle(context.Background(), revoke, nil)
@@ -551,8 +636,16 @@ func newLocalExecutor(t *testing.T, local *localOperationsStub) *Executor {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { executor.Close(context.Background()) })
+	unlockExecutorForTest(t, executor)
 	return executor
+}
+
+func unlockExecutorForTest(t *testing.T, executor *Executor) {
+	t.Helper()
+	if !executor.SetSessionLockState(context.Background(), SessionLockUnlocked) {
+		t.Fatal("failed to unlock test executor")
+	}
+	t.Cleanup(func() { executor.Close(context.Background()) })
 }
 
 func (local *localOperationsStub) Call(ctx context.Context, _ agentgatewayruntime.DesktopControlOperation, arguments json.RawMessage, processTimeout time.Duration) (json.RawMessage, error) {

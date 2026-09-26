@@ -23,6 +23,18 @@ const (
 
 var ErrUnavailable = errors.New("desktop executor unavailable")
 
+// SessionLockState is the native desktop session's observed lock condition.
+type SessionLockState string
+
+const (
+	// SessionLockUnknown keeps control disabled until the lock owner reports a state.
+	SessionLockUnknown SessionLockState = "unknown"
+	// SessionLockLocked fences all control operations.
+	SessionLockLocked SessionLockState = "locked"
+	// SessionLockUnlocked permits control when executor resources are ready.
+	SessionLockUnlocked SessionLockState = "unlocked"
+)
+
 type ToolRunner interface {
 	Call(context.Context, agentgatewayruntime.DesktopControlOperation, string, json.RawMessage) (json.RawMessage, error)
 }
@@ -86,6 +98,7 @@ type Executor struct {
 	cleanupGate     chan struct{}
 	closeCompleted  bool
 	closeResult     bool
+	sessionLock     SessionLockState
 }
 
 func New(runner ToolRunner) (*Executor, error) {
@@ -106,6 +119,7 @@ func NewWithLocalOperations(runner ToolRunner, local LocalOperations) (*Executor
 		shutdown:        make(chan struct{}),
 		closeGate:       make(chan struct{}, 1),
 		cleanupGate:     make(chan struct{}, 1),
+		sessionLock:     SessionLockUnknown,
 	}
 	if local != nil {
 		go executor.leaseExpiryLoop()
@@ -149,6 +163,8 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 		}
 		configAuthorized := e.isConfigAuthorized(scope, target.ConfigVersion)
 		bindingAuthorized := e.isBindingAuthorized(commandOwner)
+		ready := e.sessionLock == SessionLockUnlocked && e.local != nil && !e.unavailable && e.revocations == 0
+		lockState := e.sessionLock
 		if !configAuthorized || !bindingAuthorized {
 			e.mu.Unlock()
 			if !configAuthorized {
@@ -161,8 +177,17 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 		if !emptyArguments(frame.Arguments) {
 			return failure(frame, "invalid_arguments", "The Desktop Control status request is invalid.")
 		}
-		encoded, _ := json.Marshal(map[string]any{"available": false, "native_executor_ready": false, "busy": busy})
+		encoded, _ := json.Marshal(map[string]any{"available": ready, "busy": busy, "native_executor_ready": ready, "session_lock_state": lockState})
 		return result(frame, encoded)
+	}
+	e.mu.Lock()
+	lockState := e.sessionLock
+	e.mu.Unlock()
+	if lockState != SessionLockUnlocked {
+		if lockState == SessionLockUnknown {
+			return failure(frame, "desktop_control_session_state_unknown", "The desktop session lock state is unknown. Remote control is paused until it can be checked.")
+		}
+		return failure(frame, "desktop_control_session_locked", "Unlock the desktop session before using Desktop Control.")
 	}
 	if frame.Operation == agentgatewayruntime.DesktopControlOperationAcquire {
 		return e.acquire(frame, commandOwner, scope, target.ConfigVersion)
@@ -274,7 +299,59 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 	return commandResult
 }
 
-func (e *Executor) NativeReady() bool { return false }
+func (e *Executor) NativeReady() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.sessionLock == SessionLockUnlocked && e.local != nil && !e.unavailable && !e.closed && e.revocations == 0
+}
+
+// SetSessionLockState fences control before canceling active work. Unknown and
+// locked states remain fenced when cleanup cannot be confirmed.
+func (e *Executor) SetSessionLockState(ctx context.Context, state SessionLockState) bool {
+	if ctx == nil || (state != SessionLockUnknown && state != SessionLockLocked && state != SessionLockUnlocked) {
+		return false
+	}
+	e.mu.Lock()
+	if e.closed || e.unavailable {
+		e.mu.Unlock()
+		return false
+	}
+	previous := e.sessionLock
+	if previous == state {
+		e.mu.Unlock()
+		return true
+	}
+	e.sessionLock = state
+	if state == SessionLockUnlocked {
+		e.mu.Unlock()
+		return true
+	}
+	cleanupLocal := e.local != nil
+	e.current = nil
+	e.epoch++
+	e.revocations++
+	commands := e.cancelMatching(func(activeCommand) bool { return true })
+	e.mu.Unlock()
+	cleanupContext := ctx
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		cleanupContext, cancel = context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+	}
+	if !waitForCommandsContext(cleanupContext, commands) {
+		go func() {
+			for _, done := range commands {
+				<-done
+			}
+			cleaned := e.cleanupLocalResources(cleanupLocal, 5*time.Second)
+			e.finishRevocation(cleaned)
+		}()
+		return false
+	}
+	cleaned := e.cleanupLocalResourcesWithContext(cleanupContext, cleanupLocal)
+	e.finishRevocation(cleaned)
+	return cleaned
+}
 
 // Close stops lease monitoring, cancels active work, and closes local handles.
 // A false result requires the caller to keep the process alive and retry cleanup.
@@ -509,7 +586,7 @@ func (e *Executor) revokeBinding(frame agentgatewayruntime.DesktopControlFrame, 
 }
 
 func (e *Executor) authorize(commandOwner owner, scope configScope, version int64, token string) (bool, uint64) {
-	if e.revocations > 0 || e.current == nil || !e.leaseMatches(commandOwner, scope, version, token) || !e.isConfigAuthorized(scope, version) || !e.isBindingAuthorized(commandOwner) {
+	if e.sessionLock != SessionLockUnlocked || e.revocations > 0 || e.current == nil || !e.leaseMatches(commandOwner, scope, version, token) || !e.isConfigAuthorized(scope, version) || !e.isBindingAuthorized(commandOwner) {
 		return false, e.epoch
 	}
 	e.current.lastActivity = e.now()
@@ -517,7 +594,7 @@ func (e *Executor) authorize(commandOwner owner, scope configScope, version int6
 }
 
 func (e *Executor) authorizedAfterCall(commandOwner owner, scope configScope, version int64, token string, epoch uint64) bool {
-	return e.epoch == epoch && e.leaseMatches(commandOwner, scope, version, token) && e.isConfigAuthorized(scope, version) && e.isBindingAuthorized(commandOwner)
+	return e.sessionLock == SessionLockUnlocked && e.epoch == epoch && e.leaseMatches(commandOwner, scope, version, token) && e.isConfigAuthorized(scope, version) && e.isBindingAuthorized(commandOwner)
 }
 
 func (e *Executor) leaseMatches(commandOwner owner, scope configScope, version int64, token string) bool {
