@@ -7,11 +7,16 @@ const MAX_PENDING_REQUESTS = 8;
 const REQUEST_TIMEOUT_MS = 45_000;
 const MAX_REQUEST_ID = Number.MAX_SAFE_INTEGER;
 
-export type DesktopControlStatus = Readonly<{
-  enrolled: boolean;
-  credential_valid: boolean;
-  relay_active: boolean;
+export type DesktopControlState = Readonly<{
+  installation_id: string | null;
+  operating_system: "linux";
+  cua_ready: boolean;
+  native_executor_ready: boolean;
+  gateway_connected: boolean;
+  relay_paused: boolean;
 }>;
+
+type DesktopControlPrepared = DesktopControlState & Readonly<{ runtime_available: false }>;
 
 export type DesktopControlError =
   | "invalid_request"
@@ -24,7 +29,8 @@ export type DesktopControlError =
 
 export type DesktopControlResult =
   | Readonly<{ ok: true }>
-  | Readonly<{ ok: true; status: DesktopControlStatus }>
+  | (Readonly<{ ok: true }> & DesktopControlState)
+  | (Readonly<{ ok: true }> & DesktopControlPrepared)
   | Readonly<{ ok: false; error: DesktopControlError }>;
 
 type PendingRequest = Readonly<{
@@ -59,9 +65,7 @@ export class CompanionClient {
     }
 
     const id = this.nextRequestID++;
-    const request = command.action === "enroll" || command.action === "attach"
-      ? { id, action: command.action, ticket: command.ticket }
-      : { id, action: command.action };
+    const request = { id, ...command };
     return new Promise((resolve) => {
       const timeout = setTimeout(() => this.failAll(), REQUEST_TIMEOUT_MS);
       this.pending.set(id, { action: command.action, resolve, timeout });
@@ -130,23 +134,39 @@ export class CompanionClient {
 
 function matchesCommandResponse(action: DesktopControlCommand["action"], result: DesktopControlResult): boolean {
   if (!result.ok) return true;
-  return action === "status" ? "status" in result : !("status" in result);
+  if (action === "sync") return !hasLocalState(result);
+  if (action === "prepare") return hasLocalState(result) && "runtime_available" in result && result.runtime_available === false;
+  if ("runtime_available" in result) return false;
+  return hasLocalState(result);
 }
 
 function parseResponse(value: unknown): Readonly<{ id: number; result: DesktopControlResult }> | undefined {
   if (!isRecord(value) || !Number.isSafeInteger(value.id) || Number(value.id) < 1 || typeof value.ok !== "boolean") return undefined;
   if (value.ok) {
     if (hasExactKeys(value, ["id", "ok"])) return { id: Number(value.id), result: { ok: true } };
-    if (!hasExactKeys(value, ["id", "ok", "status"]) || !isStatus(value.status)) return undefined;
-    return { id: Number(value.id), result: { ok: true, status: value.status } };
+    if (!hasExactKeys(value, ["id", "ok", "result"]) || !isRecord(value.result)) return undefined;
+    if (hasExactKeys(value.result, ["installation_id", "operating_system", "cua_ready", "native_executor_ready", "gateway_connected", "relay_paused"]) &&
+        isLocalState(value.result) && value.result.operating_system === "linux") {
+      return { id: Number(value.id), result: { ok: true, ...value.result, operating_system: "linux" } };
+    }
+    if (hasExactKeys(value.result, ["installation_id", "operating_system", "runtime_available", "cua_ready", "native_executor_ready", "gateway_connected", "relay_paused"]) &&
+        isLocalState(value.result) && value.result.operating_system === "linux" && value.result.runtime_available === false) {
+      return { id: Number(value.id), result: { ok: true, ...value.result, operating_system: "linux", runtime_available: false } };
+    }
+    return undefined;
   }
   if (!hasExactKeys(value, ["id", "ok", "error"]) || !isError(value.error)) return undefined;
   return { id: Number(value.id), result: { ok: false, error: value.error } };
 }
 
-function isStatus(value: unknown): value is DesktopControlStatus {
-  return isRecord(value) && hasExactKeys(value, ["enrolled", "credential_valid", "relay_active"]) &&
-    typeof value.enrolled === "boolean" && typeof value.credential_valid === "boolean" && typeof value.relay_active === "boolean";
+function isLocalState(value: Record<string, unknown>): value is Record<string, unknown> & DesktopControlState {
+  return (typeof value.installation_id === "string" || value.installation_id === null) && value.operating_system === "linux" &&
+    typeof value.cua_ready === "boolean" && typeof value.native_executor_ready === "boolean" &&
+    typeof value.gateway_connected === "boolean" && typeof value.relay_paused === "boolean";
+}
+
+function hasLocalState(value: DesktopControlResult): value is Readonly<{ ok: true }> & (DesktopControlState | DesktopControlPrepared) {
+  return value.ok && "installation_id" in value;
 }
 
 function isError(value: unknown): value is Exclude<DesktopControlError, "unsupported_platform" | "stale_request"> {

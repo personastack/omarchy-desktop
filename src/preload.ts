@@ -22,6 +22,8 @@ contextBridge.exposeInMainWorld("webkit", {
   },
 });
 
+contextBridge.exposeInMainWorld("personastackDesktopPlatform", process.platform);
+
 document.addEventListener("click", (event) => {
   if (!event.isTrusted) return;
   const anchor = event.composedPath().find((target): target is HTMLAnchorElement => target instanceof HTMLAnchorElement);

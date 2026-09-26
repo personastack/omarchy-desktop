@@ -155,6 +155,37 @@ func TestStatusSeparatesEnrollmentCredentialAndRelayState(t *testing.T) {
 	})
 }
 
+func TestLocalStateReadsOnlyProtectedLocalIdentity(t *testing.T) {
+	t.Parallel()
+	installation := testInstallation()
+	t.Run("not enrolled", func(t *testing.T) {
+		t.Parallel()
+		api := &apiRecorder{}
+		store := &memoryStore{loadErr: credentialstore.ErrCredentialMissing}
+		state, err := mustService(t, api, store).LocalState(context.Background(), installation.EnvironmentOrigin)
+		if err != nil || state != (LocalState{RelayPaused: true}) || len(api.calls) != 0 {
+			t.Fatalf("LocalState() = %#v, %v, API calls %v", state, err, api.calls)
+		}
+	})
+	t.Run("enrolled but runtime absent", func(t *testing.T) {
+		t.Parallel()
+		api := &apiRecorder{}
+		store := &memoryStore{loaded: installationPointer(installation)}
+		state, err := mustService(t, api, store).LocalState(context.Background(), installation.EnvironmentOrigin)
+		if err != nil || state.InstallationID == nil || *state.InstallationID != installation.InstallationID ||
+			state.CuaReady || state.NativeExecutorReady || state.GatewayConnected || !state.RelayPaused || len(api.calls) != 0 {
+			t.Fatalf("LocalState() = %#v, %v, API calls %v", state, err, api.calls)
+		}
+	})
+	t.Run("keyring unavailable", func(t *testing.T) {
+		t.Parallel()
+		state, err := mustService(t, &apiRecorder{}, &memoryStore{loadErr: errors.New("secret service unavailable")}).LocalState(context.Background(), installation.EnvironmentOrigin)
+		if err != credentialstore.ErrUnavailable || state != (LocalState{}) {
+			t.Fatalf("LocalState() = %#v, %v", state, err)
+		}
+	})
+}
+
 func TestLifecycleOperationsUseStoredInstallation(t *testing.T) {
 	t.Parallel()
 	installation := testInstallation()

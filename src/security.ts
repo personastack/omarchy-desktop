@@ -29,8 +29,8 @@ export type StackCommand =
   | Readonly<{ version: "1"; action: "open_persona_activity"; persona_id: string }>;
 
 export type DesktopControlCommand =
-  | Readonly<{ version: "1"; action: "status" | "revoke" }>
-  | Readonly<{ version: "1"; action: "enroll" | "attach"; ticket: string }>;
+  | Readonly<{ version: "1"; action: "sync" | "state"; scope: string }>
+  | Readonly<{ version: "1"; action: "prepare"; scope: string; enrollment_ticket: string }>;
 
 export function resolveAppURL(args: readonly string[], packagedDefault?: string): URL {
   const switchIndex = args.indexOf(APP_URL_SWITCH);
@@ -120,12 +120,14 @@ export function parseStackCommand(value: unknown): StackCommand | undefined {
 
 export function parseDesktopControlCommand(value: unknown): DesktopControlCommand | undefined {
   if (!isRecord(value) || value.version !== "1" || typeof value.action !== "string") return undefined;
-  if ((value.action === "status" || value.action === "revoke") && hasExactKeys(value, ["version", "action"])) {
-    return { version: "1", action: value.action };
+  if ((value.action === "sync" || value.action === "state") && hasExactKeys(value, ["version", "action", "scope"]) &&
+      isBoundedUTF8Text(value.scope, 512) && value.scope.trim() === value.scope) {
+    return { version: "1", action: value.action, scope: value.scope };
   }
-  if ((value.action === "enroll" || value.action === "attach") && hasExactKeys(value, ["version", "action", "ticket"]) &&
-      typeof value.ticket === "string" && /^[A-Za-z0-9_-]{43}$/.test(value.ticket)) {
-    return { version: "1", action: value.action, ticket: value.ticket };
+  if (value.action === "prepare" && hasExactKeys(value, ["version", "action", "scope", "enrollment_ticket"]) &&
+      isBoundedUTF8Text(value.scope, 512) && value.scope !== "" && value.scope.trim() === value.scope &&
+      typeof value.enrollment_ticket === "string" && /^[A-Za-z0-9_-]{43}$/.test(value.enrollment_ticket)) {
+    return { version: "1", action: "prepare", scope: value.scope, enrollment_ticket: value.enrollment_ticket };
   }
   return undefined;
 }
@@ -162,6 +164,10 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
 
 function isBoundedText(value: unknown, maxLength: number): value is string {
   return typeof value === "string" && value.length <= maxLength;
+}
+
+function isBoundedUTF8Text(value: unknown, maxBytes: number): value is string {
+  return typeof value === "string" && new TextEncoder().encode(value).byteLength <= maxBytes;
 }
 
 function isValidID(value: unknown): value is string {

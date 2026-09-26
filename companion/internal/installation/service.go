@@ -41,6 +41,16 @@ type Status struct {
 	RelayActive     bool `json:"relay_active"`
 }
 
+// LocalState contains only locally available, non-secret installation state.
+// It deliberately does not infer Cua, executor, or Gateway readiness.
+type LocalState struct {
+	InstallationID      *string `json:"installation_id"`
+	CuaReady            bool    `json:"cua_ready"`
+	NativeExecutorReady bool    `json:"native_executor_ready"`
+	GatewayConnected    bool    `json:"gateway_connected"`
+	RelayPaused         bool    `json:"relay_paused"`
+}
+
 func New(api API, store Store) (*Service, error) {
 	if api == nil || store == nil {
 		return nil, ErrUnavailable
@@ -98,6 +108,22 @@ func (s *Service) Status(ctx context.Context, origin string) (Status, error) {
 	}
 	status.RelayActive = active
 	return status, nil
+}
+
+// LocalState reads only the OS credential store. Network and runtime
+// readiness are intentionally left false until their owners are implemented.
+func (s *Service) LocalState(ctx context.Context, origin string) (LocalState, error) {
+	installation, err := s.store.Load(ctx, origin)
+	if errors.Is(err, credentialstore.ErrCredentialMissing) {
+		return LocalState{RelayPaused: true}, nil
+	}
+	if err != nil || installation == nil {
+		return LocalState{}, credentialstore.ErrUnavailable
+	}
+	if err := installation.Validate(origin); err != nil {
+		return LocalState{}, desktopcontrol.ErrUnavailable
+	}
+	return LocalState{InstallationID: &installation.InstallationID, RelayPaused: true}, nil
 }
 
 func (s *Service) ReportReadiness(ctx context.Context, origin string, readiness apicontract.DesktopControlReadiness) error {

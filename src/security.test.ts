@@ -73,15 +73,19 @@ test("chat and stack bridges accept only their finite exact payloads", () => {
   assert.equal(parseStackCommand({ version: "1", action: "open_stack_view", stack_id: "../etc", view: "graph" }), undefined);
 });
 
-test("Desktop Control bridge accepts only finite enrollment commands", () => {
+test("Desktop Control bridge accepts only hosted sync, state, and prepare commands", () => {
   const ticket = "A".repeat(43);
-  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "status" }), { version: "1", action: "status" });
-  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "enroll", ticket }), { version: "1", action: "enroll", ticket });
-  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "attach", ticket }), { version: "1", action: "attach", ticket });
-  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "revoke" }), { version: "1", action: "revoke" });
-  assert.equal(parseDesktopControlCommand({ version: "1", action: "enroll", ticket: "short" }), undefined);
-  assert.equal(parseDesktopControlCommand({ version: "1", action: "status", ticket }), undefined);
-  assert.equal(parseDesktopControlCommand({ version: "1", action: "revoke", extra: true }), undefined);
+  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "sync", scope: "" }), { version: "1", action: "sync", scope: "" });
+  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "state", scope: "" }), { version: "1", action: "state", scope: "" });
+  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: ticket }),
+    { version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: ticket });
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "x", enrollment_ticket: "short" }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "", enrollment_ticket: ticket }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "state", scope: "", enrollment_ticket: ticket }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "sync", scope: " padded " }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "sync", scope: "é".repeat(300) }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "status" }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "", enrollment_ticket: ticket, extra: true }), undefined);
 });
 
 test("concern notification accepts only the generic new-concern event", () => {

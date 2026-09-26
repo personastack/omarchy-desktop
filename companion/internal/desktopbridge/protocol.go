@@ -6,34 +6,39 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/personastack/omarchy-desktop/companion/internal/credentialstore"
 	"github.com/personastack/omarchy-desktop/companion/internal/installation"
 	"github.com/personastack/omarchy-desktop/companion/internal/wirejson"
-	"github.com/personastack/personastack-api/pkg/client/apicontract"
 	"github.com/personastack/personastack-api/pkg/client/desktopcontrol"
 )
 
 const MaxRequestBytes = 4 * 1024
 const maxRequestID = 1<<53 - 1
+const maxScopeLength = 512
 
-var ErrInvalidRequest = errors.New("invalid desktop bridge request")
+var (
+	ErrInvalidRequest = errors.New("invalid desktop bridge request")
+	ticketPattern     = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+)
 
 type Action string
 
 const (
-	ActionStatus Action = "status"
-	ActionEnroll Action = "enroll"
-	ActionAttach Action = "attach"
-	ActionRevoke Action = "revoke"
+	ActionSync    Action = "sync"
+	ActionState   Action = "state"
+	ActionPrepare Action = "prepare"
 )
 
 type Request struct {
-	ID     uint64
-	Action Action
-	Ticket string
+	ID               uint64 `json:"id"`
+	Version          string `json:"version"`
+	Action           Action `json:"action"`
+	Scope            string `json:"scope"`
+	EnrollmentTicket string `json:"enrollment_ticket,omitempty"`
 }
 
 type ErrorCode string
@@ -46,23 +51,32 @@ const (
 	ErrorUnavailable        ErrorCode = "unavailable"
 )
 
+type Result struct {
+	InstallationID      *string `json:"installation_id"`
+	OperatingSystem     string  `json:"operating_system"`
+	RuntimeAvailable    *bool   `json:"runtime_available,omitempty"`
+	CuaReady            bool    `json:"cua_ready"`
+	NativeExecutorReady bool    `json:"native_executor_ready"`
+	GatewayConnected    bool    `json:"gateway_connected"`
+	RelayPaused         bool    `json:"relay_paused"`
+}
+
 type Response struct {
-	ID     uint64               `json:"id"`
-	OK     bool                 `json:"ok"`
-	Error  ErrorCode            `json:"error,omitempty"`
-	Status *installation.Status `json:"status,omitempty"`
+	ID     uint64    `json:"id"`
+	OK     bool      `json:"ok"`
+	Error  ErrorCode `json:"error,omitempty"`
+	Result *Result   `json:"result,omitempty"`
 }
 
 type Service interface {
-	Enroll(context.Context, string, apicontract.DesktopControlOperatingSystem) error
-	Attach(context.Context, string, string) error
-	Status(context.Context, string) (installation.Status, error)
-	Revoke(context.Context, string) error
+	LocalState(context.Context, string) (installation.LocalState, error)
 }
 
 type Processor struct {
 	service Service
 	origin  string
+	scope   string
+	synced  bool
 }
 
 func New(service Service, origin string) (*Processor, error) {
@@ -92,25 +106,22 @@ func Parse(raw []byte) (Request, error) {
 	if err := json.Unmarshal(raw, &request); err != nil || request.ID == 0 || request.ID > maxRequestID {
 		return Request{}, ErrInvalidRequest
 	}
+	if request.Version != "1" || request.Scope != strings.TrimSpace(request.Scope) || len(request.Scope) > maxScopeLength {
+		return Request{}, ErrInvalidRequest
+	}
+	if !hasField(fields, "id") || !hasField(fields, "version") || !hasField(fields, "action") || !hasField(fields, "scope") {
+		return Request{}, ErrInvalidRequest
+	}
 	switch request.Action {
-	case ActionStatus, ActionRevoke:
-		if len(fields) != 2 {
+	case ActionSync, ActionState:
+		if len(fields) != 4 || hasField(fields, "enrollment_ticket") {
 			return Request{}, ErrInvalidRequest
 		}
-	case ActionEnroll, ActionAttach:
-		if len(fields) != 3 || strings.TrimSpace(request.Ticket) == "" || len(request.Ticket) > 128 {
+	case ActionPrepare:
+		if len(fields) != 5 || request.Scope == "" || !hasField(fields, "enrollment_ticket") || !ticketPattern.MatchString(request.EnrollmentTicket) {
 			return Request{}, ErrInvalidRequest
 		}
 	default:
-		return Request{}, ErrInvalidRequest
-	}
-	if _, ok := fields["id"]; !ok {
-		return Request{}, ErrInvalidRequest
-	}
-	if _, ok := fields["action"]; !ok {
-		return Request{}, ErrInvalidRequest
-	}
-	if (request.Action == ActionEnroll || request.Action == ActionAttach) != hasField(fields, "ticket") {
 		return Request{}, ErrInvalidRequest
 	}
 	return request, nil
@@ -118,28 +129,43 @@ func Parse(raw []byte) (Request, error) {
 
 func (p *Processor) Handle(ctx context.Context, request Request) Response {
 	response := Response{ID: request.ID}
-	var err error
-	switch request.Action {
-	case ActionStatus:
-		var status installation.Status
-		status, err = p.service.Status(ctx, p.origin)
-		if err == nil {
-			response.Status = &status
-		}
-	case ActionEnroll:
-		err = p.service.Enroll(ctx, request.Ticket, apicontract.DesktopControlOperatingSystemLinux)
-	case ActionAttach:
-		err = p.service.Attach(ctx, p.origin, request.Ticket)
-	case ActionRevoke:
-		err = p.service.Revoke(ctx, p.origin)
-	default:
-		err = ErrInvalidRequest
+	if request.Version != "1" || len(request.Scope) > maxScopeLength || request.Scope != strings.TrimSpace(request.Scope) {
+		response.Error = ErrorInvalidRequest
+		return response
 	}
+	if request.Action == ActionSync {
+		p.scope, p.synced = request.Scope, true
+		response.OK = true
+		return response
+	}
+	if !p.synced || p.scope != request.Scope {
+		response.Error = ErrorInvalidRequest
+		return response
+	}
+	if request.Action != ActionState && request.Action != ActionPrepare {
+		response.Error = ErrorInvalidRequest
+		return response
+	}
+	if request.Action == ActionPrepare && (request.Scope == "" || !ticketPattern.MatchString(request.EnrollmentTicket)) {
+		response.Error = ErrorInvalidRequest
+		return response
+	}
+	state, err := p.service.LocalState(ctx, p.origin)
 	if err != nil {
 		response.Error = errorCode(err)
 		return response
 	}
 	response.OK = true
+	result := &Result{
+		InstallationID: state.InstallationID, CuaReady: state.CuaReady,
+		NativeExecutorReady: state.NativeExecutorReady, GatewayConnected: state.GatewayConnected,
+		RelayPaused: state.RelayPaused, OperatingSystem: "linux",
+	}
+	if request.Action == ActionPrepare {
+		runtimeAvailable := false
+		result.RuntimeAvailable = &runtimeAvailable
+	}
+	response.Result = result
 	return response
 }
 

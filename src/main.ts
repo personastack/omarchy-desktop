@@ -56,6 +56,7 @@ const windows = new Map<number, RegisteredWindow>();
 const chats = new Map<string, BrowserWindow>();
 const stackWindows = new Map<string, BrowserWindow>();
 const expandedChatSizes = new Map<BrowserWindow, readonly [number, number]>();
+const programmaticChatClose = new WeakSet<BrowserWindow>();
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let isQuitting = false;
@@ -357,6 +358,20 @@ function createChatWindow(personaID: string): BrowserWindow {
     expandedChatSizes.delete(window);
     if (chats.get(personaID) === window) chats.delete(personaID);
   });
+  window.on("close", (event) => {
+    if (programmaticChatClose.delete(window) || isQuitting) return;
+    event.preventDefault();
+    const entry = windows.get(window.webContents.id);
+    if (entry?.role !== "chat" || !isCurrentChatDocument(window)) {
+      closeWindow(window);
+      return;
+    }
+    void window.webContents.executeJavaScript(
+      "typeof window.personastackDesktopClose === 'function' ? (window.personastackDesktopClose(), true) : false",
+    ).then((requested) => {
+      if (requested !== true) closeWindow(window);
+    }).catch(() => closeWindow(window));
+  });
   const url = routeURL(appOriginURL().href, "/user/personas/chat/desktop-popout", { persona_id: personaID });
   void window.loadURL(url).then(() => window.show());
   return window;
@@ -451,7 +466,18 @@ function invalidatePopouts(): void {
 }
 
 function closeWindow(window: BrowserWindow): void {
-  if (!window.isDestroyed()) window.close();
+  if (window.isDestroyed()) return;
+  programmaticChatClose.add(window);
+  window.close();
+}
+
+function isCurrentChatDocument(window: BrowserWindow): boolean {
+  try {
+    const current = new URL(window.webContents.getURL());
+    return current.origin === appURL.origin && current.pathname === "/user/personas/chat/desktop-popout";
+  } catch {
+    return false;
+  }
 }
 
 function createTray(): void {

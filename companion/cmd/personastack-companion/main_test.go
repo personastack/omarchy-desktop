@@ -11,17 +11,16 @@ import (
 
 	"github.com/personastack/omarchy-desktop/companion/internal/desktopbridge"
 	"github.com/personastack/omarchy-desktop/companion/internal/installation"
-	"github.com/personastack/personastack-api/pkg/client/apicontract"
 )
 
 func TestServeProcessesBoundedRequestResponseLines(t *testing.T) {
 	t.Parallel()
-	service := &serviceFake{status: installation.Status{Enrolled: true, CredentialValid: true}}
+	service := &serviceFake{state: installation.LocalState{RelayPaused: true}}
 	processor, err := desktopbridge.New(service, "https://my.personastack.ai")
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := strings.NewReader("{\"id\":1,\"action\":\"status\"}\n{\"id\":2,\"action\":\"revoke\"}\n")
+	input := strings.NewReader("{\"id\":1,\"version\":\"1\",\"action\":\"sync\",\"scope\":\"\"}\n{\"id\":2,\"version\":\"1\",\"action\":\"state\",\"scope\":\"\"}\n")
 	var output bytes.Buffer
 	if err := serve(input, &output, processor); err != nil {
 		t.Fatalf("serve() error = %v", err)
@@ -38,7 +37,7 @@ func TestServeProcessesBoundedRequestResponseLines(t *testing.T) {
 	if len(responses) != 2 || responses[0]["id"] != float64(1) || responses[1]["id"] != float64(2) || responses[1]["ok"] != true {
 		t.Fatalf("responses = %#v", responses)
 	}
-	if !reflect.DeepEqual(service.calls, []string{"status", "revoke"}) {
+	if !reflect.DeepEqual(service.calls, []string{"state"}) {
 		t.Fatalf("service calls = %v", service.calls)
 	}
 }
@@ -50,8 +49,8 @@ func TestServeStopsOnMalformedOrOversizedRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, input := range []string{
-		"{\"id\":1,\"action\":\"revoke\",\"action\":\"status\"}\n",
-		"{\"id\":1,\"action\":\"status\",\"padding\":\"" + strings.Repeat("x", desktopbridge.MaxRequestBytes) + "\"}\n",
+		"{\"id\":1,\"version\":\"1\",\"action\":\"sync\",\"action\":\"state\",\"scope\":\"\"}\n",
+		"{\"id\":1,\"version\":\"1\",\"action\":\"sync\",\"scope\":\"" + strings.Repeat("x", desktopbridge.MaxRequestBytes) + "\"}\n",
 	} {
 		var output bytes.Buffer
 		if err := serve(strings.NewReader(input), &output, processor); err == nil {
@@ -72,34 +71,19 @@ func TestServeRequiresProcessorAndPropagatesOutputFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := serve(strings.NewReader("{\"id\":1,\"action\":\"status\"}\n"), errorWriter{}, processor); err == nil {
+	if err := serve(strings.NewReader("{\"id\":1,\"version\":\"1\",\"action\":\"sync\",\"scope\":\"\"}\n"), errorWriter{}, processor); err == nil {
 		t.Fatal("serve() swallowed writer error")
 	}
 }
 
 type serviceFake struct {
 	calls  []string
-	status installation.Status
+	state  installation.LocalState
 }
 
-func (s *serviceFake) Enroll(_ context.Context, _ string, _ apicontract.DesktopControlOperatingSystem) error {
-	s.calls = append(s.calls, "enroll")
-	return nil
-}
-
-func (s *serviceFake) Attach(_ context.Context, _, _ string) error {
-	s.calls = append(s.calls, "attach")
-	return nil
-}
-
-func (s *serviceFake) Status(_ context.Context, _ string) (installation.Status, error) {
-	s.calls = append(s.calls, "status")
-	return s.status, nil
-}
-
-func (s *serviceFake) Revoke(_ context.Context, _ string) error {
-	s.calls = append(s.calls, "revoke")
-	return nil
+func (s *serviceFake) LocalState(_ context.Context, _ string) (installation.LocalState, error) {
+	s.calls = append(s.calls, "state")
+	return s.state, nil
 }
 
 type errorWriter struct{}
