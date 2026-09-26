@@ -7,8 +7,13 @@ the finite operation-to-tool allowlist, command deadlines, bounded image results
 and command draining for release and revocation. Oversized PNG and JPEG
 screenshots are converted to bounded JPEG results before Gateway frame encoding.
 
-The filesystem and managed-process operation families are not implemented.
-`NativeReady` stays false, and status reports the native executor unavailable.
-This package is not connected to companion startup or the Gateway yet. Its
-tests prove source-level dispatch policy only. They do not prove a real Cua call
-or Omarchy desktop behavior.
+When constructed with `NewWithLocalOperations`, the executor dispatches the
+producer-owned file and managed-process operation families through the same
+configuration, persona-generation, and lease checks as Cua calls. Resource
+handles are closed on lease release and scoped revocation. Unconfirmed cleanup
+leaves the executor unavailable. The executor expires idle leases every five
+seconds, renews the idle window while a managed process runs, and caps process
+timeouts at the lease hard deadline. The companion does not construct this executor
+or connect it to Gateway startup yet, so `NativeReady` stays false. Tests prove
+the local dispatch contract with fakes. They do not prove real Cua calls or
+Omarchy desktop behavior.

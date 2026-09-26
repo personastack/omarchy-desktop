@@ -3,6 +3,7 @@ package desktopexecutor
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,12 +18,19 @@ import (
 const (
 	leaseIdleDuration = 90 * time.Second
 	leaseMaxDuration  = 30 * time.Minute
+	leaseSweepPeriod  = 5 * time.Second
 )
 
 var ErrUnavailable = errors.New("desktop executor unavailable")
 
 type ToolRunner interface {
 	Call(context.Context, agentgatewayruntime.DesktopControlOperation, string, json.RawMessage) (json.RawMessage, error)
+}
+
+type LocalOperations interface {
+	Call(context.Context, agentgatewayruntime.DesktopControlOperation, json.RawMessage, time.Duration) (json.RawMessage, error)
+	ActiveProcesses() int
+	CloseAll(context.Context) bool
 }
 
 type owner struct {
@@ -56,11 +64,11 @@ type activeCommand struct {
 	done          chan struct{}
 }
 
-// Executor dispatches the reviewed Cua operation families and protects them
-// with one installation-wide control lease. Native file and process operations
-// remain unavailable until their Linux implementations are installed.
+// Executor dispatches the reviewed Cua and optional local operation families
+// under one installation-wide control lease.
 type Executor struct {
 	runner ToolRunner
+	local  LocalOperations
 	now    func() time.Time
 
 	mu              sync.Mutex
@@ -71,22 +79,32 @@ type Executor struct {
 	revocations     int
 	nextCommandID   uint64
 	active          map[uint64]activeCommand
+	unavailable     bool
 }
 
 func New(runner ToolRunner) (*Executor, error) {
+	return NewWithLocalOperations(runner, nil)
+}
+
+func NewWithLocalOperations(runner ToolRunner, local LocalOperations) (*Executor, error) {
 	if runner == nil {
 		return nil, ErrUnavailable
 	}
-	return &Executor{
+	executor := &Executor{
 		runner:          runner,
+		local:           local,
 		now:             time.Now,
 		revokedConfigs:  make(map[configScope]int64),
 		revokedBindings: make(map[bindingScope]int64),
 		active:          make(map[uint64]activeCommand),
-	}, nil
+	}
+	if local != nil {
+		go executor.leaseExpiryLoop()
+	}
+	return executor, nil
 }
 
-func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.DesktopControlFrame, _ func(agentgatewayruntime.DesktopControlFrame) error) agentgatewayruntime.DesktopControlFrame {
+func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.DesktopControlFrame, emit func(agentgatewayruntime.DesktopControlFrame) error) agentgatewayruntime.DesktopControlFrame {
 	if ctx == nil || frame.Type != agentgatewayruntime.DesktopControlFrameCommand || frame.Target == nil || strings.TrimSpace(frame.RequestID) == "" {
 		return failure(frame, "invalid_arguments", "The Desktop Control command is invalid.")
 	}
@@ -133,22 +151,38 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 	if frame.Operation == agentgatewayruntime.DesktopControlOperationRelease {
 		return e.release(frame, commandOwner, scope, target.ConfigVersion)
 	}
-	if !cuaOperation(frame.Operation) {
+	isLocal := localOperation(frame.Operation)
+	if !cuaOperation(frame.Operation) && !isLocal {
 		return failure(frame, "desktop_executor_unavailable", "The Linux native file and process executor is not ready.")
 	}
-	toolName, arguments, token, ok := decodeCuaArguments(frame.Arguments)
-	if !ok || !toolAllowed(frame.Operation, toolName) {
+	var toolName string
+	var arguments json.RawMessage
+	var token string
+	var ok bool
+	if isLocal {
+		arguments, token, ok = decodeLocalArguments(frame.Arguments)
+	} else {
+		toolName, arguments, token, ok = decodeCuaArguments(frame.Arguments)
+		ok = ok && toolAllowed(frame.Operation, toolName)
+	}
+	if !ok {
 		return failure(frame, "invalid_arguments", "The Desktop Control tool arguments are invalid.")
 	}
 	e.mu.Lock()
+	if e.unavailable || isLocal && e.local == nil {
+		e.mu.Unlock()
+		return failure(frame, "desktop_executor_unavailable", "The Linux native file and process executor is not ready.")
+	}
 	active, epoch := e.authorize(commandOwner, scope, target.ConfigVersion, token)
 	var commandID uint64
 	var done chan struct{}
 	var callCtx context.Context
 	var cancel context.CancelFunc
+	processTimeout := time.Duration(0)
 	if active {
 		deadline := frame.DeadlineAt
 		leaseDeadline := e.current.started.Add(leaseMaxDuration)
+		processTimeout = leaseDeadline.Sub(e.now())
 		if leaseDeadline.Before(deadline) {
 			deadline = leaseDeadline
 		}
@@ -161,8 +195,21 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 	}
 	defer e.finishActive(commandID, done)
 	defer cancel()
-	response, err := e.runner.Call(callCtx, frame.Operation, toolName, arguments)
+	var response json.RawMessage
+	var err error
+	if isLocal {
+		response, err = e.local.Call(callCtx, frame.Operation, arguments, processTimeout)
+	} else {
+		response, err = e.runner.Call(callCtx, frame.Operation, toolName, arguments)
+	}
 	if err != nil {
+		var coded interface {
+			DesktopControlCode() string
+			DesktopControlMessage() string
+		}
+		if errors.As(err, &coded) {
+			return failure(frame, coded.DesktopControlCode(), coded.DesktopControlMessage())
+		}
 		e.mu.Lock()
 		stillAuthorized := e.authorizedAfterCall(commandOwner, scope, target.ConfigVersion, token, epoch)
 		e.mu.Unlock()
@@ -173,6 +220,11 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 	}
 	if !json.Valid(response) {
 		return failure(frame, "desktop_command_failed", "The desktop command failed.")
+	}
+	if emit != nil && isProcessRead(frame.Operation) {
+		if err := e.forwardProcessChunks(callCtx, frame, response, emit, commandOwner, scope, target.ConfigVersion, token, epoch); err != nil {
+			return failure(frame, "desktop_command_failed", "The desktop command did not complete.")
+		}
 	}
 	bounded, err := boundCuaResult(callCtx, response)
 	if err != nil {
@@ -205,6 +257,48 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 
 func (e *Executor) NativeReady() bool { return false }
 
+func (e *Executor) forwardProcessChunks(ctx context.Context, command agentgatewayruntime.DesktopControlFrame, payload json.RawMessage,
+	emit func(agentgatewayruntime.DesktopControlFrame) error, commandOwner owner, scope configScope, version int64,
+	token string, epoch uint64) error {
+	var output struct {
+		ExecutionID string `json:"execution_id"`
+		Chunks      []struct {
+			Stream string `json:"stream"`
+			Data   string `json:"data_base64"`
+		} `json:"chunks"`
+	}
+	if err := json.Unmarshal(payload, &output); err != nil || output.ExecutionID == "" {
+		return nil
+	}
+	for index, chunk := range output.Chunks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if chunk.Stream != "stdout" && chunk.Stream != "stderr" {
+			continue
+		}
+		data, err := base64.StdEncoding.DecodeString(chunk.Data)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		e.mu.Lock()
+		stillAuthorized := e.authorizedAfterCall(commandOwner, scope, version, token, epoch)
+		e.mu.Unlock()
+		if !stillAuthorized {
+			return context.Canceled
+		}
+		frame := agentgatewayruntime.DesktopControlFrame{
+			Version: agentgatewayruntime.DesktopControlProtocolVersion, Type: agentgatewayruntime.DesktopControlFrameResultChunk,
+			RequestID: command.RequestID, StreamID: command.RequestID, Sequence: uint64(index + 1),
+			StreamChannel: chunk.Stream, StreamData: data,
+		}
+		if err := emit(frame); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (e *Executor) acquire(frame agentgatewayruntime.DesktopControlFrame, commandOwner owner, scope configScope, version int64) agentgatewayruntime.DesktopControlFrame {
 	if !emptyArguments(frame.Arguments) {
 		return failure(frame, "invalid_arguments", "The Desktop Control lease request is invalid.")
@@ -219,6 +313,10 @@ func (e *Executor) acquire(frame agentgatewayruntime.DesktopControlFrame, comman
 		}
 		return failure(frame, "desktop_control_binding_revoked", "This Desktop Control binding is no longer authorized.")
 	}
+	if e.unavailable {
+		e.mu.Unlock()
+		return failure(frame, "desktop_executor_unavailable", "The desktop executor is unavailable because prior resource cleanup was not confirmed.")
+	}
 	if e.current != nil && !e.leaseValid(e.current) {
 		previous := e.current.owner
 		e.current = nil
@@ -226,7 +324,7 @@ func (e *Executor) acquire(frame agentgatewayruntime.DesktopControlFrame, comman
 		e.revocations++
 		commands := e.cancelMatching(func(command activeCommand) bool { return command.owner == previous })
 		e.mu.Unlock()
-		if !e.completeRevocation(frame.DeadlineAt, commands) {
+		if !e.completeRevocation(frame.DeadlineAt, commands, true) {
 			return failure(frame, "desktop_control_revoke_incomplete", "The expired desktop command did not stop before a new lease was requested.")
 		}
 		return e.acquire(frame, commandOwner, scope, version)
@@ -278,7 +376,7 @@ func (e *Executor) release(frame agentgatewayruntime.DesktopControlFrame, comman
 	e.revocations++
 	commands := e.cancelMatching(func(command activeCommand) bool { return command.owner == commandOwner })
 	e.mu.Unlock()
-	if !e.completeRevocation(frame.DeadlineAt, commands) {
+	if !e.completeRevocation(frame.DeadlineAt, commands, true) {
 		return failure(frame, "desktop_control_revoke_incomplete", "The active desktop command did not stop before release.")
 	}
 	return result(frame, json.RawMessage(`{"released":true}`))
@@ -289,14 +387,15 @@ func (e *Executor) revokeConfig(frame agentgatewayruntime.DesktopControlFrame, s
 	if version > e.revokedConfigs[scope] {
 		e.revokedConfigs[scope] = version
 	}
-	if e.current != nil && e.current.config == scope && e.current.configVersion <= version {
+	cleanupLocal := e.current != nil && e.current.config == scope && e.current.configVersion <= version
+	if cleanupLocal {
 		e.current = nil
 		e.epoch++
 	}
 	e.revocations++
 	commands := e.cancelMatching(func(command activeCommand) bool { return command.config == scope && command.configVersion <= version })
 	e.mu.Unlock()
-	if !e.completeRevocation(frame.DeadlineAt, commands) {
+	if !e.completeRevocation(frame.DeadlineAt, commands, cleanupLocal) {
 		return failure(frame, "desktop_control_revoke_incomplete", "An active desktop command did not stop before revocation.")
 	}
 	return result(frame, json.RawMessage(`{"revoked":true}`))
@@ -308,8 +407,9 @@ func (e *Executor) revokeBinding(frame agentgatewayruntime.DesktopControlFrame, 
 	if generation > e.revokedBindings[binding] {
 		e.revokedBindings[binding] = generation
 	}
-	if e.current != nil && e.current.config == scope && e.current.owner.persona == persona &&
-		e.current.owner.generation <= generation {
+	cleanupLocal := e.current != nil && e.current.config == scope && e.current.owner.persona == persona &&
+		e.current.owner.generation <= generation
+	if cleanupLocal {
 		e.current = nil
 		e.epoch++
 	}
@@ -318,7 +418,7 @@ func (e *Executor) revokeBinding(frame agentgatewayruntime.DesktopControlFrame, 
 		return command.config == scope && command.owner.persona == persona && command.owner.generation <= generation
 	})
 	e.mu.Unlock()
-	if !e.completeRevocation(frame.DeadlineAt, commands) {
+	if !e.completeRevocation(frame.DeadlineAt, commands, cleanupLocal) {
 		return failure(frame, "desktop_control_revoke_incomplete", "An active desktop command did not stop before revocation.")
 	}
 	return result(frame, json.RawMessage(`{"revoked":true}`))
@@ -365,6 +465,45 @@ func (e *Executor) leaseValid(current *lease) bool {
 	return now.Sub(current.lastActivity) < leaseIdleDuration && now.Sub(current.started) < leaseMaxDuration
 }
 
+func (e *Executor) leaseExpiryLoop() {
+	ticker := time.NewTicker(leaseSweepPeriod)
+	defer ticker.Stop()
+	for range ticker.C {
+		e.expireLeaseIfNeeded()
+	}
+}
+
+func (e *Executor) expireLeaseIfNeeded() {
+	e.mu.Lock()
+	if e.current == nil || e.revocations > 0 || e.unavailable {
+		e.mu.Unlock()
+		return
+	}
+	current := *e.current
+	e.mu.Unlock()
+
+	activeProcesses := e.local.ActiveProcesses() > 0
+	e.mu.Lock()
+	if e.current == nil || e.current.token != current.token || e.revocations > 0 {
+		e.mu.Unlock()
+		return
+	}
+	if activeProcesses && e.now().Sub(e.current.started) < leaseMaxDuration {
+		e.current.lastActivity = e.now()
+	}
+	if e.leaseValid(e.current) {
+		e.mu.Unlock()
+		return
+	}
+	previous := e.current.owner
+	e.current = nil
+	e.epoch++
+	e.revocations++
+	commands := e.cancelMatching(func(command activeCommand) bool { return command.owner == previous })
+	e.mu.Unlock()
+	e.completeRevocation(time.Now().Add(leaseSweepPeriod), commands, true)
+}
+
 func (e *Executor) registerActiveLocked(commandOwner owner, scope configScope, version int64, cancel context.CancelFunc) (uint64, chan struct{}) {
 	e.nextCommandID++
 	done := make(chan struct{})
@@ -390,21 +529,42 @@ func (e *Executor) cancelMatching(matches func(activeCommand) bool) []<-chan str
 	return done
 }
 
-func (e *Executor) completeRevocation(deadline time.Time, commands []<-chan struct{}) bool {
-	if waitForCommands(deadline, commands) {
-		e.finishRevocation()
-		return true
+func (e *Executor) completeRevocation(deadline time.Time, commands []<-chan struct{}, cleanupLocal bool) bool {
+	if !waitForCommands(deadline, commands) {
+		go func() {
+			for _, done := range commands {
+				<-done
+			}
+			cleaned := e.cleanupLocalResources(cleanupLocal, 5*time.Second)
+			e.finishRevocation(cleaned)
+		}()
+		return false
 	}
-	go func() {
-		for _, done := range commands {
-			<-done
-		}
-		e.finishRevocation()
-	}()
-	return false
+	cleaned := e.cleanupLocalResources(cleanupLocal, time.Until(deadline))
+	e.finishRevocation(cleaned)
+	return cleaned
 }
 
-func (e *Executor) finishRevocation() { e.mu.Lock(); e.revocations--; e.mu.Unlock() }
+func (e *Executor) cleanupLocalResources(cleanup bool, timeout time.Duration) bool {
+	if !cleanup || e.local == nil {
+		return true
+	}
+	if timeout <= 0 {
+		timeout = time.Nanosecond
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return e.local.CloseAll(ctx)
+}
+
+func (e *Executor) finishRevocation(cleaned bool) {
+	e.mu.Lock()
+	if !cleaned {
+		e.unavailable = true
+	}
+	e.revocations--
+	e.mu.Unlock()
+}
 
 func waitForCommands(deadline time.Time, commands []<-chan struct{}) bool {
 	timer := time.NewTimer(time.Until(deadline))
@@ -438,6 +598,26 @@ func decodeCuaArguments(raw json.RawMessage) (string, json.RawMessage, string, b
 	return args.Tool, args.Arguments, args.ControlToken, true
 }
 
+func decodeLocalArguments(raw json.RawMessage) (json.RawMessage, string, bool) {
+	if !wirejson.ValidUniqueJSON(raw) {
+		return nil, "", false
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return nil, "", false
+	}
+	var token string
+	if field := fields["control_token"]; field == nil || json.Unmarshal(field, &token) != nil || strings.TrimSpace(token) == "" {
+		return nil, "", false
+	}
+	delete(fields, "control_token")
+	if len(fields) == 0 {
+		return nil, "", false
+	}
+	arguments, err := json.Marshal(fields)
+	return arguments, token, err == nil
+}
+
 func emptyArguments(raw json.RawMessage) bool {
 	if !wirejson.ValidUniqueJSON(raw) {
 		return false
@@ -461,6 +641,24 @@ func toolAllowed(operation agentgatewayruntime.DesktopControlOperation, name str
 
 func cuaOperation(operation agentgatewayruntime.DesktopControlOperation) bool {
 	return operationTools[operation] != nil
+}
+
+func localOperation(operation agentgatewayruntime.DesktopControlOperation) bool {
+	switch operation {
+	case agentgatewayruntime.DesktopControlOperationFile,
+		agentgatewayruntime.DesktopControlOperationShellStart,
+		agentgatewayruntime.DesktopControlOperationShellRead,
+		agentgatewayruntime.DesktopControlOperationShellWrite,
+		agentgatewayruntime.DesktopControlOperationShellStatus,
+		agentgatewayruntime.DesktopControlOperationShellCancel:
+		return true
+	default:
+		return false
+	}
+}
+
+func isProcessRead(operation agentgatewayruntime.DesktopControlOperation) bool {
+	return operation == agentgatewayruntime.DesktopControlOperationShellStart || operation == agentgatewayruntime.DesktopControlOperationShellRead
 }
 
 var operationTools = map[agentgatewayruntime.DesktopControlOperation]map[string]struct{}{

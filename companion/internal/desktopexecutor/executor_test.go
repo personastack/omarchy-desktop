@@ -53,6 +53,102 @@ func TestExecutorRequiresExclusiveScopedLeaseForCuaCalls(t *testing.T) {
 	}
 }
 
+func TestLocalOperationsRequireLeaseAndStripControlToken(t *testing.T) {
+	t.Parallel()
+	local := &localOperationsStub{response: json.RawMessage(`{"kind":"file"}`), closeOK: true}
+	executor, err := NewWithLocalOperations(&runnerStub{response: json.RawMessage(`{}`)}, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := commandFrame(agentgatewayruntime.DesktopControlOperationFile,
+		`{"control_token":"missing","action":"stat","path":"/tmp/a"}`)
+	if got := executor.Handle(context.Background(), command, nil); got.ErrorCode != "desktop_control_required" || local.callCount() != 0 {
+		t.Fatalf("unleased file operation=%#v calls=%d", got, local.callCount())
+	}
+	token := acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
+	command.Arguments = json.RawMessage(`{"control_token":"` + token + `","action":"stat","path":"/tmp/a"}`)
+	if got := executor.Handle(context.Background(), command, nil); got.Type != agentgatewayruntime.DesktopControlFrameResult {
+		t.Fatalf("leased file operation=%#v", got)
+	}
+	var forwarded map[string]json.RawMessage
+	if err := json.Unmarshal(local.arguments(), &forwarded); err != nil || forwarded["control_token"] != nil || string(forwarded["action"]) != `"stat"` {
+		t.Fatalf("local operation arguments=%s err=%v", local.arguments(), err)
+	}
+	otherRun := command
+	otherRun.Target = cloneTarget(command.Target)
+	otherRun.Target.RunID = "other-run"
+	if got := executor.Handle(context.Background(), otherRun, nil); got.ErrorCode != "desktop_control_required" || local.callCount() != 1 {
+		t.Fatalf("other run used local operation=%#v calls=%d", got, local.callCount())
+	}
+}
+
+func TestLocalOperationRevocationCancelsCallAndClosesResources(t *testing.T) {
+	t.Parallel()
+	local := &localOperationsStub{response: json.RawMessage(`{}`), closeOK: true, entered: make(chan struct{}), waitForContext: true}
+	executor, err := NewWithLocalOperations(&runnerStub{response: json.RawMessage(`{}`)}, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
+	command := commandFrame(agentgatewayruntime.DesktopControlOperationFile,
+		`{"control_token":"`+token+`","action":"search","root":"/tmp","name_contains":"x"}`)
+	finished := make(chan agentgatewayruntime.DesktopControlFrame, 1)
+	go func() { finished <- executor.Handle(context.Background(), command, nil) }()
+	<-local.entered
+	revoke := commandFrame(agentgatewayruntime.DesktopControlOperationRevokeConfig, `{}`)
+	revoke.Target = &agentgatewayruntime.DesktopControlTarget{InstallationID: "install", WorkspaceID: "workspace", ConfigID: "config", ConfigVersion: 2}
+	if got := executor.Handle(context.Background(), revoke, nil); got.Type != agentgatewayruntime.DesktopControlFrameResult {
+		t.Fatalf("config revoke=%#v", got)
+	}
+	if got := <-finished; got.Type != agentgatewayruntime.DesktopControlFrameFailure || got.ErrorCode != "desktop_control_required" {
+		t.Fatalf("late local result=%#v", got)
+	}
+	if local.closeCount() != 1 {
+		t.Fatalf("local resource cleanup calls=%d", local.closeCount())
+	}
+}
+
+func TestUnconfirmedLocalCleanupLeavesExecutorUnavailable(t *testing.T) {
+	t.Parallel()
+	local := &localOperationsStub{response: json.RawMessage(`{}`), closeOK: false}
+	executor, err := NewWithLocalOperations(&runnerStub{response: json.RawMessage(`{}`)}, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
+	revoke := commandFrame(agentgatewayruntime.DesktopControlOperationRevokeConfig, `{}`)
+	revoke.Target = &agentgatewayruntime.DesktopControlTarget{InstallationID: "install", WorkspaceID: "workspace", ConfigID: "config", ConfigVersion: 2}
+	if got := executor.Handle(context.Background(), revoke, nil); got.ErrorCode != "desktop_control_revoke_incomplete" {
+		t.Fatalf("unconfirmed cleanup revoke=%#v", got)
+	}
+	newLease := commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`)
+	newLease.Target = cloneTarget(newLease.Target)
+	newLease.Target.ConfigVersion = 3
+	if got := executor.Handle(context.Background(), newLease, nil); got.ErrorCode != "desktop_executor_unavailable" {
+		t.Fatalf("acquire after unconfirmed cleanup=%#v", got)
+	}
+}
+
+func TestProcessChunksForwardOnlyWhileLeaseRemainsAuthorized(t *testing.T) {
+	t.Parallel()
+	local := &localOperationsStub{response: json.RawMessage(`{"execution_id":"run","chunks":[{"sequence":9,"stream":"stdout","data_base64":"aGVsbG8="}]}`), closeOK: true}
+	executor, err := NewWithLocalOperations(&runnerStub{response: json.RawMessage(`{}`)}, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
+	command := commandFrame(agentgatewayruntime.DesktopControlOperationShellRead,
+		`{"control_token":"`+token+`","execution_id":"run","cursor":0,"wait_ms":0}`)
+	var chunks []agentgatewayruntime.DesktopControlFrame
+	result := executor.Handle(context.Background(), command, func(frame agentgatewayruntime.DesktopControlFrame) error {
+		chunks = append(chunks, frame)
+		return nil
+	})
+	if result.Type != agentgatewayruntime.DesktopControlFrameResult || len(chunks) != 1 || chunks[0].Type != agentgatewayruntime.DesktopControlFrameResultChunk || string(chunks[0].StreamData) != "hello" {
+		t.Fatalf("result=%#v chunks=%#v", result, chunks)
+	}
+}
+
 func TestExecutorRevocationFencesInFlightResult(t *testing.T) {
 	t.Parallel()
 	runner := &runnerStub{response: json.RawMessage(`{"content":[{"type":"text","text":"ok"}]}`), entered: make(chan struct{}), release: make(chan struct{})}
@@ -119,6 +215,51 @@ func TestExecutorLeaseHasHardMaximumLifetime(t *testing.T) {
 	command.DeadlineAt = now.Add(30 * time.Second)
 	if got := executor.Handle(context.Background(), command, nil); got.ErrorCode != "desktop_control_required" {
 		t.Fatalf("expired maximum-lifetime lease = %#v", got)
+	}
+}
+
+func TestLocalLeaseExpiryRenewsForActiveProcessThenCleansAtHardLimit(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	local := &localOperationsStub{response: json.RawMessage(`{}`), closeOK: true, activeProcesses: 1}
+	executor, err := NewWithLocalOperations(&runnerStub{response: json.RawMessage(`{}`)}, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.now = func() time.Time { return now }
+	_ = acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
+	now = now.Add(leaseIdleDuration + time.Second)
+	executor.expireLeaseIfNeeded()
+	if executor.current == nil || !executor.leaseValid(executor.current) || local.closeCount() != 0 {
+		t.Fatalf("active process did not renew idle lease: lease=%#v closes=%d", executor.current, local.closeCount())
+	}
+	now = executor.current.started.Add(leaseMaxDuration)
+	executor.expireLeaseIfNeeded()
+	if executor.current != nil || local.closeCount() != 1 || executor.revocations != 0 {
+		t.Fatalf("hard expiry did not clean lease resources: lease=%#v closes=%d revocations=%d", executor.current, local.closeCount(), executor.revocations)
+	}
+}
+
+func TestShellStartTimeoutIsCappedToLeaseRemainingLifetime(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	local := &localOperationsStub{response: json.RawMessage(`{"execution_id":"test"}`), closeOK: true}
+	executor, err := NewWithLocalOperations(&runnerStub{response: json.RawMessage(`{}`)}, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.now = func() time.Time { return now }
+	token := acquire(t, executor, commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
+	executor.mu.Lock()
+	executor.current.started = now.Add(-leaseMaxDuration + 20*time.Second)
+	executor.mu.Unlock()
+	command := commandFrame(agentgatewayruntime.DesktopControlOperationShellStart,
+		`{"control_token":"`+token+`","command":"sleep 5","working_directory":"/tmp","timeout_seconds":300}`)
+	if got := executor.Handle(context.Background(), command, nil); got.Type != agentgatewayruntime.DesktopControlFrameResult {
+		t.Fatalf("shell start=%#v", got)
+	}
+	if local.processTimeout <= 0 || local.processTimeout > 20*time.Second {
+		t.Fatalf("process timeout exceeds lease remainder: %s", local.processTimeout)
 	}
 }
 
@@ -333,6 +474,67 @@ type runnerStub struct {
 	response  json.RawMessage
 	entered   chan struct{}
 	release   chan struct{}
+}
+
+type localOperationsStub struct {
+	mu              sync.Mutex
+	response        json.RawMessage
+	callArgs        json.RawMessage
+	calls           int
+	closeCalls      int
+	closeOK         bool
+	activeProcesses int
+	processTimeout  time.Duration
+	entered         chan struct{}
+	waitForContext  bool
+}
+
+func (local *localOperationsStub) Call(ctx context.Context, _ agentgatewayruntime.DesktopControlOperation, arguments json.RawMessage, processTimeout time.Duration) (json.RawMessage, error) {
+	local.mu.Lock()
+	local.calls++
+	local.callArgs = append(json.RawMessage(nil), arguments...)
+	local.processTimeout = processTimeout
+	entered, waitForContext := local.entered, local.waitForContext
+	local.mu.Unlock()
+	if entered != nil {
+		close(entered)
+		if waitForContext {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	}
+	return append(json.RawMessage(nil), local.response...), nil
+}
+
+func (local *localOperationsStub) ActiveProcesses() int {
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	return local.activeProcesses
+}
+
+func (local *localOperationsStub) CloseAll(context.Context) bool {
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	local.closeCalls++
+	return local.closeOK
+}
+
+func (local *localOperationsStub) callCount() int {
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	return local.calls
+}
+
+func (local *localOperationsStub) closeCount() int {
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	return local.closeCalls
+}
+
+func (local *localOperationsStub) arguments() json.RawMessage {
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	return append(json.RawMessage(nil), local.callArgs...)
 }
 
 type stubbornRunner struct {

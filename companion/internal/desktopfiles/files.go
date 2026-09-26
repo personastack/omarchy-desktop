@@ -207,7 +207,10 @@ func (files *OpenFiles) Open(path string) (Opened, error) {
 		_ = file.Close()
 		return Opened{}, err
 	}
-	id := hex.EncodeToString(idBytes[:])
+	idBytes[6] = (idBytes[6] & 0x0f) | 0x40
+	idBytes[8] = (idBytes[8] & 0x3f) | 0x80
+	encodedID := hex.EncodeToString(idBytes[:])
+	id := fmt.Sprintf("%s-%s-%s-%s-%s", encodedID[:8], encodedID[8:12], encodedID[12:16], encodedID[16:20], encodedID[20:])
 	opened := &openFile{file: file, path: resolved, size: info.Size(), modTime: info.ModTime(), text: textFile}
 	files.mu.Lock()
 	if generation != files.generation {
