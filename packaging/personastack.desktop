@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PersonaStack
+Comment=PersonaStack desktop client
+Exec=personastack
+Icon=personastack
+Terminal=false
+Categories=Network;Utility;
+StartupNotify=true

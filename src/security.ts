@@ -1,5 +1,6 @@
 export const DEFAULT_APP_URL = "https://my.personastack.ai/user/personas";
 export const APP_URL_SWITCH = "--personastack-url";
+export const BACKGROUND_SWITCH = "--background";
 
 export type BridgeRole = "main" | "chat" | "stack" | "activity";
 
@@ -42,6 +43,10 @@ export function resolveAppURL(args: readonly string[], packagedDefault?: string)
   const switchIndex = args.indexOf(APP_URL_SWITCH);
   const override = switchIndex >= 0 ? args[switchIndex + 1] : undefined;
   return parseHTTPURL(override) ?? parseHTTPURL(packagedDefault) ?? new URL(DEFAULT_APP_URL);
+}
+
+export function shouldStartInBackground(args: readonly string[]): boolean {
+  return args.includes(BACKGROUND_SWITCH);
 }
 
 export function parseHTTPURL(value: unknown): URL | undefined {

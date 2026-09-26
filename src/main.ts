@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { basename, join } from "node:path";
-
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   Menu,
   nativeImage,
@@ -16,10 +16,13 @@ import {
   type DownloadItem,
   type IpcMainEvent,
   type IpcMainInvokeEvent,
+  type MenuItemConstructorOptions,
 } from "electron";
 
+import { getAutostartStatus, setAutostartEnabled, type AutostartStatus } from "./autostart.js";
 import {
   authorizeBridgeFrame,
+  shouldStartInBackground,
   isNewConcernEvent,
   isAllowedOAuthPopupURL,
   isAllowedMainNavigation,
@@ -64,6 +67,8 @@ let isQuitting = false;
 let companionShutdownComplete = false;
 let chatScope = "";
 let companionClient: CompanionClient | undefined;
+let launchAtLoginStatus: AutostartStatus | "unavailable" = "unavailable";
+const launchInBackground = shouldStartInBackground(process.argv);
 
 app.setName(APP_NAME);
 
@@ -87,7 +92,7 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     configureDownloads();
     createTray();
-    openMainWindow();
+    openMainWindow(!launchInBackground);
   });
 }
 
@@ -115,10 +120,12 @@ function createWindow(role: BridgeRole, options: Electron.BrowserWindowConstruct
   return window;
 }
 
-function openMainWindow(): void {
+function openMainWindow(show = true): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.show();
-    mainWindow.focus();
+    if (show) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
     return;
   }
   mainWindow = createWindow("main", {
@@ -130,7 +137,7 @@ function openMainWindow(): void {
     title: APP_NAME,
     icon: nativeImage.createFromDataURL(APP_ICON),
   });
-  mainWindow.once("ready-to-show", () => mainWindow?.show());
+  if (show) mainWindow.once("ready-to-show", () => mainWindow?.show());
   mainWindow.on("close", (event) => {
     if (!isQuitting) {
       event.preventDefault();
@@ -519,12 +526,50 @@ function isCurrentChatDocument(window: BrowserWindow): boolean {
 function createTray(): void {
   tray = new Tray(nativeImage.createFromDataURL(APP_ICON));
   tray.setToolTip(`${APP_NAME} is running`);
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: "Open PersonaStack", click: openMainWindow },
+  updateTrayMenu();
+  if (app.isPackaged) void refreshLaunchAtLoginStatus();
+  tray.on("click", () => openMainWindow());
+}
+
+function updateTrayMenu(): void {
+  if (!tray) return;
+  const items: MenuItemConstructorOptions[] = [
+    { label: "Open PersonaStack", click: () => openMainWindow() },
     { type: "separator" },
-    { label: "Quit", click: () => app.quit() },
-  ]));
-  tray.on("click", openMainWindow);
+  ];
+  if (app.isPackaged) {
+    items.push({
+      label: launchAtLoginStatus === "conflict" ? "Launch at Login (manual entry found)" : "Launch at Login",
+      type: "checkbox",
+      checked: launchAtLoginStatus === "enabled",
+      enabled: launchAtLoginStatus !== "conflict" && launchAtLoginStatus !== "unavailable",
+      click: () => { void toggleLaunchAtLogin(); },
+    });
+    items.push({ type: "separator" });
+  }
+  items.push({ label: "Quit PersonaStack", click: () => app.quit() });
+  tray.setContextMenu(Menu.buildFromTemplate(items));
+}
+
+async function refreshLaunchAtLoginStatus(): Promise<void> {
+  try {
+    launchAtLoginStatus = await getAutostartStatus(join(app.getPath("appData"), "autostart"));
+  } catch {
+    launchAtLoginStatus = "unavailable";
+  }
+  updateTrayMenu();
+}
+
+async function toggleLaunchAtLogin(): Promise<void> {
+  if (!app.isPackaged || launchAtLoginStatus === "conflict" || launchAtLoginStatus === "unavailable") return;
+  const directory = join(app.getPath("appData"), "autostart");
+  try {
+    await setAutostartEnabled(directory, launchAtLoginStatus !== "enabled");
+    await refreshLaunchAtLoginStatus();
+  } catch {
+    await refreshLaunchAtLoginStatus();
+    dialog.showErrorBox("Launch at Login", "PersonaStack could not update its login item. Check the user autostart folder and try again.");
+  }
 }
 
 function configureDownloads(): void {

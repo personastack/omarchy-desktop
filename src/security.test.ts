@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   APP_URL_SWITCH,
+  BACKGROUND_SWITCH,
   authorizeBridgeFrame,
   isAllowedOAuthPopupURL,
   isAllowedMainNavigation,
@@ -17,6 +18,7 @@ import {
   parseChatWindowCommand,
   parseStackCommand,
   resolveAppURL,
+  shouldStartInBackground,
   unwrapBridgePayload,
 } from "./security.js";
 
@@ -25,6 +27,12 @@ test("URL resolution preserves packaged defaults and rejects invalid overrides",
   assert.equal(resolveAppURL([APP_URL_SWITCH, "file:///tmp/page"], "https://example.test/app").href, "https://example.test/app");
   assert.equal(resolveAppURL([APP_URL_SWITCH], "bad").href, "https://my.personastack.ai/user/personas");
   assert.equal(resolveAppURL([APP_URL_SWITCH, "https://user:pass@example.test"], "https://example.test").origin, "https://example.test");
+});
+
+test("background launch is explicit and leaves ordinary launches visible", () => {
+  assert.equal(shouldStartInBackground(["/usr/bin/personastack"]), false);
+  assert.equal(shouldStartInBackground(["/usr/bin/personastack", BACKGROUND_SWITCH]), true);
+  assert.equal(shouldStartInBackground(["/usr/bin/personastack", "--not-background"]), false);
 });
 
 test("bridge admits only registered current main frames at the exact configured origin", () => {
