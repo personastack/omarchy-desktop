@@ -26,7 +26,7 @@ The detailed parity inventory and implementation checklist are maintained with t
 
 ## Development
 
-Use Node `24.21.0` with npm `11.19.0`. Run `npm ci` and `npm test` from the repository root. The Go companion uses Go `1.27.1`; run `GOTOOLCHAIN=go1.27.1 go test -parallel 8 ./...` from `companion/`. These host-independent checks do not validate Omarchy, Hyprland, Cua, keyring, or graphical-session behavior.
+Use Node `24.21.0` with npm `11.19.0`. Run `npm ci` and `npm test` from the repository root. The Go companion uses Go `1.27.1`; it imports the producer-owned client from the private `personastack-api` repository. Building it requires authorized GitHub access. Set `GOPRIVATE=github.com/personastack` and use configured Git authentication. Keep credentials out of this repository and command arguments. Run `GOTOOLCHAIN=go1.27.1 go test -parallel 8 ./...` from `companion/`. These host-independent checks do not validate Omarchy, Hyprland, Cua, keyring, or graphical-session behavior.
 
 ## Security
 
