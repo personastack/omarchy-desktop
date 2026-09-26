@@ -18,7 +18,7 @@ The desktop app's Omarchy compatibility, complete Cua tool coverage, real Secret
 
 ## Proposed implementation
 
-The implementation uses an Electron shell and one Go companion. Electron owns the hosted windows and a finite, origin-checked native bridge. Go will own machine credentials, the outbound PersonaStack connection, Cua, local CLI setup, files, and processes. The current shell has a persistent hosted window, tray residency, generation-bound exact-origin bridge admission, Google OAuth navigation/pop-ups, persona chat and stack/activity pop-outs, downloads, and generic concern notifications. A Go adapter now stores API-issued Desktop Control installation records through Linux Secret Service with no plaintext fallback. Its unit tests use a fake command. It is not connected to enrollment and does not prove real keyring behavior. The sign-in journey is not validated. Cua, local CLI setup, and remote file/process execution are not implemented.
+The implementation uses an Electron shell and one Go companion. Electron owns the hosted windows and a finite, origin-checked native bridge. Go will own machine credentials, the outbound PersonaStack connection, Cua, local CLI setup, files, and processes. The current shell has a persistent hosted window, tray residency, generation-bound exact-origin bridge admission, Google OAuth navigation/pop-ups, persona chat and stack/activity pop-outs, downloads, and generic concern notifications. The Go companion has a producer-owned API client and an installation service for enroll, attach, readiness, session fencing, status, and revoke. The service stores machine credentials through Linux Secret Service with no plaintext fallback. Its source and ordering tests use fake APIs and commands. The service is not yet exposed through Electron IPC or a running companion process. Real API, keyring, sign-in, and Omarchy behavior remain unverified. Cua, local CLI setup, and remote file/process execution are not implemented.
 
 ## Development status
 
@@ -34,4 +34,4 @@ The client must not put machine credentials in a web renderer, browser storage, 
 
 ## Contributing
 
-The next milestone is to connect the companion to the existing enrollment and gateway contracts, then implement the remaining host-independent Desktop Control paths. Native window, keyring, Cua, login, and lifecycle acceptance remains open until tested on the exact Omarchy profile.
+The next milestone is to expose the installation service through the typed companion process and Electron bridge, then implement the gateway and remaining host-independent Desktop Control paths. Native window, keyring, Cua, login, and lifecycle acceptance remains open until tested on the exact Omarchy profile.

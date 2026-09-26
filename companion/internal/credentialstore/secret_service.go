@@ -3,16 +3,13 @@ package credentialstore
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"net/url"
 	"os/exec"
-	"regexp"
-	"strings"
 	"time"
+
+	"github.com/personastack/personastack-api/pkg/client/desktopcontrol"
 )
 
 const (
@@ -26,21 +23,10 @@ var (
 	ErrInvalidInstallation = errors.New("invalid desktop control installation")
 	ErrCredentialMissing   = errors.New("desktop control installation is not enrolled")
 	ErrUnavailable         = errors.New("Linux Secret Service is unavailable")
-	installationIDPattern  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 )
 
-// Installation is the API-issued machine credential and gateway pairing.
-// Its string forms deliberately omit the credential.
-type Installation struct {
-	EnvironmentOrigin   string `json:"environment_origin"`
-	InstallationID      string `json:"installation_id"`
-	MachineCredential   string `json:"machine_credential"`
-	GatewayWebsocketURL string `json:"gateway_websocket_url"`
-}
-
-func (i Installation) String() string {
-	return fmt.Sprintf("Installation{environment_origin:%q installation_id:%q machine_credential:<redacted> gateway_websocket_url:%q}", i.EnvironmentOrigin, i.InstallationID, i.GatewayWebsocketURL)
-}
+// Installation is the producer-owned API contract for an enrolled desktop.
+type Installation = desktopcontrol.Installation
 
 // SecretService stores one API-owned installation per app origin in the
 // user's Linux Secret Service collection. It has no plaintext fallback.
@@ -151,31 +137,13 @@ func attributes(origin string) []string {
 }
 
 func validateInstallation(installation Installation) error {
-	if !validOrigin(installation.EnvironmentOrigin) || !installationIDPattern.MatchString(installation.InstallationID) || !validCredential(installation.MachineCredential) || !validGateway(installation.GatewayWebsocketURL, installation.EnvironmentOrigin) {
+	if installation.Validate(installation.EnvironmentOrigin) != nil {
 		return ErrInvalidInstallation
 	}
 	return nil
 }
 
 func validOrigin(origin string) bool {
-	return origin == "https://my.personastack.ai" || origin == "https://personastack.ericgreer.info"
-}
-
-func validCredential(value string) bool {
-	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(value, "="))
-	if err != nil {
-		decoded, err = base64.StdEncoding.DecodeString(value)
-	}
-	return err == nil && len(decoded) == 32
-}
-
-func validGateway(raw, origin string) bool {
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.User != nil || parsed.Path != "/v1/desktop-control/ws" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
-		return false
-	}
-	if origin == "https://my.personastack.ai" {
-		return parsed.Scheme == "wss" && strings.EqualFold(parsed.Hostname(), "cluster-agent.personastack.ai") && (parsed.Port() == "" || parsed.Port() == "443")
-	}
-	return origin == "https://personastack.ericgreer.info" && parsed.Scheme == "ws" && strings.EqualFold(parsed.Hostname(), "cluster-agent.personastack.lan") && (parsed.Port() == "" || parsed.Port() == "80")
+	_, err := desktopcontrol.New(origin)
+	return err == nil
 }

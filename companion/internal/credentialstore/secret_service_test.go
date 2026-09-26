@@ -149,7 +149,7 @@ func fakeSecretTool(t *testing.T, argsPath, secretPath, body string) string {
 	path := filepath.Join(t.TempDir(), "secret-tool")
 	argsVar := shellQuote(argsPath)
 	secretVar := shellQuote(secretPath)
-	script := "#!/bin/sh\nARGS_PATH=" + argsVar + "\nSECRET_PATH=" + secretVar + "\nprintf '%s\\n' \"$@\" > \"$ARGS_PATH\"\n" + body + "\n"
+	script := "#!/bin/bash\nARGS_PATH=" + argsVar + "\nSECRET_PATH=" + secretVar + "\nprintf '%s\\n' \"$@\" > \"$ARGS_PATH\"\n" + body + "\n"
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake secret-tool: %v", err)
 	}
