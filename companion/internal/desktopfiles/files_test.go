@@ -241,7 +241,7 @@ func TestFailedSearchDoesNotRetainContinuationState(t *testing.T) {
 	defer os.Chmod(path, 0o600)
 	files := New()
 	for i := 0; i < maxSearches+1; i++ {
-		if _, err := files.Search(root, "", "", "secret", 1, ""); !errors.Is(err, ErrPermissionDenied) {
+		if _, err := files.Search(root, nil, nil, stringPointer("secret"), 1, nil); !errors.Is(err, ErrPermissionDenied) {
 			t.Fatalf("failing search %d = %v", i, err)
 		}
 	}
@@ -256,7 +256,7 @@ func TestSearchContinuationCanOnlyAdvanceOnce(t *testing.T) {
 		}
 	}
 	files := New()
-	page, err := files.Search(root, "a", "", "", 1, "")
+	page, err := files.Search(root, stringPointer("a"), nil, nil, 1, nil)
 	if err != nil || page.Continuation == "" {
 		t.Fatalf("initial search = %#v, %v", page, err)
 	}
@@ -268,7 +268,7 @@ func TestSearchContinuationCanOnlyAdvanceOnce(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			<-start
-			_, callErr := files.Search(root, "a", "", "", 1, page.Continuation)
+			_, callErr := files.Search(root, stringPointer("a"), nil, nil, 1, &page.Continuation)
 			errs <- callErr
 		}()
 	}
@@ -286,6 +286,202 @@ func TestSearchContinuationCanOnlyAdvanceOnce(t *testing.T) {
 	}
 	if succeeded != 1 || expired != 1 {
 		t.Fatalf("continuation outcomes: success=%d expired=%d", succeeded, expired)
+	}
+}
+
+func TestSearchContinuationPreservesEmptyFilterPresence(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	for _, name := range []string{"alpha.txt", "beta.txt"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("hit"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := New()
+	emptyFilter := ""
+	glob := "*.txt"
+	page, err := files.Search(root, &emptyFilter, &glob, nil, 1, nil)
+	if err != nil || page.Continuation == "" || len(page.Matches) != 1 || page.Matches[0].MatchedLines == nil {
+		t.Fatalf("initial search = %#v, %v", page, err)
+	}
+	if _, err := files.Search(root, nil, &glob, nil, 1, &page.Continuation); !errors.Is(err, ErrSearchContinuationExpired) {
+		t.Fatalf("continuation after dropping explicit empty filter = %v", err)
+	}
+}
+
+func TestSearchEmptyNameFilterDoesNotMatchEveryEntry(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "alpha.txt"), []byte("hit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := New()
+	emptyFilter := ""
+	glob := "no-match*"
+	page, err := files.Search(root, &emptyFilter, &glob, nil, 100, nil)
+	if err != nil || len(page.Matches) != 0 {
+		t.Fatalf("empty name filter should not match by itself: %#v, %v", page, err)
+	}
+}
+
+func TestSearchEmptyContentFilterKeepsEmptyLinesAndScanTruncation(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	path := filepath.Join(root, "large-item.txt")
+	content := bytes.Repeat([]byte("x"), maxSearchFileSize+1)
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := New()
+	nameContains := "large-item"
+	emptyContent := ""
+	page, err := files.Search(root, &nameContains, nil, &emptyContent, 10, nil)
+	if err != nil || len(page.Matches) != 1 {
+		t.Fatalf("search page = %#v, %v", page, err)
+	}
+	match := page.Matches[0]
+	if match.MatchedLines == nil || len(match.MatchedLines) != 0 || !match.ContentScanTruncated {
+		t.Fatalf("empty content filter match = %#v", match)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.IncompleteContentPaths) != 1 || page.IncompleteContentPaths[0] != resolvedPath {
+		t.Fatalf("incomplete content paths = %#v", page.IncompleteContentPaths)
+	}
+}
+
+func TestSearchUsesUnicodeCaseFoldingForNamesAndContents(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	path := filepath.Join(root, "straße.txt")
+	if err := os.WriteFile(path, []byte("die Straße"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := New()
+	nameQuery := "STRASSE"
+	page, err := files.Search(root, &nameQuery, nil, nil, 10, nil)
+	if err != nil || len(page.Matches) != 1 || page.Matches[0].Entry.Name != "straße.txt" {
+		t.Fatalf("Unicode name search = %#v, %v", page, err)
+	}
+	contentQuery := "STRASSE"
+	page, err = files.Search(root, nil, nil, &contentQuery, 10, nil)
+	if err != nil || len(page.Matches) != 1 || len(page.Matches[0].MatchedLines) != 1 {
+		t.Fatalf("Unicode content search = %#v, %v", page, err)
+	}
+	if containsFold("İstanbul", "i") {
+		t.Fatal("dotted capital I matched plain i")
+	}
+	if !containsFold("straße", "STRASSE") {
+		t.Fatal("sharp S did not match its case-insensitive double-s spelling")
+	}
+	for _, value := range []string{"a\u00adbc", "a\u200bbc"} {
+		if containsFold(value, "abc") {
+			t.Fatalf("default ignorable in %q was skipped across a search match", value)
+		}
+	}
+	if containsFold("abc", "a\u00adbc") {
+		t.Fatal("soft hyphen in query was ignored across a search match")
+	}
+	if !containsFold("a\u00adbc", "a\u00adbc") {
+		t.Fatal("literal soft hyphen search did not match")
+	}
+	for _, test := range []struct{ value, needle string }{
+		{"straße\u200b", "STRASSE\u200b"},
+		{"Σ\u200b", "ς\u200b"},
+		{"ﬀ\u200b", "FF\u200b"},
+		{"ax\u200bstraße\u200by", "x\u200bSTRASSE\u200by"},
+	} {
+		if !containsFold(test.value, test.needle) {
+			t.Errorf("localized search %q in %q did not match", test.needle, test.value)
+		}
+	}
+}
+
+func TestSearchAcceptsValidUTF8ControlsAndFoundationNewlines(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	path := filepath.Join(root, "lines.txt")
+	if err := os.WriteFile(path, []byte("first\rsecond\r\nthird\u2028needle\x00\vthird2\fneedle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := New()
+	query := "needle"
+	page, err := files.Search(root, nil, nil, &query, 10, nil)
+	if err != nil || len(page.Matches) != 1 {
+		t.Fatalf("search page = %#v, %v", page, err)
+	}
+	if got := page.Matches[0].MatchedLines; len(got) != 2 || got[0] != 5 || got[1] != 7 {
+		t.Fatalf("matched lines = %#v, want [5 7]", got)
+	}
+}
+
+func TestSearchNameGlobSupportsPOSIXNegatedCharacterClasses(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		pattern    string
+		name       string
+		want       bool
+		incomplete bool
+	}{
+		{"[!a]*", "banana", true, false},
+		{"[!a]*", "apple", false, false},
+		{"[a-\\z]", "m", true, false},
+		{"\\[!a]*", "banana", false, false},
+		{"[[:digit:]]", "7", true, false},
+		{"[[:alpha:]]", "é", false, false},
+		{"[[:digit:]]", "١", false, false},
+		{"[[:space:]]", " ", false, false},
+		{"[[:ascii:]]", "a", false, false},
+		{"[[=a=]]", "a", true, false},
+		{"[[.a.]]", "a", true, false},
+		{"[![:digit:]]", "x", true, false},
+		{"[![:digit:]]", "7", false, false},
+		{"?", "é", false, false},
+		{"??", "é", true, false},
+		{"é", "é", true, false},
+		{"[!a]", "é", false, false},
+		{"[À-ÿ]", "é", false, false},
+		{strings.Repeat("*", maxPOSIXGlobBytes+1) + "[[:digit:]]", "7", false, true},
+	} {
+		got, err := matchesFileGlob(test.pattern, test.name)
+		if test.incomplete {
+			if !errors.Is(err, ErrSearchIncomplete) {
+				t.Errorf("matchesFileGlob(%q) error = %v, want %v", test.pattern, err, ErrSearchIncomplete)
+			}
+			continue
+		}
+		if err != nil || got != test.want {
+			t.Errorf("matchesFileGlob(%q, %q) = %t, want %t", test.pattern, test.name, got, test.want)
+		}
+	}
+}
+
+func TestSearchReportsGlobWorkLimit(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		pattern string
+	}{
+		{"oversized", strings.Repeat("*", maxPOSIXGlobBytes+1) + "[[:digit:]]"},
+		{"state budget", strings.Repeat("*", 400) + "[[:digit:]]"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			name := "7"
+			if test.name == "state budget" {
+				name = strings.Repeat("x", 255)
+			}
+			if err := os.WriteFile(filepath.Join(root, name), []byte("value"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := New().Search(root, nil, &test.pattern, nil, 10, nil)
+			if !errors.Is(err, ErrSearchIncomplete) {
+				t.Fatalf("search error = %v, want %v", err, ErrSearchIncomplete)
+			}
+		})
 	}
 }
 
@@ -332,18 +528,18 @@ func TestSearchPaginatesAndReportsIncompleteContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	files := New()
-	page, err := files.Search(root, "", "", "hit", 1, "")
+	page, err := files.Search(root, nil, nil, stringPointer("hit"), 1, nil)
 	resolvedFirst, _ := filepath.EvalSymlinks(first)
 	if err != nil || len(page.Matches) != 1 || page.Matches[0].Entry.Path != resolvedFirst || page.Continuation == "" {
 		t.Fatalf("first search page: %#v, %v", page, err)
 	}
 	continuation := page.Continuation
-	page, err = files.Search(root, "", "", "hit", 1, continuation)
+	page, err = files.Search(root, nil, nil, stringPointer("hit"), 1, &continuation)
 	resolvedLarge, _ := filepath.EvalSymlinks(large)
 	if err != nil || len(page.Matches) != 1 || page.Matches[0].Entry.Path != resolvedLarge || !page.Matches[0].ContentScanTruncated || len(page.IncompleteContentPaths) != 1 {
 		t.Fatalf("second search page: %#v, %v", page, err)
 	}
-	if _, err = files.Search(root, "different", "", "hit", 1, continuation); !errors.Is(err, ErrSearchContinuationExpired) {
+	if _, err = files.Search(root, stringPointer("different"), nil, stringPointer("hit"), 1, &continuation); !errors.Is(err, ErrSearchContinuationExpired) {
 		t.Fatalf("search continuation with changed query = %v", err)
 	}
 }
@@ -364,3 +560,5 @@ func TestOpenRejectsSpecialFilesAndUnsafePaths(t *testing.T) {
 		}
 	}
 }
+
+func stringPointer(value string) *string { return &value }

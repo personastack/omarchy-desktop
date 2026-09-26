@@ -3,12 +3,16 @@
 package desktoplocal
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"mime"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -106,28 +110,25 @@ func (operations *Operations) CloseAll(ctx context.Context) bool {
 func (operations *Operations) file(ctx context.Context, fields map[string]json.RawMessage) (any, error) {
 	action, ok := stringField(fields, "action")
 	if !ok {
-		return nil, desktopfiles.ErrInvalidPath
+		return nil, invalidArguments()
 	}
 	switch action {
 	case "stat":
 		path, ok := stringField(fields, "path")
 		if !ok {
-			return nil, desktopfiles.ErrInvalidPath
+			return nil, invalidArguments()
 		}
 		entry, err := desktopfiles.Metadata(path)
 		return entryResult(entry), err
 	case "list":
 		path, ok := stringField(fields, "path")
 		if !ok {
-			return nil, desktopfiles.ErrInvalidPath
+			return nil, invalidArguments()
 		}
-		offset, ok := integerField(fields, "offset", 0)
-		if !ok {
-			return nil, desktopfiles.ErrInvalidRange
-		}
-		limit, ok := integerField(fields, "limit", 100)
-		if !ok {
-			return nil, desktopfiles.ErrInvalidRange
+		offset := integerOrDefault(fields, "offset", 0)
+		limit := integerOrDefault(fields, "limit", 100)
+		if offset < 0 || limit < 1 || limit > desktopfiles.MaxPageSize {
+			return nil, desktopfiles.ErrNotDirectory
 		}
 		entries, next, err := desktopfiles.List(path, offset, limit)
 		mapped := make([]map[string]any, 0, len(entries))
@@ -138,14 +139,17 @@ func (operations *Operations) file(ctx context.Context, fields map[string]json.R
 	case "search":
 		root, ok := stringField(fields, "root")
 		if !ok {
+			return nil, invalidArguments()
+		}
+		limit := integerOrDefault(fields, "limit", 100)
+		nameContains := optionalStringValue(fields, "name_contains")
+		nameGlob := optionalStringValue(fields, "name_glob")
+		contentContains := optionalStringValue(fields, "content_contains")
+		if limit < 1 || limit > desktopfiles.MaxPageSize || !nonEmpty(nameContains) && !nonEmpty(nameGlob) && !nonEmpty(contentContains) {
 			return nil, desktopfiles.ErrNotDirectory
 		}
-		limit, ok := integerField(fields, "limit", 100)
-		if !ok {
-			return nil, desktopfiles.ErrInvalidRange
-		}
-		page, err := operations.files.Search(root, optionalString(fields, "name_contains"), optionalString(fields, "name_glob"),
-			optionalString(fields, "content_contains"), limit, optionalString(fields, "continuation"))
+		continuation := optionalStringValue(fields, "continuation")
+		page, err := operations.files.Search(root, nameContains, nameGlob, contentContains, limit, continuation)
 		matches := make([]map[string]any, 0, len(page.Matches))
 		for _, match := range page.Matches {
 			entry := entryResult(match.Entry)
@@ -158,7 +162,7 @@ func (operations *Operations) file(ctx context.Context, fields map[string]json.R
 	case "open":
 		path, ok := stringField(fields, "path")
 		if !ok {
-			return nil, desktopfiles.ErrInvalidPath
+			return nil, invalidArguments()
 		}
 		opened, err := operations.files.Open(path)
 		if err != nil {
@@ -196,19 +200,18 @@ func (operations *Operations) file(ctx context.Context, fields map[string]json.R
 		return result, nil
 	case "read":
 		handle, ok := stringField(fields, "handle")
+		handle, ok = canonicalUUID(handle)
 		if !ok {
-			return nil, desktopfiles.ErrMissingHandle
+			return nil, invalidArguments()
 		}
-		length, ok := integerField(fields, "length", desktopfiles.MaxReadBytes)
-		if !ok {
-			return nil, desktopfiles.ErrInvalidRange
-		}
+		length := integerOrDefault(fields, "length", desktopfiles.MaxReadBytes)
 		read, err := readFileOperation(operations.files, fields, handle, length)
 		return readResult(read), err
 	case "close":
 		handle, ok := stringField(fields, "handle")
+		handle, ok = canonicalUUID(handle)
 		if !ok {
-			return nil, desktopfiles.ErrMissingHandle
+			return nil, invalidArguments()
 		}
 		if err := operations.files.Close(handle); err != nil {
 			return nil, err
@@ -220,15 +223,15 @@ func (operations *Operations) file(ctx context.Context, fields map[string]json.R
 		modeText, modeOK := stringField(fields, "mode")
 		data, decodeErr := base64.StdEncoding.DecodeString(content)
 		if !pathOK || !contentOK || decodeErr != nil || !modeOK {
-			return nil, desktopfiles.ErrInvalidRange
+			return nil, invalidArguments()
 		}
 		mode := desktopfiles.WriteMode(modeText)
 		if mode != desktopfiles.WriteCreate && mode != desktopfiles.WriteReplace && mode != desktopfiles.WriteAppend {
-			return nil, desktopfiles.ErrInvalidRange
+			return nil, invalidArguments()
 		}
 		offset, ok := optionalInt64(fields, "offset")
 		if !ok {
-			return nil, desktopfiles.ErrInvalidRange
+			offset = nil
 		}
 		entry, err := desktopfiles.Write(path, data, mode, offset)
 		return entryResult(entry), err
@@ -237,31 +240,31 @@ func (operations *Operations) file(ctx context.Context, fields map[string]json.R
 		expected, expectedOK := stringField(fields, "expected")
 		replacement, replacementOK := stringField(fields, "replacement")
 		if !pathOK || !expectedOK || !replacementOK {
-			return nil, desktopfiles.ErrInvalidPath
+			return nil, invalidArguments()
 		}
 		entry, err := desktopfiles.Patch(path, expected, replacement)
 		return entryResult(entry), err
 	case "mkdir":
 		path, ok := stringField(fields, "path")
 		if !ok {
-			return nil, desktopfiles.ErrInvalidPath
+			return nil, invalidArguments()
 		}
 		return map[string]bool{"created": true}, desktopfiles.MakeDirectory(path)
 	case "move":
 		source, sourceOK := stringField(fields, "source")
 		destination, destinationOK := stringField(fields, "destination")
 		if !sourceOK || !destinationOK {
-			return nil, desktopfiles.ErrInvalidPath
+			return nil, invalidArguments()
 		}
 		return map[string]bool{"moved": true}, desktopfiles.Move(source, destination)
 	case "remove":
 		path, ok := stringField(fields, "path")
 		if !ok {
-			return nil, desktopfiles.ErrInvalidPath
+			return nil, invalidArguments()
 		}
 		return map[string]bool{"removed": true}, desktopfiles.Remove(path)
 	default:
-		return nil, desktopfiles.ErrInvalidRange
+		return nil, invalidArguments()
 	}
 }
 
@@ -276,9 +279,9 @@ func (operations *Operations) process(ctx context.Context, operation agentgatewa
 	case agentgatewayruntime.DesktopControlOperationShellStart:
 		command, commandOK := stringField(fields, "command")
 		workingDirectory, directoryOK := stringField(fields, "working_directory")
-		timeoutSeconds, timeoutOK := numberField(fields, "timeout_seconds", 300)
-		if !commandOK || !directoryOK || !timeoutOK {
-			return nil, desktopprocess.ErrInvalidCommand
+		timeoutSeconds := numberOrDefault(fields, "timeout_seconds", 300)
+		if !commandOK || !directoryOK {
+			return nil, invalidArguments()
 		}
 		if timeoutSeconds < 1 {
 			timeoutSeconds = 1
@@ -297,29 +300,32 @@ func (operations *Operations) process(ctx context.Context, operation agentgatewa
 		return read, err
 	case agentgatewayruntime.DesktopControlOperationShellRead:
 		id, ok := stringField(fields, "execution_id")
+		id, ok = canonicalUUID(id)
 		if !ok {
-			return nil, desktopprocess.ErrMissingExecution
+			return nil, invalidArguments()
 		}
-		cursor, ok := uint64Field(fields, "cursor", 0)
-		if !ok {
-			return nil, desktopprocess.ErrInvalidInput
+		cursor := uint64OrDefault(fields, "cursor", 0)
+		waitMS := integerOrDefault(fields, "wait_ms", 0)
+		if waitMS < 0 {
+			waitMS = 0
 		}
-		waitMS, ok := integerField(fields, "wait_ms", 0)
-		if !ok || waitMS < 0 {
-			return nil, desktopprocess.ErrInvalidInput
+		if waitMS > 10_000 {
+			waitMS = 10_000
 		}
 		read, err := processes.Read(ctx, id, cursor, time.Duration(waitMS)*time.Millisecond)
 		return read, err
 	case agentgatewayruntime.DesktopControlOperationShellStatus:
 		id, ok := stringField(fields, "execution_id")
+		id, ok = canonicalUUID(id)
 		if !ok {
-			return nil, desktopprocess.ErrMissingExecution
+			return nil, invalidArguments()
 		}
 		return processes.Status(id)
 	case agentgatewayruntime.DesktopControlOperationShellWrite:
 		id, ok := stringField(fields, "execution_id")
+		id, ok = canonicalUUID(id)
 		if !ok {
-			return nil, desktopprocess.ErrMissingExecution
+			return nil, invalidArguments()
 		}
 		if closed, ok := boolField(fields, "close_stdin"); ok && closed {
 			if err := processes.CloseStdin(ctx, id); err != nil {
@@ -332,19 +338,20 @@ func (operations *Operations) process(ctx context.Context, operation agentgatewa
 		} else if encoded, ok := stringField(fields, "data_base64"); ok {
 			data, err := base64.StdEncoding.DecodeString(encoded)
 			if err != nil {
-				return nil, desktopprocess.ErrInvalidInput
+				return nil, invalidArguments()
 			}
 			if err := processes.Write(ctx, id, data); err != nil {
 				return nil, err
 			}
 		} else {
-			return nil, desktopprocess.ErrInvalidInput
+			return nil, invalidArguments()
 		}
 		return map[string]bool{"accepted": true}, nil
 	case agentgatewayruntime.DesktopControlOperationShellCancel:
 		id, ok := stringField(fields, "execution_id")
+		id, ok = canonicalUUID(id)
 		if !ok {
-			return nil, desktopprocess.ErrMissingExecution
+			return nil, invalidArguments()
 		}
 		if err := processes.Cancel(ctx, id); err != nil {
 			return nil, err
@@ -356,26 +363,32 @@ func (operations *Operations) process(ctx context.Context, operation agentgatewa
 }
 
 func readFileOperation(files *desktopfiles.OpenFiles, fields map[string]json.RawMessage, handle string, length int) (desktopfiles.Read, error) {
+	line, lineCastOK := integerField(fields, "start_line", 0)
 	_, hasLine := fields["start_line"]
-	if hasLine {
+	if hasLine && lineCastOK {
 		if _, hasOffset := fields["offset"]; hasOffset {
-			return desktopfiles.Read{}, desktopfiles.ErrInvalidRange
+			return desktopfiles.Read{}, invalidArguments()
 		}
-		line, ok := integerField(fields, "start_line", 0)
 		lineCount, countOK := integerField(fields, "line_count", 0)
-		if !ok || !countOK || line < 1 || lineCount < 1 {
-			return desktopfiles.Read{}, desktopfiles.ErrInvalidRange
+		if _, hasCount := fields["line_count"]; !hasCount || !countOK {
+			return desktopfiles.Read{}, invalidArguments()
 		}
 		return files.ReadLines(handle, line, lineCount, length)
 	}
 	if _, exists := fields["line_count"]; exists {
-		return desktopfiles.Read{}, desktopfiles.ErrInvalidRange
+		return desktopfiles.Read{}, invalidArguments()
 	}
-	offset, ok := int64Field(fields, "offset", 0)
+	if _, hasOffset := fields["offset"]; !hasOffset {
+		return desktopfiles.Read{}, invalidArguments()
+	}
+	offset, ok := uint64Field(fields, "offset", 0)
 	if !ok {
+		return desktopfiles.Read{}, invalidArguments()
+	}
+	if offset > uint64(^uint64(0)>>1) {
 		return desktopfiles.Read{}, desktopfiles.ErrInvalidRange
 	}
-	return files.Read(handle, offset, length)
+	return files.Read(handle, int64(offset), length)
 }
 
 func collectImage(files *desktopfiles.OpenFiles, opened desktopfiles.Opened) ([]byte, bool, bool, error) {
@@ -428,6 +441,10 @@ func entryResult(entry desktopfiles.Entry) map[string]any {
 }
 
 func mapError(operation agentgatewayruntime.DesktopControlOperation, fields map[string]json.RawMessage, err error) error {
+	var commandFailure *Failure
+	if errors.As(err, &commandFailure) {
+		return commandFailure
+	}
 	var code, message string
 	switch {
 	case errors.Is(err, desktopfiles.ErrPermissionDenied):
@@ -485,6 +502,10 @@ func isPartialWrite(fields map[string]json.RawMessage, err error) bool {
 
 func failure(code, message string) *Failure { return &Failure{Code: code, Message: message} }
 
+func invalidArguments() *Failure {
+	return failure("invalid_arguments", "The Desktop Control tool arguments are invalid.")
+}
+
 func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
 	if !wirejson.ValidUniqueJSON(raw) {
 		return nil, errors.New("invalid JSON object")
@@ -499,39 +520,40 @@ func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
 func stringField(fields map[string]json.RawMessage, name string) (string, bool) {
 	var value string
 	raw, ok := fields[name]
-	if !ok || json.Unmarshal(raw, &value) != nil {
+	if !ok || isJSONNull(raw) || json.Unmarshal(raw, &value) != nil {
 		return "", false
 	}
 	return value, true
 }
 
-func optionalString(fields map[string]json.RawMessage, name string) string {
-	value, _ := stringField(fields, name)
-	return value
+func optionalStringValue(fields map[string]json.RawMessage, name string) *string {
+	value, ok := stringField(fields, name)
+	if !ok {
+		return nil
+	}
+	return &value
 }
+
+func nonEmpty(value *string) bool { return value != nil && *value != "" }
 
 func integerField(fields map[string]json.RawMessage, name string, fallback int) (int, bool) {
 	raw, ok := fields[name]
 	if !ok {
 		return fallback, true
 	}
-	var value int
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, ok := foundationInteger(raw)
+	if !ok || int64(int(value)) != value {
 		return 0, false
 	}
-	return value, true
+	return int(value), true
 }
 
-func int64Field(fields map[string]json.RawMessage, name string, fallback int64) (int64, bool) {
-	raw, ok := fields[name]
+func integerOrDefault(fields map[string]json.RawMessage, name string, fallback int) int {
+	value, ok := integerField(fields, name, fallback)
 	if !ok {
-		return fallback, true
+		return fallback
 	}
-	var value int64
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return 0, false
-	}
-	return value, true
+	return value
 }
 
 func optionalInt64(fields map[string]json.RawMessage, name string) (*int64, bool) {
@@ -539,8 +561,8 @@ func optionalInt64(fields map[string]json.RawMessage, name string) (*int64, bool
 	if !ok {
 		return nil, true
 	}
-	var value int64
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, ok := foundationInt64(raw)
+	if !ok || value < 0 {
 		return nil, false
 	}
 	return &value, true
@@ -551,8 +573,8 @@ func uint64Field(fields map[string]json.RawMessage, name string, fallback uint64
 	if !ok {
 		return fallback, true
 	}
-	var value int64
-	if err := json.Unmarshal(raw, &value); err != nil || value < 0 {
+	value, ok := foundationInt64(raw)
+	if !ok || value < 0 {
 		return 0, false
 	}
 	return uint64(value), true
@@ -563,11 +585,46 @@ func numberField(fields map[string]json.RawMessage, name string, fallback float6
 	if !ok {
 		return fallback, true
 	}
+	if boolean, ok := jsonBoolean(raw); ok {
+		if boolean {
+			return 1, true
+		}
+		return 0, true
+	}
 	var value float64
-	if err := json.Unmarshal(raw, &value); err != nil {
+	if isJSONNull(raw) || json.Unmarshal(raw, &value) != nil {
 		return 0, false
 	}
 	return value, true
+}
+
+func numberOrDefault(fields map[string]json.RawMessage, name string, fallback float64) float64 {
+	value, ok := numberField(fields, name, fallback)
+	if !ok {
+		return fallback
+	}
+	return value
+}
+
+func uint64OrDefault(fields map[string]json.RawMessage, name string, fallback uint64) uint64 {
+	value, ok := uint64Field(fields, name, fallback)
+	if !ok {
+		return fallback
+	}
+	return value
+}
+
+func canonicalUUID(value string) (string, bool) {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return "", false
+	}
+	compact := strings.ReplaceAll(value, "-", "")
+	decoded := make([]byte, 16)
+	_, err := hex.Decode(decoded, []byte(compact))
+	if err != nil {
+		return "", false
+	}
+	return strings.ToLower(value), true
 }
 
 func boolField(fields map[string]json.RawMessage, name string) (bool, bool) {
@@ -575,11 +632,79 @@ func boolField(fields map[string]json.RawMessage, name string) (bool, bool) {
 	if !ok {
 		return false, true
 	}
-	var value bool
-	if err := json.Unmarshal(raw, &value); err != nil {
+	if value, ok := jsonBoolean(raw); ok {
+		return value, true
+	}
+	var number float64
+	if isJSONNull(raw) || json.Unmarshal(raw, &number) != nil {
 		return false, false
 	}
-	return value, true
+	if number != 0 && number != 1 {
+		return false, false
+	}
+	return number == 1, true
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+func jsonBoolean(raw json.RawMessage) (bool, bool) {
+	raw = bytes.TrimSpace(raw)
+	if !bytes.Equal(raw, []byte("true")) && !bytes.Equal(raw, []byte("false")) {
+		return false, false
+	}
+	return bytes.Equal(raw, []byte("true")), true
+}
+
+func foundationInt64(raw json.RawMessage) (int64, bool) {
+	if isJSONNull(raw) {
+		return 0, false
+	}
+	if value, ok := jsonBoolean(raw); ok {
+		if value {
+			return 1, true
+		}
+		return 0, true
+	}
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return 0, false
+	}
+	if value, err := strconv.ParseInt(number.String(), 10, 64); err == nil {
+		return value, true
+	}
+	value, err := number.Float64()
+	const int64Limit = float64(1 << 63)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < -int64Limit || value >= int64Limit {
+		return 0, false
+	}
+	return int64(value), true
+}
+
+func foundationInteger(raw json.RawMessage) (int64, bool) {
+	if isJSONNull(raw) {
+		return 0, false
+	}
+	if value, ok := jsonBoolean(raw); ok {
+		if value {
+			return 1, true
+		}
+		return 0, true
+	}
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return 0, false
+	}
+	if value, err := strconv.ParseInt(number.String(), 10, 64); err == nil {
+		return value, true
+	}
+	value, err := number.Float64()
+	const int64Limit = float64(1 << 63)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value || value < -int64Limit || value >= int64Limit {
+		return 0, false
+	}
+	return int64(value), true
 }
 
 func isoTime(value time.Time) string { return value.UTC().Format("2006-01-02T15:04:05.000Z") }

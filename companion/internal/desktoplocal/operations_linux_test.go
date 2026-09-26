@@ -31,13 +31,19 @@ func TestFileOperationDTOsMatchDesktopContract(t *testing.T) {
 	if opened["encoding"] != "utf-8" || opened["content_text"] != "one\ntwo\n" || opened["line_count"] != float64(2) {
 		t.Fatalf("opened file DTO=%#v", opened)
 	}
+	canonicalHandle := strings.ToUpper(handle)
 	read := callObject(t, operations, agentgatewayruntime.DesktopControlOperationFile,
-		`{"action":"read","handle":"`+handle+`","offset":4}`)
+		`{"action":"read","handle":"`+canonicalHandle+`","offset":4}`)
 	if read["content_text"] != "two\n" || read["byte_offset"] != float64(4) || read["line_start"] != nil {
 		t.Fatalf("read DTO=%#v", read)
 	}
+	read = callObject(t, operations, agentgatewayruntime.DesktopControlOperationFile,
+		`{"action":"read","handle":"`+canonicalHandle+`","offset":0,"length":null}`)
+	if read["content_text"] != "one\ntwo\n" {
+		t.Fatalf("null length should use the macOS default: %#v", read)
+	}
 	closed := callObject(t, operations, agentgatewayruntime.DesktopControlOperationFile,
-		`{"action":"close","handle":"`+handle+`"}`)
+		`{"action":"close","handle":"`+canonicalHandle+`"}`)
 	if closed["closed"] != true {
 		t.Fatalf("close DTO=%#v", closed)
 	}
@@ -45,6 +51,190 @@ func TestFileOperationDTOsMatchDesktopContract(t *testing.T) {
 		`{"action":"stat","path":"`+path+`"}`)
 	if stat["kind"] != "file" || stat["symlink_target"] != nil || stat["modified_at"] == nil {
 		t.Fatalf("stat DTO=%#v", stat)
+	}
+}
+
+func TestMalformedDesktopControlArgumentsKeepContractErrorCodes(t *testing.T) {
+	t.Parallel()
+	operations := New("/bin/bash")
+	t.Cleanup(func() { operations.CloseAll(context.Background()) })
+
+	tests := []struct {
+		name      string
+		operation agentgatewayruntime.DesktopControlOperation
+		arguments string
+		wantCode  string
+	}{
+		{name: "malformed file handle", operation: agentgatewayruntime.DesktopControlOperationFile,
+			arguments: `{"action":"read","handle":"not-a-uuid"}`, wantCode: "invalid_arguments"},
+		{name: "unknown file handle", operation: agentgatewayruntime.DesktopControlOperationFile,
+			arguments: `{"action":"read","handle":"00000000-0000-4000-8000-000000000001","offset":0}`, wantCode: "desktop_file_handle_expired"},
+		{name: "malformed read offset", operation: agentgatewayruntime.DesktopControlOperationFile,
+			arguments: `{"action":"read","handle":"00000000-0000-4000-8000-000000000001","offset":-1}`, wantCode: "invalid_arguments"},
+		{name: "missing read offset", operation: agentgatewayruntime.DesktopControlOperationFile,
+			arguments: `{"action":"read","handle":"00000000-0000-4000-8000-000000000001"}`, wantCode: "invalid_arguments"},
+		{name: "null read offset", operation: agentgatewayruntime.DesktopControlOperationFile,
+			arguments: `{"action":"read","handle":"00000000-0000-4000-8000-000000000001","offset":null}`, wantCode: "invalid_arguments"},
+		{name: "missing line count", operation: agentgatewayruntime.DesktopControlOperationFile,
+			arguments: `{"action":"read","handle":"00000000-0000-4000-8000-000000000001","start_line":1}`, wantCode: "invalid_arguments"},
+		{name: "null line count", operation: agentgatewayruntime.DesktopControlOperationFile,
+			arguments: `{"action":"read","handle":"00000000-0000-4000-8000-000000000001","start_line":1,"line_count":null}`, wantCode: "invalid_arguments"},
+		{name: "null start line falls back to byte read", operation: agentgatewayruntime.DesktopControlOperationFile,
+			arguments: `{"action":"read","handle":"00000000-0000-4000-8000-000000000001","start_line":null,"offset":0}`, wantCode: "desktop_file_handle_expired"},
+		{name: "malformed execution id", operation: agentgatewayruntime.DesktopControlOperationShellStatus,
+			arguments: `{"execution_id":"not-a-uuid"}`, wantCode: "invalid_arguments"},
+		{name: "unknown execution id", operation: agentgatewayruntime.DesktopControlOperationShellStatus,
+			arguments: `{"execution_id":"00000000-0000-4000-8000-000000000001"}`, wantCode: "desktop_process_handle_expired"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := operations.Call(context.Background(), test.operation, json.RawMessage(test.arguments), time.Minute)
+			failure, ok := err.(*Failure)
+			if !ok || failure.Code != test.wantCode {
+				t.Fatalf("failure=%#v, want code %q", err, test.wantCode)
+			}
+		})
+	}
+}
+
+func TestNumericDTOFieldsFallBackWhenTheirJSONTypesDoNotMatch(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "item.txt"), []byte("value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "second.txt"), []byte("value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	operations := New("/bin/bash")
+	result := callObject(t, operations, agentgatewayruntime.DesktopControlOperationFile,
+		`{"action":"list","path":"`+root+`","limit":1.0,"offset":false}`)
+	entries, ok := result["entries"].([]any)
+	if !ok || len(entries) != 1 || result["next_offset"] != float64(1) {
+		t.Fatalf("list DTO with Foundation numeric casts=%#v", result)
+	}
+	result = callObject(t, operations, agentgatewayruntime.DesktopControlOperationFile,
+		`{"action":"list","path":"`+root+`","limit":null,"offset":null}`)
+	entries, ok = result["entries"].([]any)
+	if !ok || len(entries) != 2 {
+		t.Fatalf("null list fields should use macOS defaults: %#v", result)
+	}
+}
+
+func TestFoundationNumberCastsMatchDesktopDTOs(t *testing.T) {
+	t.Parallel()
+	fields := map[string]json.RawMessage{
+		"integer_float":    json.RawMessage(`1.0`),
+		"integer_bool":     json.RawMessage(`true`),
+		"integer_fraction": json.RawMessage(`1.5`),
+		"number_bool":      json.RawMessage(`true`),
+		"bool_number":      json.RawMessage(`1`),
+		"bool_two":         json.RawMessage(`2`),
+	}
+	for name, field := range map[string]string{"integer_float": "integer_float", "integer_bool": "integer_bool"} {
+		if value, ok := integerField(fields, field, 0); !ok || value != 1 {
+			t.Errorf("integer cast %s = %d, %v; want 1, true", name, value, ok)
+		}
+	}
+	if value, ok := numberField(fields, "number_bool", 0); !ok || value != 1 {
+		t.Errorf("number cast = %v, %v; want 1, true", value, ok)
+	}
+	if value, ok := boolField(fields, "bool_number"); !ok || !value {
+		t.Errorf("boolean cast = %v, %v; want true, true", value, ok)
+	}
+	if value, ok := integerField(fields, "integer_fraction", 9); ok || value != 0 {
+		t.Errorf("fractional integer cast = %d, %v; want 0, false", value, ok)
+	}
+	if value, ok := boolField(fields, "bool_two"); ok || value {
+		t.Errorf("non-boolean number cast = %v, %v; want false, false", value, ok)
+	}
+}
+
+func TestNullWriteContentIsRejectedWithoutChangingTheFile(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "keep.txt")
+	if err := os.WriteFile(path, []byte("preserve me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	operations := New("/bin/bash")
+	_, err := operations.Call(context.Background(), agentgatewayruntime.DesktopControlOperationFile,
+		json.RawMessage(`{"action":"write","path":"`+path+`","content_base64":null,"mode":"replace"}`), time.Minute)
+	failure, ok := err.(*Failure)
+	if !ok || failure.Code != "invalid_arguments" {
+		t.Fatalf("write failure=%#v, want invalid_arguments", err)
+	}
+	content, readErr := os.ReadFile(path)
+	if readErr != nil || string(content) != "preserve me" {
+		t.Fatalf("file after rejected write=%q, read error=%v", content, readErr)
+	}
+}
+
+func TestFoundationNumberWriteOffsetsPreservePartialWriteSemantics(t *testing.T) {
+	t.Parallel()
+	for _, offset := range []string{"true", "1.5"} {
+		t.Run(offset, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "partial.txt")
+			if err := os.WriteFile(path, []byte("abcdef"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			operations := New("/bin/bash")
+			callObject(t, operations, agentgatewayruntime.DesktopControlOperationFile,
+				`{"action":"write","path":"`+path+`","content_base64":"WFk=","mode":"replace","offset":`+offset+`}`)
+			content, err := os.ReadFile(path)
+			if err != nil || string(content) != "aXYdef" {
+				t.Fatalf("file after offset=%s write=%q, error=%v", offset, content, err)
+			}
+		})
+	}
+}
+
+func TestListAndSearchRangeErrorsMatchDesktopContract(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	operations := New("/bin/bash")
+	for _, arguments := range []string{
+		`{"action":"list","path":"` + root + `","limit":0}`,
+		`{"action":"search","root":"` + root + `","name_contains":"item","limit":0}`,
+	} {
+		_, err := operations.Call(context.Background(), agentgatewayruntime.DesktopControlOperationFile, json.RawMessage(arguments), time.Minute)
+		failure, ok := err.(*Failure)
+		if !ok || failure.Code != "desktop_file_operation_failed" {
+			t.Fatalf("range failure=%#v, want desktop_file_operation_failed", err)
+		}
+	}
+}
+
+func TestEmptySearchContinuationMatchesDesktopContract(t *testing.T) {
+	t.Parallel()
+	operations := New("/bin/bash")
+	_, err := operations.Call(context.Background(), agentgatewayruntime.DesktopControlOperationFile,
+		json.RawMessage(`{"action":"search","root":"`+t.TempDir()+`","name_contains":"item","continuation":""}`), time.Minute)
+	failure, ok := err.(*Failure)
+	if !ok || failure.Code != "desktop_file_search_continuation_expired" {
+		t.Fatalf("empty continuation failure=%#v, want desktop_file_search_continuation_expired", err)
+	}
+	_, err = operations.Call(context.Background(), agentgatewayruntime.DesktopControlOperationFile,
+		json.RawMessage(`{"action":"search","root":"`+filepath.Join(t.TempDir(), "missing")+`","name_contains":"item","continuation":""}`), time.Minute)
+	failure, ok = err.(*Failure)
+	if !ok || failure.Code != "desktop_file_operation_failed" {
+		t.Fatalf("empty continuation with missing root failure=%#v, want desktop_file_operation_failed", err)
+	}
+}
+
+func TestNonStringSearchContinuationMatchesDesktopContract(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "item.txt"), []byte("value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	operations := New("/bin/bash")
+	result := callObject(t, operations, agentgatewayruntime.DesktopControlOperationFile,
+		`{"action":"search","root":"`+root+`","name_contains":"item","continuation":42}`)
+	matches, ok := result["matches"].([]any)
+	if !ok || len(matches) != 1 {
+		t.Fatalf("non-string continuation should behave as absent: %#v", result)
 	}
 }
 
@@ -56,6 +246,11 @@ func TestProcessOperationDTOsAndLeaseCleanup(t *testing.T) {
 	id, ok := started["execution_id"].(string)
 	if !ok || len(id) != 36 || started["state"] != "running" {
 		t.Fatalf("start DTO=%#v", started)
+	}
+	statusDTO := callObject(t, operations, agentgatewayruntime.DesktopControlOperationShellStatus,
+		`{"execution_id":"`+strings.ToUpper(id)+`"}`)
+	if statusDTO["state"] != "running" {
+		t.Fatalf("uppercase UUID status DTO=%#v", statusDTO)
 	}
 	if !operations.CloseAll(context.Background()) {
 		t.Fatal("CloseAll did not confirm process cleanup")
