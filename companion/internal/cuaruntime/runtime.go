@@ -24,6 +24,7 @@ type Installer interface {
 
 type Client interface {
 	StartWithLifetime(context.Context, context.Context) (cuamcp.Catalog, error)
+	CheckPermissions(context.Context) (json.RawMessage, error)
 	HealthReport(context.Context) (cuamcp.HealthReportSnapshot, error)
 	Call(context.Context, agentgatewayruntime.DesktopControlOperation, string, json.RawMessage) (json.RawMessage, error)
 	Alive() bool
@@ -161,6 +162,9 @@ func (r *Runtime) Prepare(ctx context.Context) (State, error) {
 	catalog, err := client.StartWithLifetime(setupCtx, processCtx)
 	if err != nil {
 		return State{}, fmt.Errorf("start Cua MCP process: %w", err)
+	}
+	if _, err := client.CheckPermissions(setupCtx); err != nil {
+		return State{}, fmt.Errorf("check Cua Linux session permissions: %w", err)
 	}
 	report, err := client.HealthReport(setupCtx)
 	if err != nil {

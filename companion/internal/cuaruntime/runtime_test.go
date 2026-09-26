@@ -37,8 +37,8 @@ func TestPrepareStartsPinnedDriverAndRequiresLinuxHealth(t *testing.T) {
 	if state != (State{Ready: true, DriverVersion: "0.29.1", ToolCount: 2}) || runtime.State() != state {
 		t.Fatalf("state = %#v, current = %#v", state, runtime.State())
 	}
-	if installer.calls != 1 || factoryCalls != 1 || client.starts != 1 || client.healthReads != 1 || client.stops != 0 {
-		t.Fatalf("calls install=%d factory=%d start=%d health=%d stop=%d", installer.calls, factoryCalls, client.starts, client.healthReads, client.stops)
+	if installer.calls != 1 || factoryCalls != 1 || client.starts != 1 || client.permissionReads != 1 || client.healthReads != 1 || client.stops != 0 {
+		t.Fatalf("calls install=%d factory=%d start=%d permissions=%d health=%d stop=%d", installer.calls, factoryCalls, client.starts, client.permissionReads, client.healthReads, client.stops)
 	}
 
 	arguments := json.RawMessage(`{"pid":42}`)
@@ -352,20 +352,23 @@ func TestPrepareStopsDriverWhenHealthDoesNotMatchPinnedLinuxRuntime(t *testing.T
 func TestPrepareStopsDriverWhenStartOrHealthProbeFails(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name   string
-		client *clientStub
-		want   string
+		name            string
+		client          *clientStub
+		want            string
+		wantPermissions int
+		wantHealth      int
 	}{
 		{name: "start", client: &clientStub{startErr: errors.New("start failed")}, want: "start Cua MCP process"},
-		{name: "health", client: &clientStub{healthErr: errors.New("health failed")}, want: "read Cua Linux health report"},
+		{name: "permissions", client: &clientStub{permissionErr: errors.New("permissions failed")}, want: "check Cua Linux session permissions", wantPermissions: 1},
+		{name: "health", client: &clientStub{healthErr: errors.New("health failed")}, want: "read Cua Linux health report", wantPermissions: 1, wantHealth: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			runtime := mustRuntime(t, &installerStub{path: "/owned/cua-driver"}, func(context.Context, string) (Client, error) { return tc.client, nil })
 			_, err := runtime.Prepare(context.Background())
-			if err == nil || !strings.Contains(err.Error(), tc.want) || tc.client.stops != 1 || runtime.State() != (State{}) {
-				t.Fatalf("Prepare() error = %v; stops=%d state=%#v", err, tc.client.stops, runtime.State())
+			if err == nil || !strings.Contains(err.Error(), tc.want) || tc.client.stops != 1 || tc.client.permissionReads != tc.wantPermissions || tc.client.healthReads != tc.wantHealth || runtime.State() != (State{}) {
+				t.Fatalf("Prepare() error = %v; stops=%d permissions=%d health=%d state=%#v", err, tc.client.stops, tc.client.permissionReads, tc.client.healthReads, runtime.State())
 			}
 		})
 	}
@@ -455,8 +458,10 @@ type clientStub struct {
 	catalog         cuamcp.Catalog
 	report          cuamcp.HealthReportSnapshot
 	startErr        error
+	permissionErr   error
 	healthErr       error
 	starts          int
+	permissionReads int
 	healthReads     int
 	stops           int
 	lastTool        string
@@ -506,6 +511,14 @@ func (c *clientStub) HealthReport(ctx context.Context) (cuamcp.HealthReportSnaps
 		return cuamcp.HealthReportSnapshot{}, c.healthErr
 	}
 	return c.report, nil
+}
+
+func (c *clientStub) CheckPermissions(context.Context) (json.RawMessage, error) {
+	c.permissionReads++
+	if c.permissionErr != nil {
+		return nil, c.permissionErr
+	}
+	return json.RawMessage(`{"content":[]}`), nil
 }
 
 func (c *clientStub) Call(_ context.Context, _ agentgatewayruntime.DesktopControlOperation, name string, arguments json.RawMessage) (json.RawMessage, error) {
