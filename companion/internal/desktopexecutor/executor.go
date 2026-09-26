@@ -80,6 +80,12 @@ type Executor struct {
 	nextCommandID   uint64
 	active          map[uint64]activeCommand
 	unavailable     bool
+	closed          bool
+	shutdown        chan struct{}
+	closeGate       chan struct{}
+	cleanupGate     chan struct{}
+	closeCompleted  bool
+	closeResult     bool
 }
 
 func New(runner ToolRunner) (*Executor, error) {
@@ -97,6 +103,9 @@ func NewWithLocalOperations(runner ToolRunner, local LocalOperations) (*Executor
 		revokedConfigs:  make(map[configScope]int64),
 		revokedBindings: make(map[bindingScope]int64),
 		active:          make(map[uint64]activeCommand),
+		shutdown:        make(chan struct{}),
+		closeGate:       make(chan struct{}, 1),
+		cleanupGate:     make(chan struct{}, 1),
 	}
 	if local != nil {
 		go executor.leaseExpiryLoop()
@@ -117,6 +126,12 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 	if !e.deadlineValid(frame.DeadlineAt) {
 		return failure(frame, "desktop_command_failed", "The desktop command deadline expired.")
 	}
+	e.mu.Lock()
+	closed := e.closed
+	e.mu.Unlock()
+	if closed {
+		return failure(frame, "desktop_executor_unavailable", "The desktop executor is shutting down.")
+	}
 	target := *frame.Target
 	commandOwner := owner{target.InstallationID, target.WorkspaceID, target.ConfigID, target.PersonaID, target.RunID, target.Generation}
 	scope := configScope{target.InstallationID, target.WorkspaceID, target.ConfigID}
@@ -128,6 +143,10 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 	}
 	if frame.Operation == agentgatewayruntime.DesktopControlOperationStatus {
 		e.mu.Lock()
+		if e.closed {
+			e.mu.Unlock()
+			return failure(frame, "desktop_executor_unavailable", "The desktop executor is shutting down.")
+		}
 		configAuthorized := e.isConfigAuthorized(scope, target.ConfigVersion)
 		bindingAuthorized := e.isBindingAuthorized(commandOwner)
 		if !configAuthorized || !bindingAuthorized {
@@ -169,7 +188,7 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 		return failure(frame, "invalid_arguments", "The Desktop Control tool arguments are invalid.")
 	}
 	e.mu.Lock()
-	if e.unavailable || isLocal && e.local == nil {
+	if e.closed || e.unavailable || isLocal && e.local == nil {
 		e.mu.Unlock()
 		return failure(frame, "desktop_executor_unavailable", "The Linux native file and process executor is not ready.")
 	}
@@ -257,6 +276,63 @@ func (e *Executor) Handle(ctx context.Context, frame agentgatewayruntime.Desktop
 
 func (e *Executor) NativeReady() bool { return false }
 
+// Close stops lease monitoring, cancels active work, and closes local handles.
+// A false result requires the caller to keep the process alive and retry cleanup.
+func (e *Executor) Close(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	select {
+	case e.closeGate <- struct{}{}:
+		defer func() { <-e.closeGate }()
+	case <-ctx.Done():
+		return false
+	}
+	e.mu.Lock()
+	if e.closed && e.closeCompleted && e.closeResult {
+		e.mu.Unlock()
+		return true
+	}
+	firstClose := !e.closed
+	if firstClose {
+		e.closed = true
+		close(e.shutdown)
+		e.current = nil
+		e.epoch++
+		e.revocations++
+	}
+	commands := e.cancelMatching(func(activeCommand) bool { return true })
+	e.mu.Unlock()
+	if !waitForCommandsContext(ctx, commands) {
+		if firstClose {
+			go func() {
+				for _, done := range commands {
+					<-done
+				}
+				cleaned := e.cleanupLocalResources(true, leaseSweepPeriod)
+				e.finishRevocation(cleaned)
+				e.finishClose(cleaned)
+			}()
+		}
+		return false
+	}
+	cleaned := e.cleanupLocalResourcesWithContext(ctx, true)
+	if firstClose {
+		e.finishRevocation(cleaned)
+	}
+	e.finishClose(cleaned)
+	return cleaned
+}
+
+func (e *Executor) finishClose(cleaned bool) {
+	e.mu.Lock()
+	if cleaned || !e.closeCompleted {
+		e.closeCompleted = true
+		e.closeResult = cleaned
+	}
+	e.mu.Unlock()
+}
+
 func (e *Executor) forwardProcessChunks(ctx context.Context, command agentgatewayruntime.DesktopControlFrame, payload json.RawMessage,
 	emit func(agentgatewayruntime.DesktopControlFrame) error, commandOwner owner, scope configScope, version int64,
 	token string, epoch uint64) error {
@@ -313,7 +389,7 @@ func (e *Executor) acquire(frame agentgatewayruntime.DesktopControlFrame, comman
 		}
 		return failure(frame, "desktop_control_binding_revoked", "This Desktop Control binding is no longer authorized.")
 	}
-	if e.unavailable {
+	if e.closed || e.unavailable {
 		e.mu.Unlock()
 		return failure(frame, "desktop_executor_unavailable", "The desktop executor is unavailable because prior resource cleanup was not confirmed.")
 	}
@@ -384,6 +460,10 @@ func (e *Executor) release(frame agentgatewayruntime.DesktopControlFrame, comman
 
 func (e *Executor) revokeConfig(frame agentgatewayruntime.DesktopControlFrame, scope configScope, version int64) agentgatewayruntime.DesktopControlFrame {
 	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return failure(frame, "desktop_executor_unavailable", "The desktop executor is shutting down.")
+	}
 	if version > e.revokedConfigs[scope] {
 		e.revokedConfigs[scope] = version
 	}
@@ -403,6 +483,10 @@ func (e *Executor) revokeConfig(frame agentgatewayruntime.DesktopControlFrame, s
 
 func (e *Executor) revokeBinding(frame agentgatewayruntime.DesktopControlFrame, scope configScope, persona string, generation, _ int64) agentgatewayruntime.DesktopControlFrame {
 	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return failure(frame, "desktop_executor_unavailable", "The desktop executor is shutting down.")
+	}
 	binding := bindingScope{scope, persona}
 	if generation > e.revokedBindings[binding] {
 		e.revokedBindings[binding] = generation
@@ -468,8 +552,13 @@ func (e *Executor) leaseValid(current *lease) bool {
 func (e *Executor) leaseExpiryLoop() {
 	ticker := time.NewTicker(leaseSweepPeriod)
 	defer ticker.Stop()
-	for range ticker.C {
-		e.expireLeaseIfNeeded()
+	for {
+		select {
+		case <-e.shutdown:
+			return
+		case <-ticker.C:
+			e.expireLeaseIfNeeded()
+		}
 	}
 }
 
@@ -546,14 +635,24 @@ func (e *Executor) completeRevocation(deadline time.Time, commands []<-chan stru
 }
 
 func (e *Executor) cleanupLocalResources(cleanup bool, timeout time.Duration) bool {
-	if !cleanup || e.local == nil {
-		return true
-	}
 	if timeout <= 0 {
 		timeout = time.Nanosecond
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return e.cleanupLocalResourcesWithContext(ctx, cleanup)
+}
+
+func (e *Executor) cleanupLocalResourcesWithContext(ctx context.Context, cleanup bool) bool {
+	if !cleanup || e.local == nil {
+		return true
+	}
+	select {
+	case e.cleanupGate <- struct{}{}:
+		defer func() { <-e.cleanupGate }()
+	case <-ctx.Done():
+		return false
+	}
 	return e.local.CloseAll(ctx)
 }
 
@@ -577,6 +676,17 @@ func waitForCommands(deadline time.Time, commands []<-chan struct{}) bool {
 		}
 	}
 	return true
+}
+
+func waitForCommandsContext(ctx context.Context, commands []<-chan struct{}) bool {
+	for _, done := range commands {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return ctx.Err() == nil
 }
 func (e *Executor) deadlineValid(deadline time.Time) bool {
 	return !deadline.IsZero() && deadline.After(e.now()) && deadline.Sub(e.now()) <= time.Minute
