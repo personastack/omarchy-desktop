@@ -1,0 +1,26 @@
+{
+  "support_status": "unverified",
+  "target": {
+    "distribution": "Omarchy",
+    "channel": null,
+    "architecture": "x86_64",
+    "hyprland_version": null,
+    "hyprland_abi": null,
+    "electron_version": "44.4.3",
+    "window_backend": null,
+    "secret_service_provider": null
+  },
+  "cua_candidate": {
+    "driver_version": "0.29.1",
+    "driver_sha256": "61a0c0f24d6b03e31bb7a73390db875ecf0de2ce53aa435eadb03d70979d79a5",
+    "hyprland_plugin_sha256": "30d3639fd08b2f08a15ebfff43138535713f4d76efbbdcbec7a83aea044069c5",
+    "build_kit_sha256": "4f689cac36b48e9c60e03ddfbb1c5a45665f744f3dbce82c91728031d46e17a9",
+    "input_plugin_mode": null,
+    "verified_apps": []
+  },
+  "acceptance": {
+    "omarchy_host_available": false,
+    "native_acceptance_complete": false,
+    "support_claim_allowed": false
+  }
+}

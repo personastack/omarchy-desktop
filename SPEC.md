@@ -4,7 +4,7 @@
 
 Provide a desktop client for PersonaStack on Omarchy with the complete user-visible functionality of `macos-desktop`.
 
-This app is not implemented. No Omarchy profile or feature is currently certified. The full required behavior and completion evidence live in the active workspace plan. This spec records the repository's ownership boundaries and current desired outcome.
+The Electron shell and initial chat/stack bridges exist. The app is incomplete and no Omarchy profile or feature is certified. The full required behavior and completion evidence live in the active workspace plan. This spec records the repository's ownership boundaries and current desired outcome.
 
 ## Authority
 
@@ -23,6 +23,8 @@ No environment is currently supported. The first candidate is Omarchy Edge on x8
 ## Security boundary
 
 Remote content receives only finite presentation messages from registered top-level windows at the configured PersonaStack app origin. Machine credentials stay in protected OS storage and native process memory. The API authorizes each workspace, persona and Desktop Control operation. Native execution accepts only reviewed typed operations under the current lease and scope. A failed or uncertain mutation is not replayed automatically.
+
+The current Electron shell uses a persistent, origin-specific browser partition. It disables renderer Node integration, enables context isolation and sandboxing, limits Google OAuth navigation/pop-ups to Google and the configured app origin, and admits native bridge calls only from registered current main frames at the exact configured origin and document generation. Other external main-frame navigation is denied. Hosted same-product navigation remains in-app without retaining bridge privileges on a different origin. User-activated HTTP(S) links open in the system browser. Only concern, chat, chat-window, and stack bridge names are exposed. Local-session and Desktop Control bridges remain absent until their native owners exist. These source-level controls do not establish native session or sign-in acceptance.
 
 ## Parity outcome
 

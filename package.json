@@ -3,7 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "description": "PersonaStack desktop client for Omarchy",
+  "type": "module",
+  "main": "dist/main.js",
   "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "npm run build && electron .",
+    "test": "npm run build && node --test dist/*.test.js",
     "verify:electron": "electron --version"
   },
   "engines": {
@@ -18,6 +23,8 @@
     }
   },
   "devDependencies": {
-    "electron": "44.4.3"
+    "@types/node": "26.6.3",
+    "electron": "44.4.3",
+    "typescript": "7.0.2"
   }
 }

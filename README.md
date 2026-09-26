@@ -1,8 +1,8 @@
 # PersonaStack for Omarchy
 
-**A desktop client for PersonaStack on Omarchy. Work in progress.**
+**A desktop client for PersonaStack on Omarchy. Early work in progress.**
 
-This repository is for building an Omarchy desktop application with the same user-visible functionality as the PersonaStack macOS app. The app is not implemented or ready to install yet. There are no release packages.
+This repository is building an Omarchy desktop application with the same user-visible functionality as the PersonaStack macOS app. The Electron shell and a small set of hosted-window bridges are implemented. The product is incomplete, not packaged, and not ready to install. There are no release packages.
 
 ## Planned functionality
 
@@ -14,15 +14,19 @@ PersonaStack services remain authoritative for sign-in, workspace and persona ac
 
 Cua announced compositor-native background computer use for Omarchy Edge on September 25, 2026. Cua describes a synthetic Hyprland cursor that can route input to a target window while the person keeps using their own pointer. The announcement says stable-channel promotion and ARM production packaging are not confirmed, and that application-specific behavior still needs testing. Cua's [driver documentation](https://github.com/trycua/cua/blob/main/docs/content/docs/how-to-guides/driver/install.mdx) lists Hyprland/Omarchy support as experimental and treats the Hyprland plugin as a separate component. Installing the Cua driver alone does not enable that background-input path. See the [Omarchy announcement](https://github.com/trycua/cua/blob/main/blog/omarchy-cua-driver.md).
 
-The desktop app's Omarchy compatibility, complete Cua tool coverage, secure keyring integration, and native window behavior have not been validated. This project will report support only after those checks pass on an actual Omarchy session.
+The desktop app's Omarchy compatibility, complete Cua tool coverage, secure keyring integration, authentication, and native window behavior have not been validated. This project will report support only after those checks pass on an actual Omarchy session. The current candidate profile is recorded as unverified in [`support-profile.json`](support-profile.json).
 
 ## Proposed implementation
 
-The implementation plan proposes an Electron shell and one Go companion. Electron would own the hosted windows and a finite, origin-checked native bridge. Go would own machine credentials, the outbound PersonaStack connection, Cua, local CLI setup, files, and processes. This design is subject to native Omarchy feasibility checks before the application is built.
+The implementation uses an Electron shell and one Go companion. Electron owns the hosted windows and a finite, origin-checked native bridge. Go will own machine credentials, the outbound PersonaStack connection, Cua, local CLI setup, files, and processes. The current shell has a persistent hosted window, tray residency, generation-bound exact-origin bridge admission, Google OAuth navigation/pop-ups, persona chat and stack/activity pop-outs, downloads, and generic concern notifications. The sign-in journey is not validated. Keyring custody, Cua, local CLI setup, and remote file/process execution are not implemented.
 
 ## Development status
 
 The detailed parity inventory and implementation checklist are maintained with the PersonaStack engineering workspace. This public README describes the project's status and scope.
+
+## Development
+
+Use Node `24.21.0` with npm `11.19.0`. Run `npm ci` and `npm test` from the repository root. The Go companion uses Go `1.27.1`; run `GOTOOLCHAIN=go1.27.1 go test -parallel 8 ./...` from `companion/`. These host-independent checks do not validate Omarchy, Hyprland, Cua, keyring, or graphical-session behavior.
 
 ## Security
 
@@ -30,4 +34,4 @@ The client must not put machine credentials in a web renderer, browser storage, 
 
 ## Contributing
 
-The first implementation milestone is to prove the required Cua, window-management, keyring, and session-lifecycle behavior on the supported Omarchy profile. Until then, this README describes intended work, not working functionality.
+The next milestone is to implement the remaining host-independent contracts and Go companion. Native window, keyring, Cua, login, and lifecycle acceptance remains open until tested on the exact Omarchy profile.

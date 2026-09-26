@@ -1,7 +1,7 @@
 node_modules/
 out/
-release/
 dist/
+release/
 coverage/
 .DS_Store
 .env

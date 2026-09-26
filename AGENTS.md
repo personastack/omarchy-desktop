@@ -4,7 +4,7 @@ Read `SPEC.md` and the active workspace implementation plan before changing the 
 
 ## Current milestone
 
-The project is a public work in progress. Do not add the Electron or Go application runtime until the active plan's Omarchy feasibility gate records a supported profile and native acceptance evidence. Cua Omarchy support remains experimental and may require a separately installed Hyprland input plugin. Do not change the user's Omarchy channel or restart Hyprland for tests.
+The project is a public work in progress. Eric authorized host-independent implementation before the Omarchy feasibility gate is closed. Keep all native acceptance checks open and do not claim the app or any feature is supported until tested on the exact Omarchy profile. Cua Omarchy support remains experimental and may require a separately installed Hyprland input plugin. Do not change the user's Omarchy channel or restart Hyprland for tests.
 
 ## Implementation rules
 
