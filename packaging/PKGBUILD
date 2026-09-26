@@ -1,0 +1,139 @@
+pkgname=personastack
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='PersonaStack desktop client for Linux'
+arch=('x86_64')
+url='https://github.com/personastack/omarchy-desktop'
+license=('unknown')
+depends=(
+  alsa-lib
+  at-spi2-core
+  atk
+  cairo
+  cups
+  dbus
+  expat
+  fontconfig
+  gdk-pixbuf2
+  glib2
+  gtk3
+  libdrm
+  libsecret
+  libx11
+  libxcb
+  libxcomposite
+  libxdamage
+  libxext
+  libxfixes
+  libxkbcommon
+  libxrandr
+  libxrender
+  libxss
+  libxtst
+  mesa
+  nspr
+  nss
+  pango
+  systemd-libs
+  wayland
+  xdg-utils
+)
+makedepends=(
+  git
+  go
+  'nodejs>=24.21.0'
+)
+optdepends=(
+  'gnome-keyring: Secret Service provider for stored installation credentials'
+  'kwallet: Secret Service provider for stored installation credentials'
+)
+source=(
+  "omarchy-desktop::git+https://github.com/personastack/omarchy-desktop.git#commit=806783423a72cf9a27a5b817310eaaf78cbff76e"
+  "personastack-api::git+ssh://git@github.com/personastack/personastack-api.git#commit=fdf742c884168c4d6f2531b9cc65b966d018e7b3"
+  "https://registry.npmjs.org/npm/-/npm-11.19.0.tgz"
+)
+noextract=('npm-11.19.0.tgz')
+sha512sums=('SKIP' 'SKIP' '48377f8478372aa1c4e47b763475b135836da82436a5700f2e5e8eb5084fc840f93c7b117eb3ad3b5f7d3194c81b6710a10d59448f6ddbcb21ac3fb672bdc003')
+
+prepare() {
+  install -d "$srcdir/npm-cli"
+  tar -xzf "$srcdir/npm-11.19.0.tgz" -C "$srcdir/npm-cli" --strip-components=1
+  cat > "$srcdir/npm-cli/bin/npm" <<'EOF'
+#!/bin/sh
+exec node "$(dirname "$0")/npm-cli.js" "$@"
+EOF
+  chmod 755 "$srcdir/npm-cli/bin/npm"
+}
+
+build() {
+  local project="$srcdir/omarchy-desktop"
+  export PATH="$srcdir/npm-cli/bin:$PATH"
+  cd "$project"
+
+  node "$srcdir/npm-cli/bin/npm-cli.js" ci
+  node "$srcdir/npm-cli/bin/npm-cli.js" run build
+  node "$project/node_modules/electron/install.js"
+  test -x "$project/node_modules/electron/dist/electron"
+
+  cd "$project/companion"
+  install -d "$project/companion/bin"
+  go mod edit -replace="github.com/personastack/personastack-api/pkg/client=../../personastack-api/pkg/client"
+  GOTOOLCHAIN=go1.27.1 GOPRIVATE=github.com/personastack go build -trimpath -o "$project/companion/bin/personastack-companion" ./cmd/personastack-companion
+
+  install -d "$srcdir/personastack-app"
+  install -Dm644 "$project/package.json" "$srcdir/personastack-app/package.json"
+  cp -a "$project/dist" "$srcdir/personastack-app/dist"
+}
+
+check() {
+  local project="$srcdir/omarchy-desktop"
+  export PATH="$srcdir/npm-cli/bin:$PATH"
+  cd "$project"
+  node "$srcdir/npm-cli/bin/npm-cli.js" test
+
+  cd "$project/companion"
+  GOTOOLCHAIN=go1.27.1 GOPRIVATE=github.com/personastack go test -timeout=180s -count=1 -parallel 8 ./...
+}
+
+package() {
+  local project="$srcdir/omarchy-desktop"
+  local appdir="$pkgdir/usr/lib/personastack/resources/app"
+  local licensedir="$pkgdir/usr/share/licenses/personastack"
+
+  install -d "$appdir"
+  cp -a "$srcdir/personastack-app/." "$appdir/"
+  cp -a "$project/node_modules/electron/dist/." "$pkgdir/usr/lib/personastack/"
+  install -Dm755 "$project/companion/bin/personastack-companion" \
+    "$pkgdir/usr/lib/personastack/resources/bin/personastack-companion"
+
+  install -Dm755 /dev/stdin "$pkgdir/usr/bin/personastack" <<'EOF'
+#!/bin/sh
+exec /usr/lib/personastack/electron "$@"
+EOF
+  install -Dm644 "$project/packaging/personastack.desktop" \
+    "$pkgdir/usr/share/applications/personastack.desktop"
+  install -Dm644 "$project/assets/personastack.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/personastack.svg"
+
+  install -Dm644 "$project/node_modules/electron/dist/LICENSE" \
+    "$licensedir/electron/LICENSE"
+  install -Dm644 "$project/node_modules/electron/dist/LICENSES.chromium.html" \
+    "$licensedir/electron/LICENSES.chromium.html"
+  install -Dm644 "$project/companion/internal/cuainstaller/CUA-NODE-NOTICE.md" \
+    "$licensedir/cua/CUA-NODE-NOTICE.md"
+  install -Dm644 "$project/companion/internal/cuainstaller/MPL-2.0.txt" \
+    "$licensedir/cua/MPL-2.0.txt"
+
+  cd "$project/companion"
+  while IFS=$'\t' read -r module version module_dir; do
+    [[ -d "$module_dir" ]] || continue
+    local module_label="${module}@${version}"
+    module_label="${module_label//\//_}"
+    module_label="${module_label//:/_}"
+    while IFS= read -r -d '' license_file; do
+      install -Dm644 "$license_file" "$licensedir/golang/$module_label/${license_file##*/}"
+    done < <(find "$module_dir" -maxdepth 1 -type f \
+      \( -iname 'LICENSE*' -o -iname 'COPYING*' -o -iname 'NOTICE*' \) -print0)
+  done < <(GOTOOLCHAIN=go1.27.1 GOPRIVATE=github.com/personastack \
+    go list -m -f '{{printf "%s\t%s\t%s" .Path .Version .Dir}}' all)
+}
