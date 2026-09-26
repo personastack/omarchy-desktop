@@ -79,7 +79,7 @@ func NewManager(probe Probe, installer Installer, preferences PreferenceStore) (
 // Handle applies the finite hosted local-session contract. A manager belongs to
 // one registered top-level page; the caller supplies its already-admitted origin.
 func (m *Manager) Handle(ctx context.Context, origin string, command Command) (json.RawMessage, error) {
-	if !originPattern.MatchString(origin) || len(command.Scope) > 512 || (command.Scope == "" && command.Action != ActionState) {
+	if ctx == nil || ctx.Err() != nil || !originPattern.MatchString(origin) || len(command.Scope) > 512 || (command.Scope == "" && command.Action != ActionState) {
 		return nil, ErrInvalidRequest
 	}
 	switch command.Action {
@@ -96,9 +96,19 @@ func (m *Manager) Handle(ctx context.Context, origin string, command Command) (j
 	}
 }
 
-func (m *Manager) state(ctx context.Context, origin, scope string) (json.RawMessage, error) {
+func (m *Manager) SynchronizeScope(scope string) {
 	m.mu.Lock()
 	m.resetScope(scope)
+	m.mu.Unlock()
+}
+
+func (m *Manager) state(ctx context.Context, origin, scope string) (json.RawMessage, error) {
+	m.mu.Lock()
+	if m.scope != scope {
+		m.mu.Unlock()
+		return nil, ErrStaleRequest
+	}
+	generation := m.generation
 	m.mu.Unlock()
 	harness, err := m.preferences.Load(ctx, origin)
 	if err != nil {
@@ -106,6 +116,12 @@ func (m *Manager) state(ctx context.Context, origin, scope string) (json.RawMess
 	}
 	if harness != "" && !validHarness(harness) {
 		return nil, ErrUnavailable
+	}
+	m.mu.Lock()
+	current := m.scope == scope && m.generation == generation
+	m.mu.Unlock()
+	if !current || ctx.Err() != nil {
+		return nil, ErrStaleRequest
 	}
 	result := response{OK: true, Version: "2", Harness: harness}
 	return json.Marshal(result)

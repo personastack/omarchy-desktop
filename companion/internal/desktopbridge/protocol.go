@@ -8,6 +8,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/personastack/omarchy-desktop/companion/internal/credentialstore"
@@ -82,14 +83,19 @@ type Service interface {
 }
 
 type Processor struct {
+	mu            sync.Mutex
 	service       Service
 	localSessions LocalSessionService
 	origin        string
 	scope         string
 	synced        bool
+	generation    uint64
+	nextCommandID uint64
+	commands      map[uint64]context.CancelFunc
 }
 
 type LocalSessionService interface {
+	SynchronizeScope(string)
 	Handle(context.Context, string, localsession.Command) (json.RawMessage, error)
 }
 
@@ -100,7 +106,7 @@ func New(service Service, origin string) (*Processor, error) {
 	if _, err := desktopcontrol.New(origin); err != nil {
 		return nil, ErrInvalidRequest
 	}
-	return &Processor{service: service, origin: origin}, nil
+	return &Processor{service: service, origin: origin, commands: make(map[uint64]context.CancelFunc)}, nil
 }
 
 func NewWithLocalSessions(service Service, localSessions LocalSessionService, origin string) (*Processor, error) {
@@ -159,16 +165,25 @@ func Parse(raw []byte) (Request, error) {
 }
 
 func (p *Processor) Handle(ctx context.Context, request Request) Response {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	response := Response{ID: request.ID}
 	if request.Version != "1" || len(request.Scope) > maxScopeLength || request.Scope != strings.TrimSpace(request.Scope) {
 		response.Error = ErrorInvalidRequest
 		return response
 	}
 	if request.Action == ActionSync {
-		p.scope, p.synced = request.Scope, true
+		p.synchronize(request.Scope)
 		response.OK = true
 		return response
 	}
+	commandCtx, commandID, generation, ok := p.beginCommand(ctx, request.Scope)
+	if !ok {
+		response.Error = ErrorInvalidRequest
+		return response
+	}
+	defer p.finishCommand(commandID)
 	if request.Action == ActionLocalSession {
 		if p.localSessions == nil {
 			response.Error = ErrorUnavailable
@@ -179,17 +194,21 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 			response.Error = ErrorInvalidRequest
 			return response
 		}
-		result, err := p.localSessions.Handle(ctx, p.origin, command)
+		if commandCtx.Err() != nil {
+			response.Error = ErrorStaleRequest
+			return response
+		}
+		result, err := p.localSessions.Handle(commandCtx, p.origin, command)
+		if !p.commandCurrent(request.Scope, generation) {
+			response.Error = ErrorStaleRequest
+			return response
+		}
 		if err != nil {
 			response.Error = localSessionErrorCode(err)
 			return response
 		}
 		response.OK = true
 		response.LocalSession = result
-		return response
-	}
-	if !p.synced || p.scope != request.Scope {
-		response.Error = ErrorInvalidRequest
 		return response
 	}
 	if request.Action != ActionState && request.Action != ActionPrepare {
@@ -200,7 +219,11 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 		response.Error = ErrorInvalidRequest
 		return response
 	}
-	state, err := p.service.LocalState(ctx, p.origin)
+	state, err := p.service.LocalState(commandCtx, p.origin)
+	if !p.commandCurrent(request.Scope, generation) {
+		response.Error = ErrorStaleRequest
+		return response
+	}
 	if err != nil {
 		response.Error = errorCode(err)
 		return response
@@ -217,6 +240,58 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 	}
 	response.Result = result
 	return response
+}
+
+func (p *Processor) synchronize(scope string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.synced && p.scope == scope {
+		return
+	}
+	if p.localSessions != nil {
+		p.localSessions.SynchronizeScope(scope)
+	}
+	p.scope, p.synced = scope, true
+	p.generation++
+	for _, cancel := range p.commands {
+		cancel()
+	}
+}
+
+func (p *Processor) beginCommand(parent context.Context, scope string) (context.Context, uint64, uint64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.synced || p.scope != scope {
+		return nil, 0, 0, false
+	}
+	p.nextCommandID++
+	ctx, cancel := context.WithCancel(parent)
+	p.commands[p.nextCommandID] = cancel
+	return ctx, p.nextCommandID, p.generation, true
+}
+
+func (p *Processor) finishCommand(id uint64) {
+	p.mu.Lock()
+	cancel := p.commands[id]
+	delete(p.commands, id)
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (p *Processor) commandCurrent(scope string, generation uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.synced && p.scope == scope && p.generation == generation
+}
+
+func (p *Processor) CancelAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, cancel := range p.commands {
+		cancel()
+	}
 }
 
 func errorCode(err error) ErrorCode {

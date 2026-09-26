@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/personastack/omarchy-desktop/companion/internal/credentialstore"
@@ -152,6 +153,33 @@ func TestProcessorPrepareReportsUnimplementedRuntimeWithoutEnrollment(t *testing
 	}
 }
 
+func TestProcessorScopeChangeCancelsInFlightCommand(t *testing.T) {
+	t.Parallel()
+	service := &blockingService{started: make(chan struct{}), canceled: make(chan struct{})}
+	processor, err := New(service, "https://my.personastack.ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor.Handle(context.Background(), Request{ID: 1, Version: "1", Action: ActionSync, Scope: "workspace:a"})
+	finished := make(chan Response, 1)
+	go func() {
+		finished <- processor.Handle(context.Background(), Request{ID: 2, Version: "1", Action: ActionState, Scope: "workspace:a"})
+	}()
+	<-service.started
+	processor.Handle(context.Background(), Request{ID: 3, Version: "1", Action: ActionSync, Scope: "workspace:b"})
+	if got := <-finished; got.Error != ErrorStaleRequest {
+		t.Fatalf("in-flight state after scope change = %#v", got)
+	}
+	select {
+	case <-service.canceled:
+	default:
+		t.Fatal("scope change did not cancel the service context")
+	}
+	if got := processor.Handle(context.Background(), Request{ID: 4, Version: "1", Action: ActionState, Scope: "workspace:a"}); got.Error != ErrorInvalidRequest {
+		t.Fatalf("old-scope state = %#v", got)
+	}
+}
+
 func TestProcessorMapsLocalStateErrorsToFiniteCodes(t *testing.T) {
 	t.Parallel()
 	service := &serviceStub{err: credentialstore.ErrUnavailable}
@@ -173,6 +201,7 @@ func TestProcessorRoutesLocalSessionThroughItsOwnScopeContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	processor.Handle(context.Background(), Request{ID: 1, Version: "1", Action: ActionSync, Scope: "workspace:a"})
 	command, err := localsession.Parse([]byte(`{"version":"1","action":"state","scope":"workspace:a"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -223,6 +252,19 @@ type serviceStub struct {
 	err    error
 }
 
+type blockingService struct {
+	started  chan struct{}
+	canceled chan struct{}
+	once     sync.Once
+}
+
+func (s *blockingService) LocalState(ctx context.Context, _ string) (installation.LocalState, error) {
+	s.once.Do(func() { close(s.started) })
+	<-ctx.Done()
+	close(s.canceled)
+	return installation.LocalState{}, ctx.Err()
+}
+
 type localSessionStub struct {
 	calls   int
 	origin  string
@@ -230,6 +272,8 @@ type localSessionStub struct {
 	result  json.RawMessage
 	err     error
 }
+
+func (s *localSessionStub) SynchronizeScope(string) {}
 
 func (s *localSessionStub) Handle(_ context.Context, origin string, command localsession.Command) (json.RawMessage, error) {
 	s.calls++

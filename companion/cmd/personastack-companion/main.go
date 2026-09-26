@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/personastack/omarchy-desktop/companion/internal/credentialstore"
 	"github.com/personastack/omarchy-desktop/companion/internal/desktopbridge"
@@ -14,6 +15,8 @@ import (
 	"github.com/personastack/omarchy-desktop/companion/localsession"
 	"github.com/personastack/personastack-api/pkg/client/desktopcontrol"
 )
+
+const maxConcurrentBridgeRequests = 31
 
 func main() {
 	if len(os.Args) != 2 {
@@ -53,21 +56,106 @@ func serve(input io.Reader, output io.Writer, processor *desktopbridge.Processor
 	if processor == nil {
 		return errors.New("desktop bridge unavailable")
 	}
-	scanner := bufio.NewScanner(input)
-	scanner.Buffer(make([]byte, 64*1024), desktopbridge.MaxRequestBytes)
 	writer := bufio.NewWriter(output)
-	for scanner.Scan() {
-		request, err := desktopbridge.Parse(scanner.Bytes())
-		if err != nil {
-			return err
+	processContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	inputDone := make(chan struct{})
+	defer close(inputDone)
+	type scannedRequest struct {
+		line []byte
+		err  error
+		done bool
+	}
+	lines := make(chan scannedRequest)
+	go func() {
+		scanner := bufio.NewScanner(input)
+		scanner.Buffer(make([]byte, 64*1024), desktopbridge.MaxRequestBytes)
+		for scanner.Scan() {
+			line := append([]byte(nil), scanner.Bytes()...)
+			select {
+			case lines <- scannedRequest{line: line}:
+			case <-inputDone:
+				return
+			}
 		}
-		response := processor.Handle(context.Background(), request)
+		select {
+		case lines <- scannedRequest{err: scanner.Err(), done: true}:
+		case <-inputDone:
+		}
+	}()
+	requestSlots := make(chan struct{}, maxConcurrentBridgeRequests)
+	var requests sync.WaitGroup
+	var outputMu sync.Mutex
+	outputErrors := make(chan error, 1)
+	writeResponse := func(response desktopbridge.Response) error {
+		outputMu.Lock()
+		defer outputMu.Unlock()
 		if err := json.NewEncoder(writer).Encode(response); err != nil {
 			return err
 		}
-		if err := writer.Flush(); err != nil {
-			return err
+		return writer.Flush()
+	}
+	shutdown := func() {
+		cancel()
+		processor.CancelAll()
+		if closer, ok := input.(io.Closer); ok {
+			_ = closer.Close()
 		}
 	}
-	return scanner.Err()
+	for {
+		var scanned scannedRequest
+		select {
+		case scanned = <-lines:
+		case err := <-outputErrors:
+			shutdown()
+			requests.Wait()
+			return err
+		}
+		if scanned.done {
+			shutdown()
+			requests.Wait()
+			select {
+			case err := <-outputErrors:
+				return err
+			default:
+			}
+			return scanned.err
+		}
+		request, err := desktopbridge.Parse(scanned.line)
+		if err != nil {
+			shutdown()
+			requests.Wait()
+			return err
+		}
+		if request.Action == desktopbridge.ActionSync {
+			if err := writeResponse(processor.Handle(processContext, request)); err != nil {
+				shutdown()
+				requests.Wait()
+				return err
+			}
+			continue
+		}
+		select {
+		case requestSlots <- struct{}{}:
+		default:
+			response := desktopbridge.Response{ID: request.ID, Error: desktopbridge.ErrorUnavailable}
+			if err := writeResponse(response); err != nil {
+				shutdown()
+				requests.Wait()
+				return err
+			}
+			continue
+		}
+		requests.Add(1)
+		go func(request desktopbridge.Request) {
+			defer requests.Done()
+			defer func() { <-requestSlots }()
+			if err := writeResponse(processor.Handle(processContext, request)); err != nil {
+				select {
+				case outputErrors <- err:
+				default:
+				}
+			}
+		}(request)
+	}
 }

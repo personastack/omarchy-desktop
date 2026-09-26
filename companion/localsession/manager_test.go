@@ -23,6 +23,7 @@ func TestManagerRunsStateSelectPrepareConfigureJourney(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manager.SynchronizeScope("workspace:one")
 	now := time.Date(2026, time.September, 26, 12, 0, 0, 0, time.UTC)
 	manager.now = func() time.Time { return now }
 	manager.newID = func() (string, error) { return "c725451f-2d11-4e46-adfd-e92f2fc84c01", nil }
@@ -78,6 +79,7 @@ func TestManagerInvalidatesPendingOnScopeChangeAndExpiry(t *testing.T) {
 	manager.now = func() time.Time { return now }
 	manager.newID = func() (string, error) { return "c725451f-2d11-4e46-adfd-e92f2fc84c01", nil }
 	origin := "https://my.personastack.ai"
+	manager.SynchronizeScope("one")
 	_, _ = manager.Handle(context.Background(), origin, Command{Action: ActionState, Scope: "one"})
 	prepared, err := manager.Handle(context.Background(), origin, Command{Action: ActionPrepare, Scope: "one", Harness: HarnessCodex, PersonaID: "persona_one"})
 	if err != nil {
@@ -85,14 +87,12 @@ func TestManagerInvalidatesPendingOnScopeChangeAndExpiry(t *testing.T) {
 	}
 	var pending response
 	_ = json.Unmarshal(prepared, &pending)
-	_, err = manager.Handle(context.Background(), origin, Command{Action: ActionState, Scope: "two"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	manager.SynchronizeScope("two")
 	bundle, _ := json.Marshal(validBundle(now))
 	if _, err := manager.Handle(context.Background(), origin, Command{Action: ActionConfigure, Scope: "one", PendingID: pending.PendingID, Bundle: bundle}); !errors.Is(err, ErrStaleRequest) {
 		t.Fatalf("scope changed configure error = %v", err)
 	}
+	manager.SynchronizeScope("one")
 	_, _ = manager.Handle(context.Background(), origin, Command{Action: ActionState, Scope: "one"})
 	prepared, err = manager.Handle(context.Background(), origin, Command{Action: ActionPrepare, Scope: "one", Harness: HarnessCodex, PersonaID: "persona_one"})
 	if err != nil {
@@ -108,6 +108,43 @@ func TestManagerInvalidatesPendingOnScopeChangeAndExpiry(t *testing.T) {
 	}
 }
 
+func TestManagerRejectsLateStateFromPreviousScopeWithoutClearingCurrentPendingWork(t *testing.T) {
+	t.Parallel()
+	fixture := newProbeFixture(t, HarnessCodex, "codex-cli 0.154.0", "add", "")
+	installer := &installerStub{}
+	manager, err := NewManager(fixture.probe, installer, &preferenceStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 26, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	manager.newID = func() (string, error) { return "c725451f-2d11-4e46-adfd-e92f2fc84c01", nil }
+	origin := "https://my.personastack.ai"
+	manager.SynchronizeScope("workspace:old")
+	manager.SynchronizeScope("workspace:new")
+	prepared, err := manager.Handle(context.Background(), origin, Command{Action: ActionPrepare, Scope: "workspace:new", Harness: HarnessCodex, PersonaID: "persona_one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pending response
+	if err := json.Unmarshal(prepared, &pending); err != nil || pending.PendingID == "" {
+		t.Fatalf("current scope pending = %s, %v", prepared, err)
+	}
+	if _, err := manager.Handle(context.Background(), origin, Command{Action: ActionState, Scope: "workspace:old"}); !errors.Is(err, ErrStaleRequest) {
+		t.Fatalf("late old-scope state error = %v", err)
+	}
+	bundle, err := json.Marshal(validBundle(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Handle(context.Background(), origin, Command{Action: ActionConfigure, Scope: "workspace:new", PendingID: pending.PendingID, Bundle: bundle}); err != nil {
+		t.Fatalf("current scope configure after stale read = %v", err)
+	}
+	if installer.configures != 1 {
+		t.Fatalf("current scope installer calls = %d", installer.configures)
+	}
+}
+
 func TestManagerConfigureRequiresMatchingPersonaAndTypedJSON(t *testing.T) {
 	t.Parallel()
 	fixture := newProbeFixture(t, HarnessCodex, "0.154.0", "add", "")
@@ -120,6 +157,7 @@ func TestManagerConfigureRequiresMatchingPersonaAndTypedJSON(t *testing.T) {
 	manager.now = func() time.Time { return now }
 	manager.newID = func() (string, error) { return "c725451f-2d11-4e46-adfd-e92f2fc84c01", nil }
 	origin := "https://my.personastack.ai"
+	manager.SynchronizeScope("one")
 	_, _ = manager.Handle(context.Background(), origin, Command{Action: ActionState, Scope: "one"})
 	prepared, err := manager.Handle(context.Background(), origin, Command{Action: ActionPrepare, Scope: "one", Harness: HarnessCodex, PersonaID: "persona_one"})
 	if err != nil {
