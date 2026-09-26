@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { basename, join } from "node:path";
 
 import {
@@ -28,6 +29,7 @@ import {
   isCurrentBridgeGeneration,
   parseChatMainCommand,
   parseChatWindowCommand,
+  parseDesktopControlCommand,
   parseStackCommand,
   resolveAppURL,
   unwrapBridgePayload,
@@ -36,6 +38,7 @@ import {
   type ChatWindowCommand,
   type StackCommand,
 } from "./security.js";
+import { CompanionClient, type DesktopControlResult } from "./companion-client.js";
 
 const APP_NAME = "PersonaStack";
 const APP_ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMiIgaGVpZ2h0PSIzMiIgdmlld0JveD0iMCAwIDMyIDMyIj48cmVjdCB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHJ4PSI4IiBmaWxsPSIjNzY1NUZGIi8+PHBhdGggZD0iTTEwIDguNWg4LjVhNS41IDUuNSAwIDAgMSAwIDExSDExdjQuNWwtNC01LjUgNC01LjVWMTMuNWg3LjVhMS41IDEuNSAwIDAgMCAwLTNIMTB6IiBmaWxsPSJ3aGl0ZSIvPjwvc3ZnPg==";
@@ -57,6 +60,7 @@ let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let isQuitting = false;
 let chatScope = "";
+let companionClient: CompanionClient | undefined;
 
 app.setName(APP_NAME);
 
@@ -67,6 +71,7 @@ if (!app.requestSingleInstanceLock()) {
 
   app.on("before-quit", () => {
     isQuitting = true;
+    companionClient?.close();
   });
 
   app.whenReady().then(() => {
@@ -234,6 +239,22 @@ function registerBridgeHandlers(): void {
     return { ok: true };
   });
 
+  ipcMain.handle("personastack:desktop-control", async (event, payload: unknown): Promise<DesktopControlResult> => {
+    const envelope = unwrapBridgePayload(payload);
+    const entry = envelope && bridgeGeneration(event, envelope.generation, ["main"]);
+    const command = envelope && parseDesktopControlCommand(envelope.payload);
+    if (!entry || !command) return { ok: false, error: "invalid_request" };
+    const client = getCompanionClient();
+    if (!client) {
+      return { ok: false, error: process.platform === "linux" ? "unavailable" : "unsupported_platform" };
+    }
+    const result = await client.request(command);
+    if (windows.get(event.sender.id) !== entry || bridgeGeneration(event, envelope.generation, ["main"]) !== entry) {
+      return { ok: false, error: "stale_request" };
+    }
+    return result;
+  });
+
   ipcMain.handle("personastack:open-external", async (event, rawURL: unknown) => {
     const envelope = unwrapBridgePayload(rawURL);
     if (!envelope || !bridgeGeneration(event, envelope.generation) || !isSafeExternalURL(envelope.payload) ||
@@ -241,6 +262,27 @@ function registerBridgeHandlers(): void {
     await shell.openExternal(envelope.payload);
     return { ok: true };
   });
+}
+
+function getCompanionClient(): CompanionClient | undefined {
+  if (process.platform !== "linux") return undefined;
+  if (companionClient?.isOpen) return companionClient;
+  try {
+    const binaryPath = app.isPackaged
+      ? join(process.resourcesPath, "bin", "personastack-companion")
+      : join(app.getAppPath(), "companion", "bin", "personastack-companion");
+    const child = spawn(binaryPath, [appURL.origin], { stdio: ["pipe", "pipe", "ignore"] });
+    const client = new CompanionClient(child);
+    companionClient = client;
+    const clear = (): void => {
+      if (companionClient === client) companionClient = undefined;
+    };
+    child.once("error", clear);
+    child.once("exit", clear);
+    return client;
+  } catch {
+    return undefined;
+  }
 }
 
 function openGoogleOAuthWindow(initialURL: string): void {

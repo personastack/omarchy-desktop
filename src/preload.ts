@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld("webkit", {
     personastackChat: invoke("personastack:chat"),
     personastackChatWindow: invoke("personastack:chat-window"),
     personastackStack: invoke("personastack:stack"),
+    personastackDesktopControl: invoke("personastack:desktop-control"),
   },
 });
 

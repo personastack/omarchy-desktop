@@ -7,8 +7,9 @@
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "npm run build && electron .",
+    "start": "npm run build && npm run build:companion && electron .",
     "test": "npm run build && node --test dist/*.test.js",
+    "build:companion": "mkdir -p companion/bin && GOTOOLCHAIN=go1.27.1 go build -C companion -o bin/personastack-companion ./cmd/personastack-companion",
     "verify:electron": "electron --version"
   },
   "engines": {

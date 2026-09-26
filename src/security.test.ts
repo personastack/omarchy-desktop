@@ -11,6 +11,7 @@ import {
   isInternalPersonaStackURL,
   isTrustedAppURL,
   isCurrentBridgeGeneration,
+  parseDesktopControlCommand,
   parseChatMainCommand,
   parseChatWindowCommand,
   parseStackCommand,
@@ -70,6 +71,17 @@ test("chat and stack bridges accept only their finite exact payloads", () => {
     version: "1", action: "open_stack_view", stack_id: "stack-1", view: "graph",
   });
   assert.equal(parseStackCommand({ version: "1", action: "open_stack_view", stack_id: "../etc", view: "graph" }), undefined);
+});
+
+test("Desktop Control bridge accepts only finite enrollment commands", () => {
+  const ticket = "A".repeat(43);
+  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "status" }), { version: "1", action: "status" });
+  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "enroll", ticket }), { version: "1", action: "enroll", ticket });
+  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "attach", ticket }), { version: "1", action: "attach", ticket });
+  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "revoke" }), { version: "1", action: "revoke" });
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "enroll", ticket: "short" }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "status", ticket }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "revoke", extra: true }), undefined);
 });
 
 test("concern notification accepts only the generic new-concern event", () => {

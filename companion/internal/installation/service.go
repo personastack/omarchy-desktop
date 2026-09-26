@@ -36,9 +36,9 @@ type Service struct {
 }
 
 type Status struct {
-	Enrolled        bool
-	CredentialValid bool
-	RelayActive     bool
+	Enrolled        bool `json:"enrolled"`
+	CredentialValid bool `json:"credential_valid"`
+	RelayActive     bool `json:"relay_active"`
 }
 
 func New(api API, store Store) (*Service, error) {

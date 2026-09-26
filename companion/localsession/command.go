@@ -7,6 +7,8 @@ import (
 	"io"
 	"regexp"
 	"unicode/utf8"
+
+	"github.com/personastack/omarchy-desktop/companion/internal/wirejson"
 )
 
 const maxBundleWireBytes = 12 * 1024 * 1024
@@ -43,7 +45,7 @@ type Command struct {
 }
 
 func Parse(raw []byte) (Command, error) {
-	if len(raw) == 0 || len(raw) > maxCommandWireBytes || !utf8.Valid(raw) || containsDuplicateKeys(raw) {
+	if len(raw) == 0 || len(raw) > maxCommandWireBytes || !utf8.Valid(raw) || !wirejson.ValidUniqueJSON(raw) {
 		return Command{}, ErrInvalidRequest
 	}
 	var fields map[string]json.RawMessage
@@ -132,65 +134,6 @@ func decodeOne(raw []byte, target any) error {
 		return errors.New("invalid trailing JSON")
 	}
 	return nil
-}
-
-func containsDuplicateKeys(raw []byte) bool {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if walkJSON(decoder) != nil {
-		return true
-	}
-	_, err := decoder.Token()
-	return err != io.EOF
-}
-
-func walkJSON(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	delimiter, ok := token.(json.Delim)
-	if !ok {
-		return nil
-	}
-	switch delimiter {
-	case '{':
-		keys := make(map[string]struct{})
-		for decoder.More() {
-			token, err = decoder.Token()
-			if err != nil {
-				return err
-			}
-			key, ok := token.(string)
-			if !ok {
-				return ErrInvalidRequest
-			}
-			if _, exists := keys[key]; exists {
-				return ErrInvalidRequest
-			}
-			keys[key] = struct{}{}
-			if err := walkJSON(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil || closing != json.Delim('}') {
-			return ErrInvalidRequest
-		}
-		return nil
-	case '[':
-		for decoder.More() {
-			if err := walkJSON(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil || closing != json.Delim(']') {
-			return ErrInvalidRequest
-		}
-		return nil
-	default:
-		return ErrInvalidRequest
-	}
 }
 
 func stringField(fields map[string]json.RawMessage, key string) (string, bool) {
