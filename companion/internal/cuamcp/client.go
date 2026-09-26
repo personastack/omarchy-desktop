@@ -58,6 +58,7 @@ type Client struct {
 	mu            sync.Mutex
 	process       *exec.Cmd
 	input         io.WriteCloser
+	outputReader  *os.File
 	output        <-chan outputLine
 	outputStop    chan struct{}
 	cancel        context.CancelFunc
@@ -67,6 +68,7 @@ type Client struct {
 	catalog       map[string]struct{}
 	active        atomic.Pointer[processState]
 	stopRequested atomic.Bool
+	alive         atomic.Bool
 }
 
 type processState struct {
@@ -214,8 +216,17 @@ func NewWithEnvironment(executable string, environment []string) (*Client, error
 }
 
 func (c *Client) Start(ctx context.Context) (Catalog, error) {
-	if ctx == nil {
+	return c.StartWithLifetime(ctx, ctx)
+}
+
+// StartWithLifetime bounds startup requests by ctx while tying the child
+// process lifetime to lifetime.
+func (c *Client) StartWithLifetime(ctx context.Context, lifetime context.Context) (Catalog, error) {
+	if ctx == nil || lifetime == nil {
 		return Catalog{}, ErrUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return Catalog{}, contextError(err)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -225,7 +236,10 @@ func (c *Client) Start(ctx context.Context) (Catalog, error) {
 	if c.stopRequested.Load() {
 		return Catalog{}, ErrUnavailable
 	}
-	if err := c.startProcess(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
+		return Catalog{}, contextError(err)
+	}
+	if err := c.startProcess(lifetime); err != nil {
 		c.stopLocked()
 		return Catalog{}, err
 	}
@@ -306,6 +320,10 @@ func (c *Client) Call(ctx context.Context, operation agentgatewayruntime.Desktop
 	if !c.started {
 		return nil, ErrNotStarted
 	}
+	if !c.alive.Load() {
+		c.stopLocked()
+		return nil, ErrProcessExited
+	}
 	if _, available := c.catalog[name]; !available {
 		return nil, ErrInvalidTool
 	}
@@ -342,6 +360,10 @@ func (c *Client) callSetupTool(ctx context.Context, name string) (json.RawMessag
 	if !c.started {
 		return nil, ErrNotStarted
 	}
+	if !c.alive.Load() {
+		c.stopLocked()
+		return nil, ErrProcessExited
+	}
 	if _, available := c.catalog[name]; !available {
 		return nil, ErrInvalidTool
 	}
@@ -358,7 +380,11 @@ func (c *Client) callLocked(ctx context.Context, name string, arguments json.Raw
 	result, err := c.requestLocked(callContext, "tools/call", params)
 	if err != nil {
 		if !errors.Is(err, ErrToolFailed) {
+			processExited := !c.alive.Load() && !errors.Is(err, ErrRequestTimedOut) && !errors.Is(err, context.Canceled)
 			c.stopLocked()
+			if processExited {
+				return nil, ErrProcessExited
+			}
 		}
 		return nil, err
 	}
@@ -391,6 +417,11 @@ func (c *Client) Stop() {
 	c.stopLocked()
 }
 
+// Alive reports whether the managed child process has exited.
+func (c *Client) Alive() bool {
+	return c.alive.Load()
+}
+
 func (c *Client) startProcess(parent context.Context) error {
 	processContext, cancel := context.WithCancel(parent)
 	state := &processState{closed: make(chan struct{})}
@@ -399,38 +430,50 @@ func (c *Client) startProcess(parent context.Context) error {
 		cmd = c.command(processContext, c.executable)
 	}
 	cmd.Env = c.environment
-	cmd.Stderr = io.Discard
 	input, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
 		return fmt.Errorf("create Cua MCP input: %w", err)
 	}
-	stdout, err := cmd.StdoutPipe()
+	stdout, stdoutWriter, err := os.Pipe()
 	if err != nil {
 		cancel()
 		_ = input.Close()
 		return fmt.Errorf("create Cua MCP output: %w", err)
 	}
+	cmd.Stdout = stdoutWriter
 	if err := cmd.Start(); err != nil {
 		cancel()
 		_ = input.Close()
+		_ = stdout.Close()
+		_ = stdoutWriter.Close()
 		return fmt.Errorf("start Cua MCP: %w", err)
 	}
+	_ = stdoutWriter.Close()
 	lines := make(chan outputLine, 16)
 	outputStop := make(chan struct{})
 	waited := make(chan error, 1)
 	readDone := make(chan struct{})
+	c.alive.Store(true)
 	go func() {
-		readLines(stdout, lines, outputStop)
+		readLines(stdout, lines, outputStop, cancel, func() { c.alive.Store(false) })
 		close(readDone)
 	}()
 	go func() {
-		<-readDone
-		waited <- cmd.Wait()
+		waitErr := cmd.Wait()
+		c.alive.Store(false)
+		select {
+		case <-readDone:
+		case <-time.After(100 * time.Millisecond):
+		}
+		_ = stdout.Close()
+		state.shutdown()
+		waited <- waitErr
 		close(waited)
 	}()
 	c.process = cmd
 	c.input = input
+	c.outputReader = stdout
 	c.output = lines
 	c.outputStop = outputStop
 	c.cancel = cancel
@@ -576,39 +619,109 @@ func waitForWrite(written <-chan error) {
 }
 
 func (c *Client) nextLine(ctx context.Context) ([]byte, error) {
-	var stopped <-chan struct{}
+	if err := ctx.Err(); err != nil {
+		return nil, contextError(err)
+	}
+	if c.stopRequested.Load() {
+		return nil, ErrProcessExited
+	}
 	state := c.active.Load()
+	if state != nil {
+		select {
+		case <-state.closed:
+			if c.stopRequested.Load() {
+				return nil, ErrProcessExited
+			}
+			return c.drainOutput(ctx)
+		default:
+		}
+	}
+	select {
+	case <-c.waited:
+		return c.drainOutput(ctx)
+	default:
+	}
+	select {
+	case line, ok := <-c.output:
+		if err := ctx.Err(); err != nil {
+			return nil, contextError(err)
+		}
+		if c.stopRequested.Load() {
+			return nil, ErrProcessExited
+		}
+		return outputLineResult(line, ok)
+	default:
+	}
+	var stopped <-chan struct{}
 	if state != nil {
 		stopped = state.closed
 	}
 	select {
 	case line, ok := <-c.output:
-		if !ok {
+		if err := ctx.Err(); err != nil {
+			return nil, contextError(err)
+		}
+		if c.stopRequested.Load() {
 			return nil, ErrProcessExited
 		}
-		if line.err != nil {
-			return nil, line.err
-		}
-		return line.data, nil
+		return outputLineResult(line, ok)
 	case <-ctx.Done():
 		return nil, contextError(ctx.Err())
 	case <-c.waited:
-		return nil, ErrProcessExited
+		return c.drainOutput(ctx)
 	case <-stopped:
+		if c.stopRequested.Load() {
+			return nil, ErrProcessExited
+		}
+		return c.drainOutput(ctx)
+	}
+}
+
+func (c *Client) drainOutput(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, contextError(err)
+	}
+	if c.stopRequested.Load() {
+		return nil, ErrProcessExited
+	}
+	select {
+	case line, ok := <-c.output:
+		if err := ctx.Err(); err != nil {
+			return nil, contextError(err)
+		}
+		if c.stopRequested.Load() {
+			return nil, ErrProcessExited
+		}
+		return outputLineResult(line, ok)
+	default:
 		return nil, ErrProcessExited
 	}
 }
 
+func outputLineResult(line outputLine, ok bool) ([]byte, error) {
+	if !ok {
+		return nil, ErrProcessExited
+	}
+	if line.err != nil {
+		return nil, line.err
+	}
+	return line.data, nil
+}
+
 func (c *Client) stopLocked() {
+	c.alive.Store(false)
 	state := c.active.Swap(nil)
 	if state != nil {
 		state.shutdown()
 	}
+	if c.outputStop != nil {
+		close(c.outputStop)
+	}
 	if c.input != nil {
 		_ = c.input.Close()
 	}
-	if c.outputStop != nil {
-		close(c.outputStop)
+	if c.outputReader != nil {
+		_ = c.outputReader.Close()
 	}
 	if c.waited != nil {
 		select {
@@ -635,6 +748,7 @@ func (c *Client) stopLocked() {
 	c.process = nil
 	c.input = nil
 	c.output = nil
+	c.outputReader = nil
 	c.outputStop = nil
 	c.cancel = nil
 	c.waited = nil
@@ -643,28 +757,42 @@ func (c *Client) stopLocked() {
 	c.catalog = nil
 }
 
-func readLines(reader io.ReadCloser, lines chan<- outputLine, stop <-chan struct{}) {
-	defer close(lines)
-	defer reader.Close()
+func readLines(reader io.ReadCloser, lines chan<- outputLine, stop <-chan struct{}, cancel context.CancelFunc, fail func()) {
+	defer func() {
+		select {
+		case <-stop:
+		default:
+			fail()
+			cancel()
+		}
+		_ = reader.Close()
+		close(lines)
+	}()
 	buffered := bufio.NewReader(reader)
 	for {
 		line, err := readBoundedLine(buffered)
 		if len(line) > 0 {
-			select {
-			case lines <- outputLine{data: line}:
-			case <-stop:
+			if !deliverOutput(lines, stop, outputLine{data: line}) {
 				return
 			}
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				select {
-				case lines <- outputLine{err: err}:
-				case <-stop:
-				}
+				_ = deliverOutput(lines, stop, outputLine{err: err})
 			}
 			return
 		}
+	}
+}
+
+func deliverOutput(lines chan<- outputLine, stop <-chan struct{}, line outputLine) bool {
+	select {
+	case lines <- line:
+		return true
+	case <-stop:
+		return false
+	default:
+		return false
 	}
 }
 

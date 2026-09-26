@@ -22,7 +22,8 @@ import (
 )
 
 const (
-	version            = "0.29.1"
+	DriverVersion      = "0.29.1"
+	version            = DriverVersion
 	archiveSHA256      = "61a0c0f24d6b03e31bb7a73390db875ecf0de2ce53aa435eadb03d70979d79a5"
 	archiveURL         = "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.29.1/cua-driver-rs-0.29.1-linux-x86_64.tar.gz"
 	maximumArchive     = 80 << 20
@@ -158,7 +159,10 @@ func (i *Installer) Install(ctx context.Context) (string, error) {
 	if i == nil || ctx == nil {
 		return "", ErrUnavailable
 	}
-	if err := i.Verify(); err == nil {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := verifyTree(ctx, i.root, i.release, i.notices); err == nil {
 		return filepath.Join(i.root, "cua-driver"), nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
@@ -167,20 +171,26 @@ func (i *Installer) Install(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	stage, err := i.makeStage()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	stage, err := i.makeStage(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer os.RemoveAll(stage)
-	if err := extractVerified(archive, stage, i.release); err != nil {
+	if err := extractVerified(ctx, archive, stage, i.release); err != nil {
 		return "", err
 	}
 	for _, notice := range i.notices {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		path := filepath.Join(stage, filepath.FromSlash(notice.name))
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return "", err
 		}
-		if err := writePrivateFile(path, notice.content, 0o600); err != nil {
+		if err := writePrivateFile(ctx, path, notice.content, 0o600); err != nil {
 			return "", err
 		}
 	}
@@ -189,21 +199,24 @@ func (i *Installer) Install(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("encode Cua ownership marker: %w", err)
 	}
 	marker = append(marker, '\n')
-	if err := writePrivateFile(filepath.Join(stage, ".personastack-cua.json"), marker, 0o600); err != nil {
+	if err := writePrivateFile(ctx, filepath.Join(stage, ".personastack-cua.json"), marker, 0o600); err != nil {
 		return "", err
 	}
-	if err := verifyTree(stage, i.release, i.notices); err != nil {
+	if err := verifyTree(ctx, stage, i.release, i.notices); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	if err := i.rename(stage, i.root); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			if verifyErr := i.Verify(); verifyErr == nil {
+			if verifyErr := verifyTree(ctx, i.root, i.release, i.notices); verifyErr == nil {
 				return filepath.Join(i.root, "cua-driver"), nil
 			}
 		}
 		return "", fmt.Errorf("install Cua release: %w", err)
 	}
-	if err := i.Verify(); err != nil {
+	if err := verifyTree(ctx, i.root, i.release, i.notices); err != nil {
 		return "", err
 	}
 	return filepath.Join(i.root, "cua-driver"), nil
@@ -213,7 +226,7 @@ func (i *Installer) Verify() error {
 	if i == nil {
 		return ErrUnavailable
 	}
-	return verifyTree(i.root, i.release, i.notices)
+	return verifyTree(context.Background(), i.root, i.release, i.notices)
 }
 
 func (i *Installer) download(ctx context.Context) ([]byte, error) {
@@ -232,6 +245,9 @@ func (i *Installer) download(ctx context.Context) ([]byte, error) {
 		return nil, ErrUnavailable
 	}
 	archive, err := io.ReadAll(io.LimitReader(response.Body, maximumArchive+1))
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err != nil || len(archive) == 0 || len(archive) > maximumArchive {
 		return nil, ErrUnavailable
 	}
@@ -242,10 +258,16 @@ func (i *Installer) download(ctx context.Context) ([]byte, error) {
 	return archive, nil
 }
 
-func (i *Installer) makeStage() (string, error) {
+func (i *Installer) makeStage(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	parent := filepath.Dir(i.root)
 	if err := ensurePrivateDirectoryPath(parent, true); err != nil {
 		return "", fmt.Errorf("create Cua data directory: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	info, err := os.Lstat(parent)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || !currentUserOwnsDirectory(info) {
@@ -262,7 +284,7 @@ func (i *Installer) makeStage() (string, error) {
 	return stage, nil
 }
 
-func extractVerified(archive []byte, root string, selected release) error {
+func extractVerified(ctx context.Context, archive []byte, root string, selected release) error {
 	gzipReader, err := gzip.NewReader(bytes.NewReader(archive))
 	if err != nil {
 		return ErrInvalidArchive
@@ -273,7 +295,13 @@ func extractVerified(archive []byte, root string, selected release) error {
 	seenArchiveRoot := false
 	var expanded int64
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		header, err := reader.Next()
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -317,7 +345,10 @@ func extractVerified(archive []byte, root string, selected release) error {
 			if expanded > maximumExpanded {
 				return ErrInvalidArchive
 			}
-			content, err := io.ReadAll(io.LimitReader(reader, maximumFileBytes+1))
+			content, err := io.ReadAll(io.LimitReader(interruptibleReader{ctx: ctx, reader: reader}, maximumFileBytes+1))
+			if contextErr := ctx.Err(); contextErr != nil {
+				return contextErr
+			}
 			if err != nil || int64(len(content)) != header.Size {
 				return ErrInvalidArchive
 			}
@@ -326,7 +357,10 @@ func extractVerified(archive []byte, root string, selected release) error {
 				return ErrChecksumMismatch
 			}
 			mode := expectedFileMode(name)
-			if err := writePrivateFile(filepath.Join(root, filepath.FromSlash(name)), content, mode); err != nil {
+			if err := writePrivateFile(ctx, filepath.Join(root, filepath.FromSlash(name)), content, mode); err != nil {
+				if contextErr := ctx.Err(); contextErr != nil {
+					return contextErr
+				}
 				return ErrInvalidArchive
 			}
 		default:
@@ -349,7 +383,10 @@ func extractVerified(archive []byte, root string, selected release) error {
 	return nil
 }
 
-func verifyTree(root string, selected release, notices []noticeFile) error {
+func verifyTree(ctx context.Context, root string, selected release, notices []noticeFile) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := ensurePrivateDirectoryPath(filepath.Dir(root), false); err != nil {
 		return err
 	}
@@ -375,8 +412,11 @@ func verifyTree(root string, selected release, notices []noticeFile) error {
 		return ErrForeignInstall
 	}
 	openedInfo, statErr := markerFile.Stat()
-	marker, readErr := io.ReadAll(io.LimitReader(markerFile, maximumMarker+1))
+	marker, readErr := io.ReadAll(io.LimitReader(interruptibleReader{ctx: ctx, reader: markerFile}, maximumMarker+1))
 	closeErr := markerFile.Close()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if statErr != nil || readErr != nil || closeErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(markerInfo, openedInfo) || int64(len(marker)) > maximumMarker {
 		return ErrForeignInstall
 	}
@@ -408,8 +448,14 @@ func verifyTree(root string, selected release, notices []noticeFile) error {
 	children := expectedChildren(allowedFiles, allowedDirectories)
 	verifiedFiles := make(map[string]struct{}, len(allowedFiles))
 	verifiedDirectories := make(map[string]struct{}, len(allowedDirectories))
-	if err := verifyDirectory(root, ".", children, allowedFiles, allowedDirectories, verifiedFiles, verifiedDirectories); err != nil {
+	if err := verifyDirectory(ctx, root, ".", children, allowedFiles, allowedDirectories, verifiedFiles, verifiedDirectories); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
 		return ErrForeignInstall
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if len(verifiedFiles) != len(allowedFiles) || len(verifiedDirectories) != len(allowedDirectories) {
 		return ErrForeignInstall
@@ -436,7 +482,10 @@ func expectedChildren(files map[string]string, directories map[string]struct{}) 
 	return children
 }
 
-func verifyDirectory(root, relative string, children map[string]map[string]struct{}, files map[string]string, directories map[string]struct{}, verifiedFiles, verifiedDirectories map[string]struct{}) error {
+func verifyDirectory(ctx context.Context, root, relative string, children map[string]map[string]struct{}, files map[string]string, directories map[string]struct{}, verifiedFiles, verifiedDirectories map[string]struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	path := root
 	if relative != "." {
 		path = filepath.Join(root, filepath.FromSlash(relative))
@@ -464,6 +513,9 @@ func verifyDirectory(root, relative string, children map[string]map[string]struc
 		return ErrForeignInstall
 	}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if _, ok := expected[entry.Name()]; !ok {
 			return ErrForeignInstall
 		}
@@ -472,7 +524,7 @@ func verifyDirectory(root, relative string, children map[string]map[string]struc
 			child = relative + "/" + child
 		}
 		if _, ok := directories[child]; ok {
-			if err := verifyDirectory(root, child, children, files, directories, verifiedFiles, verifiedDirectories); err != nil {
+			if err := verifyDirectory(ctx, root, child, children, files, directories, verifiedFiles, verifiedDirectories); err != nil {
 				return err
 			}
 			continue
@@ -481,7 +533,7 @@ func verifyDirectory(root, relative string, children map[string]map[string]struc
 		if !ok {
 			return ErrForeignInstall
 		}
-		if err := verifyFile(filepath.Join(root, filepath.FromSlash(child)), child, digest); err != nil {
+		if err := verifyFile(ctx, filepath.Join(root, filepath.FromSlash(child)), child, digest); err != nil {
 			return err
 		}
 		verifiedFiles[child] = struct{}{}
@@ -489,7 +541,10 @@ func verifyDirectory(root, relative string, children map[string]map[string]struc
 	return nil
 }
 
-func verifyFile(path, relative, digest string) error {
+func verifyFile(ctx context.Context, path, relative, digest string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maximumFileBytes || info.Mode().Perm() != expectedFileMode(relative).Perm() {
 		return ErrForeignInstall
@@ -508,8 +563,11 @@ func verifyFile(path, relative, digest string) error {
 	}
 	openedInfo, statErr := file.Stat()
 	hash := sha256.New()
-	copied, copyErr := io.Copy(hash, io.LimitReader(file, maximumFileBytes+1))
+	copied, copyErr := io.Copy(hash, io.LimitReader(interruptibleReader{ctx: ctx, reader: file}, maximumFileBytes+1))
 	closeErr := file.Close()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) || openedInfo.Size() > maximumFileBytes || copied > maximumFileBytes || copied != openedInfo.Size() || copyErr != nil || closeErr != nil || hex.EncodeToString(hash.Sum(nil)) != digest {
 		return ErrForeignInstall
 	}
@@ -538,17 +596,48 @@ func expectedFileMode(name string) os.FileMode {
 	}
 }
 
-func writePrivateFile(path string, data []byte, mode os.FileMode) error {
+func writePrivateFile(ctx context.Context, path string, data []byte, mode os.FileMode) error {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 	if err != nil {
 		return fmt.Errorf("create Cua runtime file: %w", err)
 	}
-	if _, err := file.Write(data); err != nil {
+	for len(data) > 0 {
+		if err := ctx.Err(); err != nil {
+			_ = file.Close()
+			return err
+		}
+		chunk := data
+		if len(chunk) > 64<<10 {
+			chunk = chunk[:64<<10]
+		}
+		written, err := file.Write(chunk)
+		if err != nil || written == 0 {
+			_ = file.Close()
+			if err == nil {
+				err = io.ErrShortWrite
+			}
+			return fmt.Errorf("write Cua runtime file: %w", err)
+		}
+		data = data[written:]
+	}
+	if err := ctx.Err(); err != nil {
 		_ = file.Close()
-		return fmt.Errorf("write Cua runtime file: %w", err)
+		return err
 	}
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close Cua runtime file: %w", err)
 	}
 	return nil
+}
+
+type interruptibleReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r interruptibleReader) Read(buffer []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(buffer)
 }

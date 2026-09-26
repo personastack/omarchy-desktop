@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"syscall"
 	"testing"
+	"time"
 )
 
 var fixtureNotices = []noticeFile{
@@ -81,6 +82,71 @@ func TestInstallerRejectsBadArchiveChecksumWithoutWriting(t *testing.T) {
 	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("installer wrote the rejected archive: %v", err)
 	}
+}
+
+func TestInstallerHonorsCancellationAfterDownloadBeforeStaging(t *testing.T) {
+	t.Parallel()
+	archive, selected := fixtureRelease(t, []archiveEntry{{name: "cua-driver", mode: 0o755, content: []byte("driver binary")}})
+	root := filepath.Join(t.TempDir(), "cua", selected.version)
+	ctx, cancel := context.WithCancel(context.Background())
+	installer, err := newInstallerForRelease(root, "linux", "amd64", &cancelAfterReadHTTP{body: archive, cancel: cancel}, selected, fixtureNotices)
+	if err != nil {
+		t.Fatal("create fixture installer")
+	}
+	if _, err := installer.Install(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Install() cancellation error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Dir(root)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled install created its staging parent: %v", err)
+	}
+}
+
+func TestExtractVerifiedRejectsCanceledContextBeforeWriting(t *testing.T) {
+	t.Parallel()
+	archive, selected := fixtureRelease(t, []archiveEntry{{name: "cua-driver", mode: 0o755, content: []byte("driver binary")}})
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := extractVerified(ctx, archive, root, selected); !errors.Is(err, context.Canceled) {
+		t.Fatalf("extractVerified() error = %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("canceled extraction wrote entries=%v error=%v", entries, err)
+	}
+}
+
+func TestWritePrivateFileReturnsCancellationDuringChunkedWrite(t *testing.T) {
+	t.Parallel()
+	ctx := &cancelOnSecondCheck{done: make(chan struct{})}
+	path := filepath.Join(t.TempDir(), "runtime-file")
+	content := bytes.Repeat([]byte("x"), 128<<10)
+	if err := writePrivateFile(ctx, path, content, 0o600); !errors.Is(err, context.Canceled) {
+		t.Fatalf("writePrivateFile() error = %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Size() != 64<<10 {
+		t.Fatalf("partial file size = %v, %v", info, err)
+	}
+}
+
+type cancelOnSecondCheck struct {
+	checks int
+	done   chan struct{}
+}
+
+func (c *cancelOnSecondCheck) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelOnSecondCheck) Done() <-chan struct{}       { return c.done }
+func (c *cancelOnSecondCheck) Value(any) any               { return nil }
+func (c *cancelOnSecondCheck) Err() error {
+	c.checks++
+	if c.checks == 2 {
+		close(c.done)
+	}
+	if c.checks >= 2 {
+		return context.Canceled
+	}
+	return nil
 }
 
 func TestInstallerRejectsUnsafeTarEntries(t *testing.T) {
@@ -465,6 +531,32 @@ type fakeHTTP struct {
 	err    error
 	calls  int
 	status int
+}
+
+type cancelAfterReadHTTP struct {
+	body   []byte
+	cancel context.CancelFunc
+}
+
+func (c *cancelAfterReadHTTP) Do(request *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, ContentLength: int64(len(c.body)), Body: cancelAfterEOF{reader: bytes.NewReader(c.body), cancel: c.cancel}, Request: request}, nil
+}
+
+type cancelAfterEOF struct {
+	reader *bytes.Reader
+	cancel context.CancelFunc
+}
+
+func (r cancelAfterEOF) Read(buffer []byte) (int, error) {
+	count, err := r.reader.Read(buffer)
+	if errors.Is(err, io.EOF) {
+		r.cancel()
+	}
+	return count, err
+}
+
+func (cancelAfterEOF) Close() error {
+	return nil
 }
 
 func (c *fakeHTTP) Do(request *http.Request) (*http.Response, error) {

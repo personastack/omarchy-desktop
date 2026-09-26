@@ -130,6 +130,146 @@ func TestClientRunsBoundedMCPCallsInOneOwnedProcess(t *testing.T) {
 	}
 }
 
+func TestClientLifetimeOutlivesStartupContext(t *testing.T) {
+	t.Parallel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal("resolve test executable")
+	}
+	client, err := New(executable)
+	if err != nil {
+		t.Fatalf("create Cua client: %v", err)
+	}
+	client.command = func(ctx context.Context, path string) *exec.Cmd {
+		return exec.CommandContext(ctx, path, "-test.run=^TestCUAHelperProcess$", "--", "mcp")
+	}
+	lifetimeContext, cancelLifetime := context.WithCancel(context.Background())
+	defer cancelLifetime()
+	startupContext, cancelStartup := context.WithCancel(context.Background())
+	if _, err := client.StartWithLifetime(startupContext, lifetimeContext); err != nil {
+		t.Fatalf("start Cua client: %v", err)
+	}
+	t.Cleanup(client.Stop)
+	cancelStartup()
+	if !client.Alive() {
+		t.Fatal("startup context cancellation stopped the Cua child")
+	}
+	if _, err := client.Call(context.Background(), agentgatewayruntime.DesktopControlOperationObserve, "get_desktop_state", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("Call() after startup context cancellation = %v", err)
+	}
+	cancelLifetime()
+	waitForAlive(t, client, false)
+}
+
+func TestClientStopsOnUnconsumedOutputOverflow(t *testing.T) {
+	t.Parallel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal("resolve test executable")
+	}
+	client, err := New(executable)
+	if err != nil {
+		t.Fatalf("create Cua client: %v", err)
+	}
+	client.command = func(ctx context.Context, path string) *exec.Cmd {
+		return exec.CommandContext(ctx, path, "-test.run=^TestCUAHelperProcess$", "--", "mcp")
+	}
+	gate := filepath.Join(t.TempDir(), "overflow-gate")
+	client.environment = append(client.environment, "CUA_HELPER_OUTPUT_OVERFLOW=1", "CUA_HELPER_OUTPUT_OVERFLOW_GATE="+gate)
+	if _, err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start Cua client: %v", err)
+	}
+	t.Cleanup(client.Stop)
+	if err := os.WriteFile(gate, []byte("release"), 0o600); err != nil {
+		t.Fatalf("release overflow child: %v", err)
+	}
+	waitForAlive(t, client, false)
+}
+
+func TestClientDetectsParentExitWhenDescendantKeepsOutputOpen(t *testing.T) {
+	t.Parallel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal("resolve test executable")
+	}
+	client, err := New(executable)
+	if err != nil {
+		t.Fatalf("create Cua client: %v", err)
+	}
+	client.command = func(ctx context.Context, path string) *exec.Cmd {
+		return exec.CommandContext(ctx, path, "-test.run=^TestCUAHelperProcess$", "--", "mcp")
+	}
+	release := filepath.Join(t.TempDir(), "release-output-holder")
+	client.environment = append(client.environment, "CUA_HELPER_HOLD_OUTPUT_CHILD=1", "CUA_HELPER_OUTPUT_RELEASE="+release)
+	if _, err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start Cua client: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.WriteFile(release, []byte("release"), 0o600)
+		client.Stop()
+	})
+	waitForAliveWithin(t, client, false, 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := client.Call(ctx, agentgatewayruntime.DesktopControlOperationObserve, "get_desktop_state", json.RawMessage(`{}`)); !errors.Is(err, ErrProcessExited) {
+		t.Fatalf("Call() after the Cua parent exited = %v", err)
+	}
+}
+
+func TestClientStopsWhenOutputReaderFails(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"close_stdout", "oversized_frame"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal("resolve test executable")
+			}
+			client, err := New(executable)
+			if err != nil {
+				t.Fatalf("create Cua client: %v", err)
+			}
+			client.command = func(ctx context.Context, path string) *exec.Cmd {
+				return exec.CommandContext(ctx, path, "-test.run=^TestCUAHelperProcess$", "--", "mcp")
+			}
+			release := filepath.Join(t.TempDir(), "release-helper")
+			client.environment = append(client.environment, "CUA_HELPER_TERMINAL_OUTPUT="+mode, "CUA_HELPER_TERMINAL_OUTPUT_RELEASE="+release)
+			if _, err := client.Start(context.Background()); err != nil {
+				t.Fatalf("start Cua client: %v", err)
+			}
+			t.Cleanup(func() {
+				_ = os.WriteFile(release, []byte("release"), 0o600)
+				client.Stop()
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, err := client.Call(ctx, agentgatewayruntime.DesktopControlOperationObserve, "get_desktop_state", json.RawMessage(`{}`)); err == nil {
+				t.Fatal("Call() succeeded after output reader failure")
+			}
+			waitForAlive(t, client, false)
+		})
+	}
+}
+
+func waitForAlive(t *testing.T, client *Client, want bool) {
+	waitForAliveWithin(t, client, want, time.Second)
+}
+
+func waitForAliveWithin(t *testing.T, client *Client, want bool, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	ticker := time.NewTicker(time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for client.Alive() != want {
+		select {
+		case <-deadline.C:
+			t.Fatalf("client alive = %t, want %t", client.Alive(), want)
+		case <-ticker.C:
+		}
+	}
+}
+
 func waitForFile(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.NewTimer(5 * time.Second)
@@ -256,6 +396,49 @@ func TestClientCancelsBlockedMCPRequestWrite(t *testing.T) {
 	}
 }
 
+func TestNextLinePrioritizesCancellationAndStopOverBufferedOutput(t *testing.T) {
+	t.Parallel()
+	t.Run("canceled context", func(t *testing.T) {
+		t.Parallel()
+		output := make(chan outputLine, 1)
+		output <- outputLine{data: []byte("response")}
+		client := &Client{output: output}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := client.nextLine(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("nextLine() error = %v", err)
+		}
+		if len(output) != 1 {
+			t.Fatal("canceled nextLine() consumed buffered output")
+		}
+	})
+	t.Run("explicit stop", func(t *testing.T) {
+		t.Parallel()
+		output := make(chan outputLine, 1)
+		output <- outputLine{data: []byte("response")}
+		client := &Client{output: output}
+		client.stopRequested.Store(true)
+		if _, err := client.nextLine(context.Background()); !errors.Is(err, ErrProcessExited) {
+			t.Fatalf("nextLine() error = %v", err)
+		}
+		if len(output) != 1 {
+			t.Fatal("stopped nextLine() consumed buffered output")
+		}
+	})
+	t.Run("natural process exit drains final response", func(t *testing.T) {
+		t.Parallel()
+		output := make(chan outputLine, 1)
+		output <- outputLine{data: []byte("final response")}
+		waited := make(chan error)
+		close(waited)
+		client := &Client{output: output, waited: waited}
+		line, err := client.nextLine(context.Background())
+		if err != nil || string(line) != "final response" {
+			t.Fatalf("nextLine() = %q, %v", line, err)
+		}
+	})
+}
+
 func TestValidateCatalogRejectsDuplicateAndMalformedTools(t *testing.T) {
 	t.Parallel()
 	for _, raw := range []json.RawMessage{
@@ -330,12 +513,42 @@ func TestCUAHelperProcess(t *testing.T) {
 				fmt.Printf("{\"name\":%q}", name)
 			}
 			fmt.Println(`,{"name":"health_report"}]}}`)
+			if os.Getenv("CUA_HELPER_HOLD_OUTPUT_CHILD") == "1" {
+				command := exec.Command(os.Args[0], "-test.run=^TestCUAOutputHolderProcess$")
+				command.Stdout = os.Stdout
+				command.Stderr = os.Stderr
+				command.Env = append(os.Environ(), "CUA_HELPER_OUTPUT_RELEASE="+os.Getenv("CUA_HELPER_OUTPUT_RELEASE"))
+				if err := command.Start(); err != nil {
+					os.Exit(11)
+				}
+				return
+			}
+			if os.Getenv("CUA_HELPER_OUTPUT_OVERFLOW") == "1" {
+				waitForHelperFile(os.Getenv("CUA_HELPER_OUTPUT_OVERFLOW_GATE"))
+				for index := 0; index < 32; index++ {
+					fmt.Printf("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"index\":%d}}\n", index)
+				}
+				return
+			}
 			if os.Getenv("CUA_HELPER_STALL_AFTER_LIST") == "1" {
 				for {
 					time.Sleep(time.Hour)
 				}
 			}
 		case "tools/call":
+			if os.Getenv("CUA_HELPER_HOLD_OUTPUT_CHILD") == "1" {
+				return
+			}
+			if mode := os.Getenv("CUA_HELPER_TERMINAL_OUTPUT"); mode != "" {
+				switch mode {
+				case "close_stdout":
+					_ = os.Stdout.Close()
+				case "oversized_frame":
+					_, _ = fmt.Fprintln(os.Stdout, strings.Repeat("x", maximumLineBytes+1))
+				}
+				waitForHelperFile(os.Getenv("CUA_HELPER_TERMINAL_OUTPUT_RELEASE"))
+				continue
+			}
 			mode := os.Getenv("CUA_HELPER_MALFORMED_MODE")
 			if mode != "" {
 				switch mode {
@@ -427,4 +640,21 @@ func TestCUAHelperProcess(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func TestCUAOutputHolderProcess(t *testing.T) {
+	release := os.Getenv("CUA_HELPER_OUTPUT_RELEASE")
+	if release == "" {
+		return
+	}
+	waitForHelperFile(release)
+}
+
+func waitForHelperFile(path string) {
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
