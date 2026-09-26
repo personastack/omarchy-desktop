@@ -25,7 +25,9 @@ func TestParseAcceptsHostedDesktopControlCommands(t *testing.T) {
 	}{
 		{name: "sync", raw: `{"id":1,"version":"1","action":"sync","scope":"workspace:request"}`, want: Request{ID: 1, Version: "1", Action: ActionSync, Scope: "workspace:request"}},
 		{name: "empty state scope", raw: `{"id":2,"version":"1","action":"state","scope":""}`, want: Request{ID: 2, Version: "1", Action: ActionState}},
-		{name: "prepare", raw: `{"id":3,"version":"1","action":"prepare","scope":"workspace:request","enrollment_ticket":"` + ticket + `"}`, want: Request{ID: 3, Version: "1", Action: ActionPrepare, Scope: "workspace:request", EnrollmentTicket: ticket}},
+		{name: "pause", raw: `{"id":3,"version":"1","action":"pause","scope":"workspace:request"}`, want: Request{ID: 3, Version: "1", Action: ActionPause, Scope: "workspace:request"}},
+		{name: "resume", raw: `{"id":4,"version":"1","action":"resume","scope":"workspace:request"}`, want: Request{ID: 4, Version: "1", Action: ActionResume, Scope: "workspace:request"}},
+		{name: "prepare", raw: `{"id":5,"version":"1","action":"prepare","scope":"workspace:request","enrollment_ticket":"` + ticket + `"}`, want: Request{ID: 5, Version: "1", Action: ActionPrepare, Scope: "workspace:request", EnrollmentTicket: ticket}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -178,6 +180,25 @@ func TestProcessorPrepareUsesIntegratedRuntimeReadiness(t *testing.T) {
 	}
 }
 
+func TestProcessorRoutesPauseAndResumeToIntegratedRuntime(t *testing.T) {
+	t.Parallel()
+	lifecycle := &controlRuntimeStub{state: installation.LocalState{RelayPaused: true}}
+	processor, err := NewWithControlRuntime(&serviceStub{}, nil, lifecycle, "https://my.personastack.ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor.Handle(context.Background(), Request{ID: 1, Version: "1", Action: ActionSync, Scope: "workspace:a"})
+	for _, action := range []Action{ActionPause, ActionResume} {
+		result := processor.Handle(context.Background(), Request{ID: uint64(lifecycle.stateCalls + 2), Version: "1", Action: action, Scope: "workspace:a"})
+		if !result.OK || result.Result == nil || !result.Result.RelayPaused {
+			t.Fatalf("%s = %#v", action, result)
+		}
+	}
+	if lifecycle.stateCalls != 2 {
+		t.Fatalf("lifecycle state calls = %d, want pause and resume", lifecycle.stateCalls)
+	}
+}
+
 func TestProcessorPreservesFiniteLifecycleLockErrors(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -322,6 +343,16 @@ func (runtime *controlRuntimeStub) Prepare(_ context.Context, _ string, ticket s
 	runtime.prepareCalls++
 	runtime.lastTicket = ticket
 	return runtime.state, runtime.prepareErr
+}
+
+func (runtime *controlRuntimeStub) Pause(context.Context) (installation.LocalState, error) {
+	runtime.stateCalls++
+	return runtime.state, nil
+}
+
+func (runtime *controlRuntimeStub) Resume(context.Context) (installation.LocalState, error) {
+	runtime.stateCalls++
+	return runtime.state, nil
 }
 
 type finiteControlError struct{ code string }

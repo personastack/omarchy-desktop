@@ -45,6 +45,27 @@ test("companion client accepts the sync acknowledgment shape", async () => {
   await client.close();
 });
 
+test("companion client accepts typed pause and resume state replies", async () => {
+  for (const action of ["pause", "resume"] as const) {
+    const fake = createFakeChild();
+    const client = new CompanionClient(fake.child);
+    fake.stdin.on("data", (chunk: Buffer) => {
+      const request = JSON.parse(chunk.toString("utf8")) as { id: number; version: string; action: string; scope: string };
+      assert.equal(request.action, action);
+      fake.stdout.write(`${JSON.stringify({
+        id: request.id,
+        ok: true,
+        result: { installation_id: null, operating_system: "linux", cua_ready: false, native_executor_ready: false, gateway_connected: false, relay_paused: action === "pause" },
+      })}\n`);
+    });
+    const result = await client.request({ version: "1", action, scope: "workspace:a" });
+    assert.equal(result.ok, true);
+    if (result.ok && "relay_paused" in result) assert.equal(result.relay_paused, action === "pause");
+    else assert.fail(`missing lifecycle state for ${action}`);
+    await client.close();
+  }
+});
+
 test("companion client transports local-session commands and validates typed replies", async () => {
   const fake = createFakeChild();
   const client = new CompanionClient(fake.child);

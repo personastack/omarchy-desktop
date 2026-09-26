@@ -82,10 +82,12 @@ test("chat and stack bridges accept only their finite exact payloads", () => {
   assert.equal(parseStackCommand({ version: "1", action: "open_stack_view", stack_id: "../etc", view: "graph" }), undefined);
 });
 
-test("Desktop Control bridge accepts only hosted sync, state, and prepare commands", () => {
+test("Desktop Control bridge accepts only hosted lifecycle commands", () => {
   const ticket = "A".repeat(43);
   assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "sync", scope: "" }), { version: "1", action: "sync", scope: "" });
   assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "state", scope: "" }), { version: "1", action: "state", scope: "" });
+  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "pause", scope: "workspace:request" }), { version: "1", action: "pause", scope: "workspace:request" });
+  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "resume", scope: "workspace:request" }), { version: "1", action: "resume", scope: "workspace:request" });
   assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: ticket }),
     { version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: ticket });
   assert.equal(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "x", enrollment_ticket: "short" }), undefined);

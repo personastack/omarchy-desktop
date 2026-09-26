@@ -33,6 +33,8 @@ const (
 	ActionSync         Action = "sync"
 	ActionState        Action = "state"
 	ActionPrepare      Action = "prepare"
+	ActionPause        Action = "pause"
+	ActionResume       Action = "resume"
 	ActionLocalSession Action = "local_session"
 )
 
@@ -105,6 +107,8 @@ type LocalSessionService interface {
 type ControlRuntime interface {
 	LocalState(context.Context, string) (installation.LocalState, error)
 	Prepare(context.Context, string, string) (installation.LocalState, error)
+	Pause(context.Context) (installation.LocalState, error)
+	Resume(context.Context) (installation.LocalState, error)
 }
 
 func New(service Service, origin string) (*Processor, error) {
@@ -160,7 +164,7 @@ func Parse(raw []byte) (Request, error) {
 		return Request{}, ErrInvalidRequest
 	}
 	switch request.Action {
-	case ActionSync, ActionState:
+	case ActionSync, ActionState, ActionPause, ActionResume:
 		if len(fields) != 4 || hasField(fields, "enrollment_ticket") {
 			return Request{}, ErrInvalidRequest
 		}
@@ -229,7 +233,7 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 		response.LocalSession = result
 		return response
 	}
-	if request.Action != ActionState && request.Action != ActionPrepare {
+	if request.Action != ActionState && request.Action != ActionPrepare && request.Action != ActionPause && request.Action != ActionResume {
 		response.Error = ErrorInvalidRequest
 		return response
 	}
@@ -239,11 +243,18 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 	}
 	var state installation.LocalState
 	var err error
-	if request.Action == ActionPrepare && p.controlRuntime != nil {
+	switch {
+	case request.Action == ActionPause && p.controlRuntime != nil:
+		state, err = p.controlRuntime.Pause(commandCtx)
+	case request.Action == ActionResume && p.controlRuntime != nil:
+		state, err = p.controlRuntime.Resume(commandCtx)
+	case request.Action == ActionPause || request.Action == ActionResume:
+		err = ErrInvalidRequest
+	case request.Action == ActionPrepare && p.controlRuntime != nil:
 		state, err = p.controlRuntime.Prepare(commandCtx, p.origin, request.EnrollmentTicket)
-	} else if p.controlRuntime != nil {
+	case p.controlRuntime != nil:
 		state, err = p.controlRuntime.LocalState(commandCtx, p.origin)
-	} else {
+	default:
 		state, err = p.service.LocalState(commandCtx, p.origin)
 	}
 	if !p.commandCurrent(request.Scope, generation) {

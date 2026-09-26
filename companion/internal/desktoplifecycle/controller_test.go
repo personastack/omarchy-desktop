@@ -157,6 +157,22 @@ type lockProbeFake struct {
 	err   error
 }
 
+type pausePreferenceFake struct {
+	paused bool
+	err    error
+}
+
+func (preference *pausePreferenceFake) Load(string) (bool, error) {
+	return preference.paused, preference.err
+}
+func (preference *pausePreferenceFake) Save(_ string, paused bool) error {
+	if preference.err != nil {
+		return preference.err
+	}
+	preference.paused = paused
+	return nil
+}
+
 func (probe lockProbeFake) State(context.Context) (desktopexecutor.SessionLockState, error) {
 	return probe.state, probe.err
 }
@@ -329,7 +345,7 @@ func TestPrepareEnrollsAndConnectsBeforeFirstWorkspaceConfigExists(t *testing.T)
 	runtime := &runtimeFake{}
 	service := &installServiceFake{missing: true, localState: installation.LocalState{RelayPaused: true}}
 	connection := &gatewayFake{closed: make(chan struct{})}
-	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}}
+	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}}
 	options.NewLockMonitor = func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil }
 	options.NewGateway = func(_ desktopcontrol.Installation, _ string, _ desktopgateway.CommandHandler, _ desktopgateway.DiagnosticsProvider) (gateway, error) {
 		return connection, nil
@@ -357,6 +373,92 @@ func TestPrepareEnrollsAndConnectsBeforeFirstWorkspaceConfigExists(t *testing.T)
 	runtime.mu.Unlock()
 	if !closed {
 		t.Fatal("Close() did not stop the Cua runtime")
+	}
+}
+
+func TestPausePersistsAcrossRestartAndResumeRechecksUnlockedActiveInstall(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	runtime := &runtimeFake{}
+	service := &installServiceFake{missing: true, active: true}
+	var connection *gatewayFake
+	options := Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{},
+		PausePreference: preference,
+		NewLockMonitor:  func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			connection = &gatewayFake{closed: make(chan struct{})}
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Prepare(context.Background(), testOrigin, "ticket"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := controller.Pause(context.Background())
+	if err != nil || !state.RelayPaused || connection.Status().Readiness != string(apicontract.DesktopControlReadinessPaused) {
+		t.Fatalf("Pause() state=%#v err=%v readiness=%q", state, err, connection.Status().Readiness)
+	}
+	if paused, err := preference.Load(testOrigin); err != nil || !paused {
+		t.Fatalf("saved pause = %t, %v", paused, err)
+	}
+	if !controller.Close(context.Background()) {
+		t.Fatal("Close() failed")
+	}
+
+	restartedRuntime := &runtimeFake{}
+	restarted := options
+	restarted.Runtime = restartedRuntime
+	restarted.Installations = &installServiceFake{active: true}
+	restarted.NewGateway = nil
+	restartedController, err := New(restarted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restartedController.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	restartedRuntime.mu.Lock()
+	prepareCalls := restartedRuntime.prepareCalls
+	restartedRuntime.mu.Unlock()
+	if prepareCalls != 0 {
+		t.Fatalf("restart recovered a user-paused runtime %d times", prepareCalls)
+	}
+	if !restartedController.Close(context.Background()) {
+		t.Fatal("restarted controller Close() failed")
+	}
+
+	resumedRuntime := &runtimeFake{}
+	resumeOptions := options
+	resumeOptions.Runtime = resumedRuntime
+	resumeOptions.Installations = &installServiceFake{active: false}
+	resumeController, err := New(resumeOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resumeController.Resume(context.Background()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Resume() without active install = %v, want unavailable", err)
+	}
+	if !resumeController.Close(context.Background()) {
+		t.Fatal("inactive resume controller Close() failed")
+	}
+	resumeOptions.Installations = service
+	resumeController, err = New(resumeOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resumeController.Resume(context.Background()); err != nil {
+		t.Fatalf("Resume() = %v", err)
+	}
+	if !resumeController.Close(context.Background()) {
+		t.Fatal("resumed controller Close() failed")
+	}
+	if paused, err := preference.Load(testOrigin); err != nil || paused {
+		t.Fatalf("cleared pause = %t, %v", paused, err)
 	}
 }
 
@@ -408,7 +510,7 @@ func TestPrepareWaitsForGatewayHeartbeatAcknowledgement(t *testing.T) {
 		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
 	}}
 	connection := &gatewayFake{closed: make(chan struct{}), deferAck: true, readyWritten: make(chan struct{})}
-	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}}
+	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}}
 	options.NewLockMonitor = func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil }
 	options.NewGateway = func(_ desktopcontrol.Installation, _ string, _ desktopgateway.CommandHandler, _ desktopgateway.DiagnosticsProvider) (gateway, error) {
 		return connection, nil
@@ -452,7 +554,7 @@ func TestPrepareRejectsLockTransitionBeforeGatewayAcknowledgement(t *testing.T) 
 		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
 	}}
 	connection := &gatewayFake{closed: make(chan struct{}), deferAck: true, readyWritten: make(chan struct{})}
-	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}}
+	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}}
 	options.NewLockMonitor = func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil }
 	options.NewGateway = func(_ desktopcontrol.Installation, _ string, _ desktopgateway.CommandHandler, _ desktopgateway.DiagnosticsProvider) (gateway, error) {
 		return connection, nil
@@ -552,7 +654,7 @@ func TestGatewayDisconnectKeepsLeaseFencedBeforeReconnect(t *testing.T) {
 	runtime := &runtimeFake{}
 	service := &installServiceFake{}
 	localState := &blockingLocalOperations{started: make(chan struct{}), release: make(chan struct{})}
-	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: lifecycleBlockingLocalOperations{state: localState}}
+	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: lifecycleBlockingLocalOperations{state: localState}, PausePreference: &pausePreferenceFake{}}
 	options.NewLockMonitor = func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil }
 	controller, err := New(options)
 	if err != nil {
@@ -637,7 +739,7 @@ func TestResumeIdleRelayRestartsCuaAndLockMonitor(t *testing.T) {
 	service := &installServiceFake{}
 	var monitorMu sync.Mutex
 	monitorStarts := 0
-	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}}
+	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}}
 	options.NewLockMonitor = func(LockStateSink, time.Duration) (LockMonitor, error) {
 		monitorMu.Lock()
 		monitorStarts++
@@ -688,7 +790,7 @@ func TestStartupIdleInstallationReconnectsWhenMappingBecomesActive(t *testing.T)
 		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
 	}}
 	connection := &gatewayFake{closed: make(chan struct{})}
-	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, ReconnectEvery: 10 * time.Millisecond}
+	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}, ReconnectEvery: 10 * time.Millisecond}
 	options.NewLockMonitor = func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil }
 	options.NewGateway = func(_ desktopcontrol.Installation, _ string, _ desktopgateway.CommandHandler, _ desktopgateway.DiagnosticsProvider) (gateway, error) {
 		return connection, nil
@@ -734,7 +836,7 @@ func TestLockCleanupFailureStillReportsObservedLockState(t *testing.T) {
 	runtime := &runtimeFake{}
 	service := &installServiceFake{}
 	local := &retryCloseLocalOperations{}
-	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: local}
+	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: local, PausePreference: &pausePreferenceFake{}}
 	options.NewLockMonitor = func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil }
 	controller, err := New(options)
 	if err != nil {
@@ -772,7 +874,7 @@ const testOrigin = "https://my.personastack.ai"
 
 func newTestController(t *testing.T, runtime cuaRuntime, service *installServiceFake, probe lockProbe, newGateway gatewayFactory) *Controller {
 	t.Helper()
-	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: probe, Local: localOperationsFake{}}
+	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: probe, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}}
 	options.NewLockMonitor = func(sink LockStateSink, _ time.Duration) (LockMonitor, error) {
 		return lockMonitorFake{sink: sink}, nil
 	}

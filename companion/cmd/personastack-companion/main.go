@@ -42,10 +42,15 @@ func main() {
 	var controlRuntime *desktoplifecycle.Controller
 	if runtimeErr == nil {
 		if shellErr == nil {
-			controlRuntime, err = desktoplifecycle.New(desktoplifecycle.Options{
-				Origin: os.Args[1], Runtime: managedRuntime, Installations: service,
-				LockProbe: hyprlandlock.NewProbe(), Local: desktoplocal.New(shell),
-			})
+			pausePreference, preferenceErr := desktoplifecycle.NewFilePausePreference()
+			if preferenceErr != nil {
+				err = preferenceErr
+			} else {
+				controlRuntime, err = desktoplifecycle.New(desktoplifecycle.Options{
+					Origin: os.Args[1], Runtime: managedRuntime, Installations: service,
+					LockProbe: hyprlandlock.NewProbe(), Local: desktoplocal.New(shell), PausePreference: pausePreference,
+				})
+			}
 		}
 		if shellErr != nil || err != nil {
 			managedRuntime.Close()

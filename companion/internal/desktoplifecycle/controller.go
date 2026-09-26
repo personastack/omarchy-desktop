@@ -71,16 +71,24 @@ type LockMonitor interface {
 
 type lockMonitorFactory func(LockStateSink, time.Duration) (LockMonitor, error)
 
+// PausePreference keeps an explicit user pause separate from idle cleanup.
+// The preference contains no credentials and is scoped by app origin.
+type PausePreference interface {
+	Load(string) (bool, error)
+	Save(string, bool) error
+}
+
 type Options struct {
-	Origin         string
-	Runtime        cuaRuntime
-	Installations  installationService
-	LockProbe      lockProbe
-	Local          desktopexecutor.LocalOperations
-	NewGateway     gatewayFactory
-	NewLockMonitor lockMonitorFactory
-	PollInterval   time.Duration
-	ReconnectEvery time.Duration
+	Origin          string
+	Runtime         cuaRuntime
+	Installations   installationService
+	LockProbe       lockProbe
+	Local           desktopexecutor.LocalOperations
+	NewGateway      gatewayFactory
+	NewLockMonitor  lockMonitorFactory
+	PausePreference PausePreference
+	PollInterval    time.Duration
+	ReconnectEvery  time.Duration
 }
 
 type lockProbe interface {
@@ -88,15 +96,16 @@ type lockProbe interface {
 }
 
 type Controller struct {
-	origin         string
-	runtime        cuaRuntime
-	installations  installationService
-	probe          lockProbe
-	local          desktopexecutor.LocalOperations
-	newGateway     gatewayFactory
-	newLockMonitor lockMonitorFactory
-	pollInterval   time.Duration
-	reconnectEvery time.Duration
+	origin          string
+	runtime         cuaRuntime
+	installations   installationService
+	probe           lockProbe
+	local           desktopexecutor.LocalOperations
+	newGateway      gatewayFactory
+	newLockMonitor  lockMonitorFactory
+	pausePreference PausePreference
+	pollInterval    time.Duration
+	reconnectEvery  time.Duration
 
 	mu                      sync.Mutex
 	readinessMu             sync.Mutex
@@ -115,6 +124,7 @@ type Controller struct {
 	recoveryChecked         bool
 	closed                  bool
 	paused                  bool
+	userPaused              bool
 	closeComplete           bool
 	closeSuccess            bool
 }
@@ -138,6 +148,13 @@ func New(options Options) (*Controller, error) {
 	if options.NewGateway == nil {
 		options.NewGateway = defaultGatewayFactory
 	}
+	if options.PausePreference == nil {
+		return nil, ErrUnavailable
+	}
+	userPaused, err := options.PausePreference.Load(options.Origin)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	monitorFactory := options.NewLockMonitor
 	if monitorFactory == nil {
@@ -154,6 +171,7 @@ func New(options Options) (*Controller, error) {
 		origin: options.Origin, runtime: options.Runtime, installations: options.Installations,
 		probe: options.LockProbe, local: options.Local, newGateway: options.NewGateway,
 		newLockMonitor: monitorFactory, pollInterval: options.PollInterval, reconnectEvery: options.ReconnectEvery,
+		pausePreference: options.PausePreference, userPaused: userPaused,
 		prepareGate: make(chan struct{}, 1), connectGate: make(chan struct{}, 1),
 		closeGate: make(chan struct{}, 1), ctx: ctx, cancel: cancel, paused: true,
 		currentLock: desktopexecutor.SessionLockUnknown,
@@ -181,7 +199,11 @@ func (controller *Controller) Prepare(ctx context.Context, origin, ticket string
 		controller.mu.Unlock()
 		return installation.LocalState{}, ErrUnavailable
 	}
+	userPaused := controller.userPaused
 	controller.mu.Unlock()
+	if userPaused {
+		return installation.LocalState{}, ErrUnavailable
+	}
 	state, err := controller.probe.State(ctx)
 	if err != nil || state == desktopexecutor.SessionLockUnknown {
 		return installation.LocalState{}, ErrSession
@@ -272,6 +294,11 @@ func (controller *Controller) Recover(ctx context.Context) error {
 	}
 	controller.mu.Lock()
 	if controller.closed || controller.recoveryChecked || controller.executor != nil {
+		controller.mu.Unlock()
+		return nil
+	}
+	if controller.userPaused {
+		controller.recoveryChecked = true
 		controller.mu.Unlock()
 		return nil
 	}
@@ -411,8 +438,12 @@ func (controller *Controller) updateGatewayReadiness(connection gateway) {
 		return
 	}
 	lockState := controller.currentLock
+	userPaused := controller.userPaused
 	controller.mu.Unlock()
 	readiness := readinessFor(lockState, controller.runtime.State().Ready && controller.nativeExecutorReady())
+	if userPaused {
+		readiness = string(apicontract.DesktopControlReadinessPaused)
+	}
 	if connection.Status().Readiness != readiness {
 		_ = connection.SetReadiness(readiness)
 	}
@@ -434,6 +465,147 @@ func readinessFor(lockState desktopexecutor.SessionLockState, cuaReady bool) str
 
 func (controller *Controller) State(ctx context.Context) (installation.LocalState, error) {
 	return controller.LocalState(ctx, controller.origin)
+}
+
+// Pause fences local execution, reports paused readiness, and stops the Cua
+// runtime while retaining the enrolled installation for an explicit resume.
+func (controller *Controller) Pause(ctx context.Context) (installation.LocalState, error) {
+	if ctx == nil {
+		return installation.LocalState{}, ErrUnavailable
+	}
+	select {
+	case controller.prepareGate <- struct{}{}:
+		defer func() { <-controller.prepareGate }()
+	case <-ctx.Done():
+		return installation.LocalState{}, ctx.Err()
+	}
+	controller.mu.Lock()
+	if controller.closed {
+		controller.mu.Unlock()
+		return installation.LocalState{}, ErrUnavailable
+	}
+	if controller.userPaused {
+		controller.mu.Unlock()
+		return controller.State(ctx)
+	}
+	controller.mu.Unlock()
+	if err := controller.pausePreference.Save(controller.origin, true); err != nil {
+		return installation.LocalState{}, err
+	}
+	controller.mu.Lock()
+	controller.userPaused = true
+	controller.paused = true
+	stop := controller.monitorStop
+	controller.monitorStop = nil
+	connection := controller.connection
+	executor := controller.executor
+	controller.mu.Unlock()
+	if executor != nil {
+		_ = executor.SetSessionLockState(ctx, desktopexecutor.SessionLockUnknown)
+	}
+	if stop != nil {
+		stop()
+	}
+	controller.runtime.Stop()
+	if connection != nil {
+		controller.readinessMu.Lock()
+		readinessErr := connection.SetReadiness(string(apicontract.DesktopControlReadinessPaused))
+		controller.readinessMu.Unlock()
+		if readinessErr != nil {
+			return installation.LocalState{}, readinessErr
+		}
+	}
+	if err := controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessPaused); err != nil {
+		return installation.LocalState{}, err
+	}
+	return controller.State(ctx)
+}
+
+// Resume only restores execution from a saved user pause after confirming the
+// compositor session is unlocked and the API still recognizes the install.
+func (controller *Controller) Resume(ctx context.Context) (installation.LocalState, error) {
+	if ctx == nil {
+		return installation.LocalState{}, ErrUnavailable
+	}
+	select {
+	case controller.prepareGate <- struct{}{}:
+		defer func() { <-controller.prepareGate }()
+	case <-ctx.Done():
+		return installation.LocalState{}, ctx.Err()
+	}
+	controller.mu.Lock()
+	if controller.closed {
+		controller.mu.Unlock()
+		return installation.LocalState{}, ErrUnavailable
+	}
+	if !controller.userPaused {
+		controller.mu.Unlock()
+		return controller.State(ctx)
+	}
+	controller.mu.Unlock()
+	status, err := controller.installations.Status(ctx, controller.origin)
+	if err != nil || !status.RelayActive || !status.CredentialValid {
+		return installation.LocalState{}, ErrUnavailable
+	}
+	installed, err := controller.installations.StoredInstallation(ctx, controller.origin)
+	if err != nil {
+		return installation.LocalState{}, err
+	}
+	lockState, err := controller.probe.State(ctx)
+	if err != nil || lockState != desktopexecutor.SessionLockUnlocked {
+		if lockState == desktopexecutor.SessionLockUnknown || err != nil {
+			return installation.LocalState{}, ErrSession
+		}
+		return installation.LocalState{}, ErrLocked
+	}
+	if _, err := controller.runtime.Prepare(ctx); err != nil {
+		return installation.LocalState{}, err
+	}
+	if err := controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessReady); err != nil {
+		controller.runtime.Stop()
+		return installation.LocalState{}, err
+	}
+	if err := controller.startExecutorAndMonitor(ctx); err != nil {
+		controller.restoreUserPause(ctx)
+		return installation.LocalState{}, err
+	}
+	controller.mu.Lock()
+	controller.userPaused = false
+	controller.paused = false
+	controller.mu.Unlock()
+	if err := controller.reconcileGateway(ctx, installed); err != nil {
+		controller.restoreUserPause(ctx)
+		return installation.LocalState{}, err
+	}
+	if err := controller.pausePreference.Save(controller.origin, false); err != nil {
+		controller.restoreUserPause(ctx)
+		return installation.LocalState{}, err
+	}
+	return controller.State(ctx)
+}
+
+func (controller *Controller) restoreUserPause(ctx context.Context) {
+	controller.mu.Lock()
+	controller.userPaused = true
+	controller.paused = true
+	stop := controller.monitorStop
+	controller.monitorStop = nil
+	executor := controller.executor
+	connection := controller.connection
+	controller.mu.Unlock()
+	if executor != nil {
+		_ = executor.SetSessionLockState(ctx, desktopexecutor.SessionLockUnknown)
+	}
+	if stop != nil {
+		stop()
+	}
+	controller.runtime.Stop()
+	_ = controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessPaused)
+	if connection != nil {
+		controller.readinessMu.Lock()
+		_ = connection.SetReadiness(string(apicontract.DesktopControlReadinessPaused))
+		controller.readinessMu.Unlock()
+	}
 }
 
 func (controller *Controller) LocalState(ctx context.Context, origin string) (installation.LocalState, error) {
@@ -512,7 +684,11 @@ func (controller *Controller) resumeIdleRelay(ctx context.Context) error {
 		return ErrUnavailable
 	}
 	paused := controller.paused
+	userPaused := controller.userPaused
 	controller.mu.Unlock()
+	if userPaused {
+		return ErrUnavailable
+	}
 	if !paused {
 		return nil
 	}
@@ -637,7 +813,11 @@ func (controller *Controller) reconcileGateway(ctx context.Context, installed de
 func (controller *Controller) desiredReadiness() string {
 	controller.mu.Lock()
 	state := controller.currentLock
+	userPaused := controller.userPaused
 	controller.mu.Unlock()
+	if userPaused {
+		return string(apicontract.DesktopControlReadinessPaused)
+	}
 	return readinessFor(state, controller.runtime.State().Ready && controller.nativeExecutorReady())
 }
 

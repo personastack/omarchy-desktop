@@ -30,7 +30,7 @@ export type StackCommand =
   | Readonly<{ version: "1"; action: "open_persona_activity"; persona_id: string }>;
 
 export type DesktopControlCommand =
-  | Readonly<{ version: "1"; action: "sync" | "state"; scope: string }>
+  | Readonly<{ version: "1"; action: "sync" | "state" | "pause" | "resume"; scope: string }>
   | Readonly<{ version: "1"; action: "prepare"; scope: string; enrollment_ticket: string }>;
 
 export type LocalSessionCommand =
@@ -131,7 +131,8 @@ export function parseStackCommand(value: unknown): StackCommand | undefined {
 
 export function parseDesktopControlCommand(value: unknown): DesktopControlCommand | undefined {
   if (!isRecord(value) || value.version !== "1" || typeof value.action !== "string") return undefined;
-  if ((value.action === "sync" || value.action === "state") && hasExactKeys(value, ["version", "action", "scope"]) &&
+  if ((value.action === "sync" || value.action === "state" || value.action === "pause" || value.action === "resume") &&
+      hasExactKeys(value, ["version", "action", "scope"]) &&
       isBoundedUTF8Text(value.scope, 512) && value.scope.trim() === value.scope) {
     return { version: "1", action: value.action, scope: value.scope };
   }
