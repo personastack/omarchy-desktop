@@ -21,7 +21,10 @@ import (
 	"github.com/personastack/personastack-api/pkg/client/desktopcontrol"
 )
 
-const reconnectInterval = 5 * time.Second
+const (
+	reconnectInterval      = 5 * time.Second
+	resumeOperationTimeout = 11 * time.Minute
+)
 
 var (
 	ErrUnavailable = errors.New("desktop control lifecycle unavailable")
@@ -108,6 +111,7 @@ type Controller struct {
 	reconnectEvery  time.Duration
 
 	mu                      sync.Mutex
+	lockStateMu             sync.Mutex
 	readinessMu             sync.Mutex
 	prepareGate             chan struct{}
 	connectGate             chan struct{}
@@ -373,6 +377,8 @@ func (controller *Controller) startExecutorAndMonitor(ctx context.Context) error
 		_ = controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessLocked)
 		return ErrLocked
 	}
+	controller.lockStateMu.Lock()
+	defer controller.lockStateMu.Unlock()
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
 	if controller.closed {
@@ -411,13 +417,19 @@ func (sink lockSink) SetSessionLockState(ctx context.Context, state desktopexecu
 	if ctx == nil || ctx.Err() != nil {
 		return true
 	}
+	controller.lockStateMu.Lock()
+	defer controller.lockStateMu.Unlock()
 	controller.mu.Lock()
 	executor := controller.executor
+	closed := controller.closed
+	paused := controller.userPaused || controller.paused
 	controller.mu.Unlock()
-	if executor == nil {
-		return false
+	if closed || (paused && state == desktopexecutor.SessionLockUnlocked) {
+		return true
 	}
-	_ = executor.SetSessionLockState(ctx, state)
+	if executor != nil {
+		_ = executor.SetSessionLockState(ctx, state)
+	}
 	controller.mu.Lock()
 	controller.currentLock = state
 	connection := controller.connection
@@ -486,39 +498,40 @@ func (controller *Controller) Pause(ctx context.Context) (installation.LocalStat
 	}
 	if controller.userPaused {
 		controller.mu.Unlock()
-		return controller.State(ctx)
+		return controller.LifecycleState(ctx, controller.origin)
 	}
+	connection := controller.connection
 	controller.mu.Unlock()
+	installed, err := controller.installations.StoredInstallation(ctx, controller.origin)
+	if err != nil || installed.Validate(controller.origin) != nil {
+		return installation.LocalState{}, ErrUnavailable
+	}
 	if err := controller.pausePreference.Save(controller.origin, true); err != nil {
 		return installation.LocalState{}, err
 	}
+	controller.lockStateMu.Lock()
 	controller.mu.Lock()
 	controller.userPaused = true
 	controller.paused = true
 	stop := controller.monitorStop
 	controller.monitorStop = nil
-	connection := controller.connection
 	executor := controller.executor
 	controller.mu.Unlock()
 	if executor != nil {
-		_ = executor.SetSessionLockState(ctx, desktopexecutor.SessionLockUnknown)
+		_ = executor.SetSessionLockState(controller.ctx, desktopexecutor.SessionLockUnknown)
 	}
+	controller.lockStateMu.Unlock()
 	if stop != nil {
 		stop()
 	}
 	controller.runtime.Stop()
-	if connection != nil {
+	if connection != nil && connection.Status().Connected {
 		controller.readinessMu.Lock()
-		readinessErr := connection.SetReadiness(string(apicontract.DesktopControlReadinessPaused))
+		_ = connection.SetReadiness(string(apicontract.DesktopControlReadinessPaused))
 		controller.readinessMu.Unlock()
-		if readinessErr != nil {
-			return installation.LocalState{}, readinessErr
-		}
 	}
-	if err := controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessPaused); err != nil {
-		return installation.LocalState{}, err
-	}
-	return controller.State(ctx)
+	_ = controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessPaused)
+	return controller.LocalState(ctx, controller.origin)
 }
 
 // Resume only restores execution from a saved user pause after confirming the
@@ -527,6 +540,8 @@ func (controller *Controller) Resume(ctx context.Context) (installation.LocalSta
 	if ctx == nil {
 		return installation.LocalState{}, ErrUnavailable
 	}
+	ctx, cancel := context.WithTimeout(ctx, resumeOperationTimeout)
+	defer cancel()
 	select {
 	case controller.prepareGate <- struct{}{}:
 		defer func() { <-controller.prepareGate }()
@@ -540,7 +555,7 @@ func (controller *Controller) Resume(ctx context.Context) (installation.LocalSta
 	}
 	if !controller.userPaused {
 		controller.mu.Unlock()
-		return controller.State(ctx)
+		return controller.LifecycleState(ctx, controller.origin)
 	}
 	controller.mu.Unlock()
 	status, err := controller.installations.Status(ctx, controller.origin)
@@ -561,30 +576,92 @@ func (controller *Controller) Resume(ctx context.Context) (installation.LocalSta
 	if _, err := controller.runtime.Prepare(ctx); err != nil {
 		return installation.LocalState{}, err
 	}
-	if err := controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessReady); err != nil {
-		controller.runtime.Stop()
-		return installation.LocalState{}, err
-	}
 	if err := controller.startExecutorAndMonitor(ctx); err != nil {
 		controller.restoreUserPause(ctx)
 		return installation.LocalState{}, err
 	}
-	controller.mu.Lock()
-	controller.userPaused = false
-	controller.paused = false
-	controller.mu.Unlock()
 	if err := controller.reconcileGateway(ctx, installed); err != nil {
 		controller.restoreUserPause(ctx)
 		return installation.LocalState{}, err
 	}
-	if err := controller.pausePreference.Save(controller.origin, false); err != nil {
+	controller.mu.Lock()
+	connection := controller.connection
+	lockState = controller.currentLock
+	controller.mu.Unlock()
+	if connection == nil || !connection.Status().Connected {
+		controller.restoreUserPause(ctx)
+		return installation.LocalState{}, ErrUnavailable
+	}
+	baseline := connection.Status().ReadinessSequence
+	readiness := readinessFor(lockState, controller.runtime.State().Ready && controller.nativeExecutorReady())
+	if err := connection.SetReadiness(readiness); err != nil {
 		controller.restoreUserPause(ctx)
 		return installation.LocalState{}, err
 	}
-	return controller.State(ctx)
+	if err := controller.waitForAcknowledgedReadiness(ctx, connection, baseline, readiness, true); err != nil {
+		controller.restoreUserPause(ctx)
+		return installation.LocalState{}, err
+	}
+	if err := controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessReady); err != nil {
+		controller.restoreUserPause(ctx)
+		return installation.LocalState{}, err
+	}
+	state, err := controller.LocalState(ctx, controller.origin)
+	if err != nil || ctx.Err() != nil {
+		controller.restoreUserPause(ctx)
+		if err == nil {
+			err = ctx.Err()
+		}
+		return installation.LocalState{}, err
+	}
+	controller.lockStateMu.Lock()
+	confirmedLock, probeErr := controller.probe.State(ctx)
+	if probeErr != nil || confirmedLock != desktopexecutor.SessionLockUnlocked {
+		controller.lockStateMu.Unlock()
+		controller.restoreUserPause(ctx)
+		if probeErr != nil || confirmedLock == desktopexecutor.SessionLockUnknown {
+			return installation.LocalState{}, ErrSession
+		}
+		return installation.LocalState{}, ErrLocked
+	}
+	controller.mu.Lock()
+	executor := controller.executor
+	connection = controller.connection
+	closed := controller.closed
+	controller.mu.Unlock()
+	if closed || executor == nil || connection == nil || !connection.Status().Connected ||
+		connection.Status().Readiness != string(apicontract.DesktopControlReadinessReady) ||
+		!controller.runtime.State().Ready || !executor.NativeReady() {
+		controller.lockStateMu.Unlock()
+		controller.restoreUserPause(ctx)
+		return installation.LocalState{}, ErrUnavailable
+	}
+	if !executor.SetSessionLockState(ctx, desktopexecutor.SessionLockUnlocked) {
+		controller.lockStateMu.Unlock()
+		controller.restoreUserPause(ctx)
+		return installation.LocalState{}, ErrUnavailable
+	}
+	if err := controller.pausePreference.Save(controller.origin, false); err != nil {
+		controller.lockStateMu.Unlock()
+		controller.restoreUserPause(ctx)
+		return installation.LocalState{}, err
+	}
+	controller.mu.Lock()
+	controller.currentLock = confirmedLock
+	controller.userPaused = false
+	controller.paused = false
+	controller.mu.Unlock()
+	controller.lockStateMu.Unlock()
+	controller.startReconnectLoop(installed)
+	state.RelayActive = &status.RelayActive
+	state.RelayPaused = false
+	state.UserPaused = false
+	return state, nil
 }
 
 func (controller *Controller) restoreUserPause(ctx context.Context) {
+	_ = controller.pausePreference.Save(controller.origin, true)
+	controller.lockStateMu.Lock()
 	controller.mu.Lock()
 	controller.userPaused = true
 	controller.paused = true
@@ -594,8 +671,9 @@ func (controller *Controller) restoreUserPause(ctx context.Context) {
 	connection := controller.connection
 	controller.mu.Unlock()
 	if executor != nil {
-		_ = executor.SetSessionLockState(ctx, desktopexecutor.SessionLockUnknown)
+		_ = executor.SetSessionLockState(controller.ctx, desktopexecutor.SessionLockUnknown)
 	}
+	controller.lockStateMu.Unlock()
 	if stop != nil {
 		stop()
 	}
@@ -625,7 +703,20 @@ func (controller *Controller) LocalState(ctx context.Context, origin string) (in
 	state.GatewayConnected = connection != nil && connection.Status().Connected
 	controller.mu.Lock()
 	state.RelayPaused = controller.paused
+	state.UserPaused = controller.userPaused
 	controller.mu.Unlock()
+	return state, nil
+}
+
+func (controller *Controller) LifecycleState(ctx context.Context, origin string) (installation.LocalState, error) {
+	state, err := controller.LocalState(ctx, origin)
+	if err != nil {
+		return installation.LocalState{}, err
+	}
+	status, err := controller.installations.Status(ctx, origin)
+	if err == nil {
+		state.RelayActive = &status.RelayActive
+	}
 	return state, nil
 }
 
@@ -728,7 +819,13 @@ func (controller *Controller) stopIdleRelay() {
 	if err != nil || status.RelayActive {
 		return
 	}
+	controller.lockStateMu.Lock()
 	controller.mu.Lock()
+	if controller.closed || controller.setupMayRunUnconfigured {
+		controller.mu.Unlock()
+		controller.lockStateMu.Unlock()
+		return
+	}
 	connection := controller.connection
 	executor := controller.executor
 	stop := controller.monitorStop
@@ -747,6 +844,7 @@ func (controller *Controller) stopIdleRelay() {
 		stop()
 	}
 	controller.runtime.Stop()
+	controller.lockStateMu.Unlock()
 }
 
 func (controller *Controller) reconcileGateway(ctx context.Context, installed desktopcontrol.Installation) error {
@@ -767,17 +865,21 @@ func (controller *Controller) reconcileGateway(ctx context.Context, installed de
 		if !existing.Status().Connected {
 			return ErrUnavailable
 		}
-		baseline := existing.Status().LastHeartbeatAt
+		baseline := existing.Status().ReadinessSequence
 		if err := existing.SetReadiness(controller.desiredReadiness()); err != nil {
 			return err
 		}
-		return controller.waitForAcknowledgedReadiness(ctx, existing, baseline)
+		return controller.waitForAcknowledgedReadiness(ctx, existing, baseline, controller.desiredReadiness(), false)
 	}
 	handler := func(ctx context.Context, frame agentgatewayruntime.DesktopControlFrame, emit func(agentgatewayruntime.DesktopControlFrame) error) agentgatewayruntime.DesktopControlFrame {
+		controller.lockStateMu.Lock()
 		controller.mu.Lock()
 		executor := controller.executor
+		paused := controller.closed || controller.userPaused || controller.paused
+		lockState := controller.currentLock
 		controller.mu.Unlock()
-		if executor == nil {
+		controller.lockStateMu.Unlock()
+		if paused || lockState != desktopexecutor.SessionLockUnlocked || executor == nil {
 			return gatewayFailure(frame, "desktop_executor_unavailable")
 		}
 		return executor.Handle(ctx, frame, emit)
@@ -792,7 +894,7 @@ func (controller *Controller) reconcileGateway(ctx context.Context, installed de
 		connection.Close()
 		return err
 	}
-	baseline := connection.Status().LastHeartbeatAt
+	baseline := connection.Status().ReadinessSequence
 	controller.mu.Lock()
 	if controller.closed || controller.connection != nil {
 		controller.mu.Unlock()
@@ -802,7 +904,7 @@ func (controller *Controller) reconcileGateway(ctx context.Context, installed de
 	controller.connection = connection
 	controller.mu.Unlock()
 	controller.updateGatewayReadiness(connection)
-	if err := controller.waitForAcknowledgedReadiness(ctx, connection, baseline); err != nil {
+	if err := controller.waitForAcknowledgedReadiness(ctx, connection, baseline, controller.desiredReadiness(), false); err != nil {
 		go controller.watchGateway(connection)
 		return err
 	}
@@ -828,19 +930,39 @@ func (controller *Controller) nativeExecutorReady() bool {
 	return executor != nil && executor.NativeReady()
 }
 
-func (controller *Controller) waitForAcknowledgedReadiness(ctx context.Context, connection gateway, baseline time.Time) error {
+func (controller *Controller) waitForAcknowledgedReadiness(ctx context.Context, connection gateway, baseline uint64, expected string, resumeCandidate bool) error {
+	status := connection.Status()
+	if !status.Connected {
+		return ErrUnavailable
+	}
+	requiredSequence := status.ReadinessSequence
+	if requiredSequence <= baseline {
+		if baseline == ^uint64(0) {
+			return ErrUnavailable
+		}
+		requiredSequence = baseline + 1
+	}
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		readiness := controller.desiredReadiness()
-		if readiness != "ready" {
-			return lockReadinessError(readiness)
+		if resumeCandidate {
+			controller.mu.Lock()
+			lockState := controller.currentLock
+			controller.mu.Unlock()
+			if expected != string(apicontract.DesktopControlReadinessReady) || lockState != desktopexecutor.SessionLockUnlocked || !controller.runtime.State().Ready || !controller.nativeExecutorReady() {
+				return lockReadinessError(readinessFor(lockState, controller.runtime.State().Ready && controller.nativeExecutorReady()))
+			}
+		} else {
+			readiness := controller.desiredReadiness()
+			if readiness != expected {
+				return lockReadinessError(readiness)
+			}
 		}
 		status := connection.Status()
 		if !status.Connected {
 			return ErrUnavailable
 		}
-		if status.Readiness == readiness && status.LastHeartbeatAt.After(baseline) {
+		if status.Readiness == expected && status.ReadinessSequence >= requiredSequence && status.AcknowledgedHeartbeatSequence >= requiredSequence {
 			return nil
 		}
 		select {
@@ -863,6 +985,7 @@ func lockReadinessError(readiness string) error {
 }
 
 func (controller *Controller) abortPrepare() {
+	controller.lockStateMu.Lock()
 	controller.mu.Lock()
 	stop := controller.monitorStop
 	controller.monitorStop = nil
@@ -880,25 +1003,38 @@ func (controller *Controller) abortPrepare() {
 	if executor != nil {
 		_ = executor.SetSessionLockState(controller.ctx, desktopexecutor.SessionLockUnknown)
 	}
+	controller.lockStateMu.Unlock()
 	controller.runtime.Stop()
 }
 
 func (controller *Controller) watchGateway(connection gateway) {
 	_ = connection.Wait(controller.ctx)
 	connection.Close()
+	controller.lockStateMu.Lock()
 	controller.mu.Lock()
-	executor := controller.executor
+	current := controller.connection == connection
+	var executor *desktopexecutor.Executor
+	if current {
+		controller.currentLock = desktopexecutor.SessionLockUnknown
+		executor = controller.executor
+		if !controller.closed {
+			controller.paused = true
+		}
+	}
 	controller.mu.Unlock()
-	if executor != nil {
+	if current && executor != nil {
 		cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_ = executor.SetSessionLockState(cleanupContext, desktopexecutor.SessionLockUnknown)
 		cancel()
 	}
-	controller.mu.Lock()
-	if controller.connection == connection {
-		controller.connection = nil
+	if current {
+		controller.mu.Lock()
+		if controller.connection == connection {
+			controller.connection = nil
+		}
+		controller.mu.Unlock()
 	}
-	controller.mu.Unlock()
+	controller.lockStateMu.Unlock()
 }
 
 func (controller *Controller) Close(ctx context.Context) bool {

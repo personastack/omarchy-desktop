@@ -48,7 +48,9 @@ type LocalState struct {
 	CuaReady            bool    `json:"cua_ready"`
 	NativeExecutorReady bool    `json:"native_executor_ready"`
 	GatewayConnected    bool    `json:"gateway_connected"`
+	RelayActive         *bool   `json:"relay_active,omitempty"`
 	RelayPaused         bool    `json:"relay_paused"`
+	UserPaused          bool    `json:"user_paused"`
 }
 
 func New(api API, store Store) (*Service, error) {

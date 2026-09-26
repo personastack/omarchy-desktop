@@ -15,7 +15,7 @@ test("companion client correlates local state replies", async () => {
     fake.stdout.write(`${JSON.stringify({
       id: request.id,
       ok: true,
-      result: { installation_id: null, operating_system: "linux", cua_ready: false, native_executor_ready: false, gateway_connected: false, relay_paused: true },
+      result: { installation_id: null, operating_system: "linux", runtime_available: false, cua_ready: false, native_executor_ready: false, gateway_connected: false, relay_paused: true, user_paused: false },
     })}\n`);
   });
   const result = await client.request({ version: "1", action: "state", scope: "" });
@@ -23,10 +23,12 @@ test("companion client correlates local state replies", async () => {
     ok: true,
     installation_id: null,
     operating_system: "linux",
+    runtime_available: false,
     cua_ready: false,
     native_executor_ready: false,
     gateway_connected: false,
     relay_paused: true,
+    user_paused: false,
   });
   assert.equal(client.isOpen, true);
   await client.close();
@@ -52,18 +54,55 @@ test("companion client accepts typed pause and resume state replies", async () =
     fake.stdin.on("data", (chunk: Buffer) => {
       const request = JSON.parse(chunk.toString("utf8")) as { id: number; version: string; action: string; scope: string };
       assert.equal(request.action, action);
+      assert.equal(request.scope, "desktop:lifecycle");
       fake.stdout.write(`${JSON.stringify({
         id: request.id,
         ok: true,
-        result: { installation_id: null, operating_system: "linux", cua_ready: false, native_executor_ready: false, gateway_connected: false, relay_paused: action === "pause" },
+        result: { installation_id: null, operating_system: "linux", runtime_available: true, cua_ready: false, native_executor_ready: false, gateway_connected: false, relay_active: true, relay_paused: action === "pause", user_paused: action === "pause" },
       })}\n`);
     });
-    const result = await client.request({ version: "1", action, scope: "workspace:a" });
+    const result = await client.requestLifecycle(action);
     assert.equal(result.ok, true);
     if (result.ok && "relay_paused" in result) assert.equal(result.relay_paused, action === "pause");
     else assert.fail(`missing lifecycle state for ${action}`);
     await client.close();
   }
+});
+
+test("resume timeout leaves response and cleanup grace after the bounded companion operation", async () => {
+  const fake = createFakeChild();
+  const client = new CompanionClient(fake.child);
+  const originalSetTimeout = globalThis.setTimeout;
+  let resumeTimeout: number | undefined;
+  globalThis.setTimeout = ((callback: Parameters<typeof setTimeout>[0], delay?: number) => {
+    resumeTimeout = delay;
+    return originalSetTimeout(callback, 3_600_000);
+  }) as typeof globalThis.setTimeout;
+  try {
+    const pending = client.requestLifecycle("resume");
+    assert.equal(resumeTimeout, 13 * 60_000);
+    await client.close();
+    assert.deepEqual(await pending, { ok: false, error: "unavailable" });
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("tray lifecycle requests use the app-wide scope without workspace sync", async () => {
+  const fake = createFakeChild();
+  const client = new CompanionClient(fake.child);
+  fake.stdin.on("data", (chunk: Buffer) => {
+    const request = JSON.parse(chunk.toString("utf8")) as { id: number; version: string; action: string; scope: string };
+    assert.deepEqual(request, { id: 1, version: "1", action: "state", scope: "desktop:lifecycle" });
+    fake.stdout.write(`${JSON.stringify({
+      id: request.id,
+      ok: true,
+      result: { installation_id: null, operating_system: "linux", runtime_available: true, cua_ready: false, native_executor_ready: false, gateway_connected: false, relay_active: false, relay_paused: true, user_paused: false },
+    })}\n`);
+  });
+  const result = await client.requestLifecycle("state");
+  assert.equal(result.ok, true);
+  await client.close();
 });
 
 test("companion client transports local-session commands and validates typed replies", async () => {
@@ -133,7 +172,7 @@ test("prepare response includes a Linux platform and local readiness", async () 
     fake.stdout.write(`${JSON.stringify({
       id: request.id,
       ok: true,
-      result: { installation_id: "install_01", operating_system: "linux", runtime_available: true, cua_ready: true, native_executor_ready: false, gateway_connected: false, relay_paused: false },
+      result: { installation_id: "install_01", operating_system: "linux", runtime_available: true, cua_ready: true, native_executor_ready: false, gateway_connected: false, relay_active: true, relay_paused: false, user_paused: false },
     })}\n`);
   });
   const result = await client.request({ version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: "A".repeat(43) });
@@ -143,7 +182,9 @@ test("prepare response includes a Linux platform and local readiness", async () 
     cua_ready: true,
     native_executor_ready: false,
     gateway_connected: false,
+    relay_active: true,
     relay_paused: false,
+    user_paused: false,
     operating_system: "linux",
     runtime_available: true,
   });
@@ -154,7 +195,7 @@ test("prepare preserves a finite unavailable-runtime result", async () => {
   const fake = createFakeChild();
   const client = new CompanionClient(fake.child);
   const pending = client.request({ version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: "A".repeat(43) });
-  fake.stdout.write('{"id":1,"ok":true,"result":{"installation_id":null,"operating_system":"linux","runtime_available":false,"cua_ready":false,"native_executor_ready":false,"gateway_connected":false,"relay_paused":true}}\n');
+  fake.stdout.write('{"id":1,"ok":true,"result":{"installation_id":null,"operating_system":"linux","runtime_available":false,"cua_ready":false,"native_executor_ready":false,"gateway_connected":false,"relay_active":false,"relay_paused":true,"user_paused":false}}\n');
   assert.deepEqual(await pending, {
     ok: true,
     installation_id: null,
@@ -163,7 +204,9 @@ test("prepare preserves a finite unavailable-runtime result", async () => {
     cua_ready: false,
     native_executor_ready: false,
     gateway_connected: false,
+    relay_active: false,
     relay_paused: true,
+    user_paused: false,
   });
   assert.equal(client.isOpen, true);
   await client.close();

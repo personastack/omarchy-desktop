@@ -21,6 +21,7 @@ import (
 const MaxRequestBytes = 13 * 1024 * 1024
 const maxRequestID = 1<<53 - 1
 const maxScopeLength = 512
+const LifecycleScope = "desktop:lifecycle"
 
 var (
 	ErrInvalidRequest = errors.New("invalid desktop bridge request")
@@ -71,7 +72,9 @@ type Result struct {
 	CuaReady            bool    `json:"cua_ready"`
 	NativeExecutorReady bool    `json:"native_executor_ready"`
 	GatewayConnected    bool    `json:"gateway_connected"`
+	RelayActive         *bool   `json:"relay_active,omitempty"`
 	RelayPaused         bool    `json:"relay_paused"`
+	UserPaused          bool    `json:"user_paused"`
 }
 
 type Response struct {
@@ -96,7 +99,12 @@ type Processor struct {
 	synced         bool
 	generation     uint64
 	nextCommandID  uint64
-	commands       map[uint64]context.CancelFunc
+	commands       map[uint64]processorCommand
+}
+
+type processorCommand struct {
+	cancel    context.CancelFunc
+	lifecycle bool
 }
 
 type LocalSessionService interface {
@@ -106,6 +114,7 @@ type LocalSessionService interface {
 
 type ControlRuntime interface {
 	LocalState(context.Context, string) (installation.LocalState, error)
+	LifecycleState(context.Context, string) (installation.LocalState, error)
 	Prepare(context.Context, string, string) (installation.LocalState, error)
 	Pause(context.Context) (installation.LocalState, error)
 	Resume(context.Context) (installation.LocalState, error)
@@ -118,7 +127,7 @@ func New(service Service, origin string) (*Processor, error) {
 	if _, err := desktopcontrol.New(origin); err != nil {
 		return nil, ErrInvalidRequest
 	}
-	return &Processor{service: service, origin: origin, commands: make(map[uint64]context.CancelFunc)}, nil
+	return &Processor{service: service, origin: origin, commands: make(map[uint64]processorCommand)}, nil
 }
 
 func NewWithLocalSessions(service Service, localSessions LocalSessionService, origin string) (*Processor, error) {
@@ -164,16 +173,23 @@ func Parse(raw []byte) (Request, error) {
 		return Request{}, ErrInvalidRequest
 	}
 	switch request.Action {
-	case ActionSync, ActionState, ActionPause, ActionResume:
+	case ActionSync:
+		if len(fields) != 4 || hasField(fields, "enrollment_ticket") || request.Scope == LifecycleScope {
+			return Request{}, ErrInvalidRequest
+		}
+	case ActionState, ActionPause, ActionResume:
 		if len(fields) != 4 || hasField(fields, "enrollment_ticket") {
 			return Request{}, ErrInvalidRequest
 		}
+		if (request.Action == ActionPause || request.Action == ActionResume) && request.Scope != LifecycleScope {
+			return Request{}, ErrInvalidRequest
+		}
 	case ActionPrepare:
-		if len(fields) != 5 || request.Scope == "" || !hasField(fields, "enrollment_ticket") || !ticketPattern.MatchString(request.EnrollmentTicket) {
+		if len(fields) != 5 || request.Scope == "" || request.Scope == LifecycleScope || !hasField(fields, "enrollment_ticket") || !ticketPattern.MatchString(request.EnrollmentTicket) {
 			return Request{}, ErrInvalidRequest
 		}
 	case ActionLocalSession:
-		if len(fields) != 5 || request.Scope == "" || !hasField(fields, "local_session") || hasField(fields, "enrollment_ticket") {
+		if len(fields) != 5 || request.Scope == "" || request.Scope == LifecycleScope || !hasField(fields, "local_session") || hasField(fields, "enrollment_ticket") {
 			return Request{}, ErrInvalidRequest
 		}
 		command, err := localsession.Parse(request.LocalSession)
@@ -200,7 +216,17 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 		response.OK = true
 		return response
 	}
-	commandCtx, commandID, generation, ok := p.beginCommand(ctx, request.Scope)
+	lifecycleAction := request.Scope == LifecycleScope &&
+		(request.Action == ActionState || request.Action == ActionPause || request.Action == ActionResume)
+	var commandCtx context.Context
+	var commandID, generation uint64
+	var ok bool
+	if lifecycleAction {
+		commandCtx, commandID, generation = p.beginLifecycleCommand(ctx)
+		ok = true
+	} else {
+		commandCtx, commandID, generation, ok = p.beginCommand(ctx, request.Scope)
+	}
 	if !ok {
 		response.Error = ErrorInvalidRequest
 		return response
@@ -244,6 +270,8 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 	var state installation.LocalState
 	var err error
 	switch {
+	case lifecycleAction && request.Action == ActionState && p.controlRuntime != nil:
+		state, err = p.controlRuntime.LifecycleState(commandCtx, p.origin)
 	case request.Action == ActionPause && p.controlRuntime != nil:
 		state, err = p.controlRuntime.Pause(commandCtx)
 	case request.Action == ActionResume && p.controlRuntime != nil:
@@ -257,7 +285,7 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 	default:
 		state, err = p.service.LocalState(commandCtx, p.origin)
 	}
-	if !p.commandCurrent(request.Scope, generation) {
+	if !lifecycleAction && !p.commandCurrent(request.Scope, generation) {
 		response.Error = ErrorStaleRequest
 		return response
 	}
@@ -269,14 +297,21 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 	result := &Result{
 		InstallationID: state.InstallationID, CuaReady: state.CuaReady,
 		NativeExecutorReady: state.NativeExecutorReady, GatewayConnected: state.GatewayConnected,
-		RelayPaused: state.RelayPaused, OperatingSystem: "linux",
+		RelayActive: state.RelayActive, RelayPaused: state.RelayPaused, UserPaused: state.UserPaused, OperatingSystem: "linux",
 	}
-	if request.Action == ActionPrepare {
-		runtimeAvailable := p.controlRuntime != nil
-		result.RuntimeAvailable = &runtimeAvailable
-	}
+	runtimeAvailable := p.controlRuntime != nil
+	result.RuntimeAvailable = &runtimeAvailable
 	response.Result = result
 	return response
+}
+
+func (p *Processor) beginLifecycleCommand(parent context.Context) (context.Context, uint64, uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.nextCommandID++
+	ctx, cancel := context.WithCancel(parent)
+	p.commands[p.nextCommandID] = processorCommand{cancel: cancel, lifecycle: true}
+	return ctx, p.nextCommandID, p.generation
 }
 
 func (p *Processor) synchronize(scope string) {
@@ -290,8 +325,10 @@ func (p *Processor) synchronize(scope string) {
 	}
 	p.scope, p.synced = scope, true
 	p.generation++
-	for _, cancel := range p.commands {
-		cancel()
+	for _, command := range p.commands {
+		if !command.lifecycle {
+			command.cancel()
+		}
 	}
 }
 
@@ -303,17 +340,17 @@ func (p *Processor) beginCommand(parent context.Context, scope string) (context.
 	}
 	p.nextCommandID++
 	ctx, cancel := context.WithCancel(parent)
-	p.commands[p.nextCommandID] = cancel
+	p.commands[p.nextCommandID] = processorCommand{cancel: cancel}
 	return ctx, p.nextCommandID, p.generation, true
 }
 
 func (p *Processor) finishCommand(id uint64) {
 	p.mu.Lock()
-	cancel := p.commands[id]
+	command := p.commands[id]
 	delete(p.commands, id)
 	p.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	if command.cancel != nil {
+		command.cancel()
 	}
 }
 
@@ -326,8 +363,8 @@ func (p *Processor) commandCurrent(scope string, generation uint64) bool {
 func (p *Processor) CancelAll() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, cancel := range p.commands {
-		cancel()
+	for _, command := range p.commands {
+		command.cancel()
 	}
 }
 

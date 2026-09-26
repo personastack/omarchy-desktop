@@ -46,7 +46,7 @@ func TestConnectionConnectsAndDispatchesCommand(t *testing.T) {
 	if err := client.Connect(context.Background()); err != nil {
 		t.Fatalf("connect desktop gateway: %v", err)
 	}
-	t.Cleanup(client.Close)
+	t.Cleanup(func() { client.Close() })
 	if !client.Status().Connected {
 		t.Fatal("gateway connection status is not connected")
 	}
@@ -57,12 +57,99 @@ func TestConnectionConnectsAndDispatchesCommand(t *testing.T) {
 	if heartbeat.Type != agentgatewayruntime.DesktopControlFrameHeartbeat || heartbeat.Readiness != "ready" {
 		t.Fatalf("unexpected readiness heartbeat: %#v", heartbeat)
 	}
+	if sequence := client.Status().ReadinessSequence; sequence != 1 {
+		t.Fatalf("readiness heartbeat sequence = %d, want 1", sequence)
+	}
 	if err := socket.send(commandFrame(installation.InstallationID, "request-1", time.Now().Add(time.Minute))); err != nil {
 		t.Fatal("send gateway command")
 	}
 	response := readWrittenFrame(t, socket)
 	if response.RequestID != "request-1" || response.Type != agentgatewayruntime.DesktopControlFrameResult || string(response.Result) != `{"ok":true}` || !handled.Load() {
 		t.Fatalf("unexpected gateway response: %#v", response)
+	}
+}
+
+func TestHeartbeatCannotSendOldPauseAfterResumeReadiness(t *testing.T) {
+	t.Parallel()
+	installation := testInstallation()
+	socket := newFakeSocket(t, agentgatewayruntime.DesktopControlFrame{
+		Version: agentgatewayruntime.DesktopControlProtocolVersion, Type: agentgatewayruntime.DesktopControlFrameReady,
+		LastHeartbeat: time.Now().UTC(),
+	})
+	blockNextHeartbeat := atomic.Bool{}
+	heartbeatStarted := make(chan struct{})
+	releaseHeartbeat := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseHeartbeat) }) }
+	defer release()
+	client, err := New(installation, installation.EnvironmentOrigin, func(context.Context, agentgatewayruntime.DesktopControlFrame, func(agentgatewayruntime.DesktopControlFrame) error) agentgatewayruntime.DesktopControlFrame {
+		return agentgatewayruntime.DesktopControlFrame{}
+	}, Options{
+		Dial: socketDialer(socket, installation), HeartbeatInterval: 5 * time.Millisecond,
+		Now: func() time.Time {
+			if blockNextHeartbeat.CompareAndSwap(true, false) {
+				close(heartbeatStarted)
+				<-releaseHeartbeat
+			}
+			return time.Now()
+		},
+	})
+	if err != nil {
+		t.Fatal("create desktop gateway connection")
+	}
+	t.Cleanup(client.Close)
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect desktop gateway: %v", err)
+	}
+	if err := client.SetReadiness("paused"); err != nil {
+		t.Fatalf("pause Gateway: %v", err)
+	}
+	if frame := readWrittenFrame(t, socket); frame.Readiness != "paused" {
+		t.Fatalf("initial readiness frame = %q, want paused", frame.Readiness)
+	}
+	blockNextHeartbeat.Store(true)
+	select {
+	case <-heartbeatStarted:
+	case <-time.After(time.Second):
+		t.Fatal("periodic heartbeat did not reach the controlled write")
+	}
+	readyResult := make(chan error, 1)
+	go func() { readyResult <- client.SetReadiness("ready") }()
+	select {
+	case err := <-readyResult:
+		t.Fatalf("Resume readiness passed a paused heartbeat still in flight: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	release()
+	select {
+	case err := <-readyResult:
+		if err != nil {
+			t.Fatalf("set ready after heartbeat: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Resume readiness did not complete")
+	}
+	deadline := time.NewTimer(20 * time.Millisecond)
+	defer deadline.Stop()
+	sawReady := false
+	for {
+		select {
+		case message := <-socket.outgoing:
+			var frame agentgatewayruntime.DesktopControlFrame
+			if err := json.Unmarshal(message.raw, &frame); err != nil {
+				t.Fatal("decode readiness frame")
+			}
+			if frame.Readiness == "ready" {
+				sawReady = true
+			} else if frame.Readiness == "paused" && sawReady {
+				t.Fatal("stale paused heartbeat followed the ready frame")
+			}
+		case <-deadline.C:
+			if !sawReady {
+				t.Fatal("no ready heartbeat was written")
+			}
+			return
+		}
 	}
 }
 

@@ -86,8 +86,11 @@ test("Desktop Control bridge accepts only hosted lifecycle commands", () => {
   const ticket = "A".repeat(43);
   assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "sync", scope: "" }), { version: "1", action: "sync", scope: "" });
   assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "state", scope: "" }), { version: "1", action: "state", scope: "" });
-  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "pause", scope: "workspace:request" }), { version: "1", action: "pause", scope: "workspace:request" });
-  assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "resume", scope: "workspace:request" }), { version: "1", action: "resume", scope: "workspace:request" });
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "pause", scope: "workspace:request" }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "resume", scope: "workspace:request" }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "state", scope: "desktop:lifecycle" }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "sync", scope: "desktop:lifecycle" }), undefined);
+  assert.equal(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "desktop:lifecycle", enrollment_ticket: ticket }), undefined);
   assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: ticket }),
     { version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: ticket });
   assert.equal(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "x", enrollment_ticket: "short" }), undefined);

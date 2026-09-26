@@ -42,7 +42,25 @@ import {
   type ChatWindowCommand,
   type StackCommand,
 } from "./security.js";
-import { CompanionClient, type DesktopControlResult, type LocalSessionError, type LocalSessionResult } from "./companion-client.js";
+import {
+  CompanionClient,
+  type DesktopControlError,
+  type DesktopControlResult,
+  type LocalSessionError,
+  type LocalSessionResult,
+} from "./companion-client.js";
+import {
+  applyTrayActionResult,
+  applyTrayStateRead,
+  beginTrayControlAction,
+  beginTrayStateRead,
+  isCurrentTrayControlAction,
+  sameTrayControlSnapshot,
+  trayControlCanSetUp,
+  trayControlAction,
+  trayControlStatus,
+  type TrayControlSnapshot,
+} from "./tray-control.js";
 
 const APP_NAME = "PersonaStack";
 const APP_ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMiIgaGVpZ2h0PSIzMiIgdmlld0JveD0iMCAwIDMyIDMyIj48cmVjdCB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHJ4PSI4IiBmaWxsPSIjNzY1NUZGIi8+PHBhdGggZD0iTTEwIDguNWg4LjVhNS41IDUuNSAwIDAgMSAwIDExSDExdjQuNWwtNC01LjUgNC01LjVWMTMuNWg3LjVhMS41IDEuNSAwIDAgMCAwLTNIMTB6IiBmaWxsPSJ3aGl0ZSIvPjwvc3ZnPg==";
@@ -68,6 +86,11 @@ let companionShutdownComplete = false;
 let chatScope = "";
 let companionClient: CompanionClient | undefined;
 let launchAtLoginStatus: AutostartStatus | "unavailable" = "unavailable";
+let trayControlSnapshot: TrayControlSnapshot = {};
+let trayControlActionPending = false;
+let trayControlRefreshing = false;
+let trayControlRevision = 0;
+let trayControlRefreshTimer: NodeJS.Timeout | undefined;
 const launchInBackground = shouldStartInBackground(process.argv);
 
 app.setName(APP_NAME);
@@ -78,6 +101,10 @@ if (!app.requestSingleInstanceLock()) {
   app.on("second-instance", () => openMainWindow());
 
   app.on("before-quit", (event) => {
+    if (trayControlRefreshTimer) {
+      clearInterval(trayControlRefreshTimer);
+      trayControlRefreshTimer = undefined;
+    }
     if (companionClient && !companionShutdownComplete) {
       event.preventDefault();
       void companionClient.close().then(() => {
@@ -120,8 +147,9 @@ function createWindow(role: BridgeRole, options: Electron.BrowserWindowConstruct
   return window;
 }
 
-function openMainWindow(show = true): void {
+function openMainWindow(show = true, route?: string): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
+    if (route) void mainWindow.loadURL(new URL(route, appOriginURL()).href);
     if (show) {
       mainWindow.show();
       mainWindow.focus();
@@ -144,7 +172,7 @@ function openMainWindow(show = true): void {
       mainWindow?.hide();
     }
   });
-  void mainWindow.loadURL(appOriginURL().href);
+  void mainWindow.loadURL(route ? new URL(route, appOriginURL()).href : appOriginURL().href);
 }
 
 function configureWebContents(entry: RegisteredWindow): void {
@@ -528,6 +556,10 @@ function createTray(): void {
   tray.setToolTip(`${APP_NAME} is running`);
   updateTrayMenu();
   if (app.isPackaged) void refreshLaunchAtLoginStatus();
+  if (process.platform === "linux") {
+    void refreshTrayControlState();
+    trayControlRefreshTimer = setInterval(() => { void refreshTrayControlState(); }, 5_000);
+  }
   tray.on("click", () => openMainWindow());
 }
 
@@ -535,8 +567,25 @@ function updateTrayMenu(): void {
   if (!tray) return;
   const items: MenuItemConstructorOptions[] = [
     { label: "Open PersonaStack", click: () => openMainWindow() },
-    { type: "separator" },
   ];
+  if (process.platform === "linux") {
+    const visibleError = trayControlSnapshot.actionError ?? trayControlSnapshot.refreshError;
+    items.push({ label: trayControlStatus(trayControlSnapshot), enabled: false });
+    if (visibleError) items.push({ label: trayControlFailure(visibleError), enabled: false });
+    const action = trayControlAction(trayControlSnapshot);
+    if (action) {
+      items.push({
+        label: action === "resume" ? "Resume Remote Control" : "Pause Remote Control",
+        enabled: !trayControlActionPending,
+        click: () => { void runTrayLifecycleAction(action); },
+      });
+    } else if (trayControlCanSetUp(trayControlSnapshot)) {
+      items.push({ label: "Set Up Desktop Control", click: () => openMainWindow(true, "/user/desktop-control") });
+    }
+    items.push({ type: "separator" });
+  } else {
+    items.push({ type: "separator" });
+  }
   if (app.isPackaged) {
     items.push({
       label: launchAtLoginStatus === "conflict" ? "Launch at Login (manual entry found)" : "Launch at Login",
@@ -549,6 +598,76 @@ function updateTrayMenu(): void {
   }
   items.push({ label: "Quit PersonaStack", click: () => app.quit() });
   tray.setContextMenu(Menu.buildFromTemplate(items));
+}
+
+async function refreshTrayControlState(): Promise<void> {
+  if (trayControlRefreshing || trayControlActionPending || !tray || process.platform !== "linux") return;
+  trayControlRefreshing = true;
+  const revision = trayControlRevision;
+  const previous = trayControlSnapshot;
+  trayControlSnapshot = beginTrayStateRead(trayControlSnapshot);
+  try {
+    const client = getCompanionClient();
+    if (!client) {
+      if (revision === trayControlRevision) {
+        trayControlSnapshot = { ...trayControlSnapshot, stateFresh: false, refreshError: "unavailable" };
+      }
+      return;
+    }
+    const result = await client.requestLifecycle("state");
+    if (revision !== trayControlRevision) return;
+    trayControlSnapshot = applyTrayStateRead(trayControlSnapshot, result);
+  } catch {
+    if (revision === trayControlRevision) {
+      trayControlSnapshot = { ...trayControlSnapshot, stateFresh: false, refreshError: "unavailable" };
+    }
+  } finally {
+    trayControlRefreshing = false;
+    if (revision !== trayControlRevision) {
+      void refreshTrayControlState();
+    } else if (!sameTrayControlSnapshot(previous, trayControlSnapshot)) {
+      updateTrayMenu();
+    }
+  }
+}
+
+async function runTrayLifecycleAction(action: "pause" | "resume"): Promise<void> {
+  if (trayControlActionPending || !tray) return;
+  if (!isCurrentTrayControlAction(trayControlSnapshot, action)) {
+    trayControlSnapshot = { ...trayControlSnapshot, actionError: "unavailable" };
+    updateTrayMenu();
+    return;
+  }
+  trayControlRevision++;
+  trayControlActionPending = true;
+  trayControlSnapshot = beginTrayControlAction(trayControlSnapshot);
+  updateTrayMenu();
+  try {
+    const client = getCompanionClient();
+    if (!client) {
+      trayControlSnapshot = { ...trayControlSnapshot, actionError: "unavailable" };
+      return;
+    }
+    const result = await client.requestLifecycle(action);
+    trayControlSnapshot = applyTrayActionResult(trayControlSnapshot, result);
+  } catch {
+    trayControlSnapshot = { ...trayControlSnapshot, stateFresh: false, actionError: "unavailable" };
+  } finally {
+    trayControlActionPending = false;
+    updateTrayMenu();
+    void refreshTrayControlState();
+  }
+}
+
+function trayControlFailure(error: DesktopControlError): string {
+  switch (error) {
+    case "not_enrolled": return "Set up Desktop Control in PersonaStack.";
+    case "keyring_unavailable": return "Linux Secret Service is unavailable.";
+    case "session_locked": return "Unlock the Omarchy session, then resume remote control.";
+    case "session_state_unknown": return "The session lock state could not be checked.";
+    case "rejected": return "PersonaStack rejected the Desktop Control request.";
+    default: return "Desktop Control could not complete the request.";
+  }
 }
 
 async function refreshLaunchAtLoginStatus(): Promise<void> {

@@ -30,7 +30,7 @@ export type StackCommand =
   | Readonly<{ version: "1"; action: "open_persona_activity"; persona_id: string }>;
 
 export type DesktopControlCommand =
-  | Readonly<{ version: "1"; action: "sync" | "state" | "pause" | "resume"; scope: string }>
+  | Readonly<{ version: "1"; action: "sync" | "state"; scope: string }>
   | Readonly<{ version: "1"; action: "prepare"; scope: string; enrollment_ticket: string }>;
 
 export type LocalSessionCommand =
@@ -131,13 +131,14 @@ export function parseStackCommand(value: unknown): StackCommand | undefined {
 
 export function parseDesktopControlCommand(value: unknown): DesktopControlCommand | undefined {
   if (!isRecord(value) || value.version !== "1" || typeof value.action !== "string") return undefined;
-  if ((value.action === "sync" || value.action === "state" || value.action === "pause" || value.action === "resume") &&
-      hasExactKeys(value, ["version", "action", "scope"]) &&
-      isBoundedUTF8Text(value.scope, 512) && value.scope.trim() === value.scope) {
+  if ((value.action === "sync" || value.action === "state") && hasExactKeys(value, ["version", "action", "scope"]) &&
+      isBoundedUTF8Text(value.scope, 512) && value.scope.trim() === value.scope &&
+      value.scope !== "desktop:lifecycle") {
     return { version: "1", action: value.action, scope: value.scope };
   }
   if (value.action === "prepare" && hasExactKeys(value, ["version", "action", "scope", "enrollment_ticket"]) &&
       isBoundedUTF8Text(value.scope, 512) && value.scope !== "" && value.scope.trim() === value.scope &&
+      value.scope !== "desktop:lifecycle" &&
       typeof value.enrollment_ticket === "string" && /^[A-Za-z0-9_-]{43}$/.test(value.enrollment_ticket)) {
     return { version: "1", action: "prepare", scope: value.scope, enrollment_ticket: value.enrollment_ticket };
   }

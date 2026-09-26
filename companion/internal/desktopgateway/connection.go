@@ -65,9 +65,11 @@ type Options struct {
 }
 
 type Status struct {
-	Connected       bool
-	Readiness       string
-	LastHeartbeatAt time.Time
+	Connected                     bool
+	Readiness                     string
+	ReadinessSequence             uint64
+	AcknowledgedHeartbeatSequence uint64
+	LastHeartbeatAt               time.Time
 }
 
 type Connection struct {
@@ -80,22 +82,25 @@ type Connection struct {
 	diagnostics  DiagnosticsProvider
 	now          func() time.Time
 
-	mu                   sync.Mutex
-	writeMu              sync.Mutex
-	conn                 Socket
-	cancel               context.CancelFunc
-	connecting           bool
-	closing              bool
-	connectCancel        context.CancelFunc
-	connectingSocket     Socket
-	done                 chan struct{}
-	finishOnce           *sync.Once
-	generation           uint64
-	connected            bool
-	currentStatus        Status
-	lastError            error
-	diagnosticsSupported bool
-	activeCommands       map[string]context.CancelFunc
+	mu                     sync.Mutex
+	writeMu                sync.Mutex
+	readinessMu            sync.Mutex
+	conn                   Socket
+	cancel                 context.CancelFunc
+	connecting             bool
+	closing                bool
+	connectCancel          context.CancelFunc
+	connectingSocket       Socket
+	done                   chan struct{}
+	finishOnce             *sync.Once
+	generation             uint64
+	connected              bool
+	currentStatus          Status
+	heartbeatSequenceSent  uint64
+	heartbeatSequenceAcked uint64
+	lastError              error
+	diagnosticsSupported   bool
+	activeCommands         map[string]context.CancelFunc
 }
 
 func New(installation desktopcontrol.Installation, origin string, handler CommandHandler, options Options) (*Connection, error) {
@@ -294,6 +299,8 @@ func (c *Connection) SetReadiness(value string) error {
 	if !agentgatewayruntime.IsDesktopControlReadiness(value) {
 		return ErrInvalidFrame
 	}
+	c.readinessMu.Lock()
+	defer c.readinessMu.Unlock()
 	c.mu.Lock()
 	c.currentStatus.Readiness = value
 	generation := c.generation
@@ -302,7 +309,7 @@ func (c *Connection) SetReadiness(value string) error {
 	if !connected {
 		return nil
 	}
-	if err := c.write(generation, c.heartbeatFrame(value)); err != nil {
+	if err := c.writeReadiness(generation, value); err != nil {
 		c.finish(generation, err)
 		return err
 	}
@@ -426,18 +433,34 @@ func (c *Connection) heartbeatLoop(ctx context.Context, generation uint64) {
 			c.finish(generation, ctx.Err())
 			return
 		case <-ticker.C:
-			frame := c.heartbeatFrame(c.Status().Readiness)
-			if err := c.write(generation, frame); err != nil {
+			c.readinessMu.Lock()
+			c.mu.Lock()
+			readiness := c.currentStatus.Readiness
+			c.mu.Unlock()
+			if err := c.writeReadiness(generation, readiness); err != nil {
+				c.readinessMu.Unlock()
 				c.finish(generation, err)
 				return
 			}
-			c.mu.Lock()
-			if generation == c.generation && c.connected {
-				c.currentStatus.Readiness = frame.Readiness
-			}
-			c.mu.Unlock()
+			c.readinessMu.Unlock()
 		}
 	}
+}
+
+func (c *Connection) writeReadiness(generation uint64, readiness string) error {
+	frame := c.heartbeatFrame(readiness)
+	c.mu.Lock()
+	if generation != c.generation || !c.connected {
+		c.mu.Unlock()
+		return ErrConnectionEnded
+	}
+	c.heartbeatSequenceSent++
+	c.currentStatus.ReadinessSequence = c.heartbeatSequenceSent
+	c.mu.Unlock()
+	if err := c.write(generation, frame); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *Connection) admitCommand(ctx context.Context, generation uint64, frame agentgatewayruntime.DesktopControlFrame) error {
@@ -594,6 +617,10 @@ func (c *Connection) recordHeartbeat(generation uint64, at time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if generation == c.generation && c.connected {
+		if c.heartbeatSequenceAcked < c.heartbeatSequenceSent {
+			c.heartbeatSequenceAcked++
+			c.currentStatus.AcknowledgedHeartbeatSequence = c.heartbeatSequenceAcked
+		}
 		if at.IsZero() {
 			at = c.now().UTC()
 		}

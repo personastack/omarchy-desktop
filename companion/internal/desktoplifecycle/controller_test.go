@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -57,18 +58,23 @@ func (runtime *runtimeFake) Stop() {
 }
 
 type installServiceFake struct {
-	mu           sync.Mutex
-	installation desktopcontrol.Installation
-	missing      bool
-	active       bool
-	readiness    []apicontract.DesktopControlReadiness
-	attached     int
-	enrolled     int
-	prepared     int
-	claimed      []string
-	localState   installation.LocalState
-	record       chan string
-	claimReady   chan struct{}
+	mu                sync.Mutex
+	installation      desktopcontrol.Installation
+	missing           bool
+	active            bool
+	statusErr         error
+	statusDeadline    time.Time
+	localStateErr     error
+	localStateStarted chan struct{}
+	localStateRelease chan struct{}
+	readiness         []apicontract.DesktopControlReadiness
+	attached          int
+	enrolled          int
+	prepared          int
+	claimed           []string
+	localState        installation.LocalState
+	record            chan string
+	claimReady        chan struct{}
 }
 
 func (service *installServiceFake) StoredInstallation(context.Context, string) (desktopcontrol.Installation, error) {
@@ -89,8 +95,8 @@ func (service *installServiceFake) Enroll(_ context.Context, _ string, operating
 	service.enrolled++
 	service.missing = false
 	service.installation = desktopcontrol.Installation{
-		InstallationID: "install_01", MachineCredential: "secret", EnvironmentOrigin: testOrigin,
-		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
+		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
 	}
 	return nil
 }
@@ -109,9 +115,15 @@ func (service *installServiceFake) ReportReadiness(_ context.Context, _ string, 
 	return nil
 }
 
-func (service *installServiceFake) Status(context.Context, string) (installation.Status, error) {
+func (service *installServiceFake) Status(ctx context.Context, _ string) (installation.Status, error) {
 	service.mu.Lock()
 	defer service.mu.Unlock()
+	if deadline, ok := ctx.Deadline(); ok {
+		service.statusDeadline = deadline
+	}
+	if service.statusErr != nil {
+		return installation.Status{}, service.statusErr
+	}
 	return installation.Status{Enrolled: true, CredentialValid: true, RelayActive: service.active}, nil
 }
 
@@ -142,12 +154,26 @@ func (service *installServiceFake) ClaimSession(_ context.Context, _, sessionID 
 	return nil
 }
 
-func (service *installServiceFake) LocalState(context.Context, string) (installation.LocalState, error) {
+func (service *installServiceFake) LocalState(ctx context.Context, _ string) (installation.LocalState, error) {
 	service.mu.Lock()
-	defer service.mu.Unlock()
+	err := service.localStateErr
+	started := service.localStateStarted
+	release := service.localStateRelease
 	state := service.localState
 	if state.InstallationID == nil && service.installation.InstallationID != "" {
 		state.InstallationID = &service.installation.InstallationID
+	}
+	service.mu.Unlock()
+	if started != nil {
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return installation.LocalState{}, ctx.Err()
+		}
+	}
+	if err != nil {
+		return installation.LocalState{}, err
 	}
 	return state, nil
 }
@@ -155,6 +181,23 @@ func (service *installServiceFake) LocalState(context.Context, string) (installa
 type lockProbeFake struct {
 	state desktopexecutor.SessionLockState
 	err   error
+}
+
+type mutableLockProbe struct {
+	mu    sync.Mutex
+	state desktopexecutor.SessionLockState
+}
+
+func (probe *mutableLockProbe) State(context.Context) (desktopexecutor.SessionLockState, error) {
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	return probe.state, nil
+}
+
+func (probe *mutableLockProbe) Set(state desktopexecutor.SessionLockState) {
+	probe.mu.Lock()
+	probe.state = state
+	probe.mu.Unlock()
 }
 
 type pausePreferenceFake struct {
@@ -239,16 +282,20 @@ func (lockMonitorIdle) Run(ctx context.Context) error {
 }
 
 type gatewayFake struct {
-	mu            sync.Mutex
-	connected     bool
-	readiness     string
-	lastHeartbeat time.Time
-	deferAck      bool
-	readyWritten  chan struct{}
-	readyOnce     sync.Once
-	closed        chan struct{}
-	once          sync.Once
-	record        chan string
+	mu                   sync.Mutex
+	connected            bool
+	readiness            string
+	readinessSequence    uint64
+	acknowledgedSequence uint64
+	lastHeartbeat        time.Time
+	deferAck             bool
+	readyWritten         chan struct{}
+	readyOnce            sync.Once
+	onReadyOnce          sync.Once
+	onReadiness          func(string)
+	closed               chan struct{}
+	once                 sync.Once
+	record               chan string
 }
 
 func (connection *gatewayFake) Connect(context.Context) error {
@@ -276,22 +323,33 @@ func (connection *gatewayFake) ConnectWithLifetime(handshake, lifetime context.C
 func (connection *gatewayFake) Status() desktopgateway.Status {
 	connection.mu.Lock()
 	defer connection.mu.Unlock()
-	return desktopgateway.Status{Connected: connection.connected, Readiness: connection.readiness, LastHeartbeatAt: connection.lastHeartbeat}
+	return desktopgateway.Status{
+		Connected: connection.connected, Readiness: connection.readiness,
+		ReadinessSequence:             connection.readinessSequence,
+		AcknowledgedHeartbeatSequence: connection.acknowledgedSequence,
+		LastHeartbeatAt:               connection.lastHeartbeat,
+	}
 }
 func (connection *gatewayFake) SetReadiness(readiness string) error {
 	connection.mu.Lock()
 	connection.readiness = readiness
+	connection.readinessSequence++
 	if !connection.deferAck {
+		connection.acknowledgedSequence = connection.readinessSequence
 		connection.lastHeartbeat = time.Now()
 	}
 	connection.mu.Unlock()
 	if connection.readyWritten != nil {
 		connection.readyOnce.Do(func() { close(connection.readyWritten) })
 	}
+	if readiness == string(apicontract.DesktopControlReadinessReady) && connection.onReadiness != nil {
+		connection.onReadyOnce.Do(func() { connection.onReadiness(readiness) })
+	}
 	return nil
 }
 func (connection *gatewayFake) AcknowledgeReadiness() {
 	connection.mu.Lock()
+	connection.acknowledgedSequence = connection.readinessSequence
 	connection.lastHeartbeat = time.Now()
 	connection.mu.Unlock()
 }
@@ -400,7 +458,7 @@ func TestPausePersistsAcrossRestartAndResumeRechecksUnlockedActiveInstall(t *tes
 		t.Fatal(err)
 	}
 	state, err := controller.Pause(context.Background())
-	if err != nil || !state.RelayPaused || connection.Status().Readiness != string(apicontract.DesktopControlReadinessPaused) {
+	if err != nil || !state.RelayPaused || !state.UserPaused || connection.Status().Readiness != string(apicontract.DesktopControlReadinessPaused) {
 		t.Fatalf("Pause() state=%#v err=%v readiness=%q", state, err, connection.Status().Readiness)
 	}
 	if paused, err := preference.Load(testOrigin); err != nil || !paused {
@@ -447,12 +505,34 @@ func TestPausePersistsAcrossRestartAndResumeRechecksUnlockedActiveInstall(t *tes
 		t.Fatal("inactive resume controller Close() failed")
 	}
 	resumeOptions.Installations = service
+	resumeOptions.ReconnectEvery = 10 * time.Millisecond
+	resumedConnections := make(chan *gatewayFake, 4)
+	resumeOptions.NewGateway = func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+		connection := &gatewayFake{closed: make(chan struct{})}
+		resumedConnections <- connection
+		return connection, nil
+	}
 	resumeController, err = New(resumeOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := resumeController.Resume(context.Background()); err != nil {
 		t.Fatalf("Resume() = %v", err)
+	}
+	resumedConnection := <-resumedConnections
+	resumedConnection.Close()
+	select {
+	case <-resumedConnections:
+	case <-time.After(2 * time.Second):
+		resumeController.mu.Lock()
+		connected := resumeController.connection != nil && resumeController.connection.Status().Connected
+		reconnectStarted := resumeController.reconnectStarted
+		paused := resumeController.paused
+		resumeController.mu.Unlock()
+		service.mu.Lock()
+		active := service.active
+		service.mu.Unlock()
+		t.Fatalf("resumed controller did not reconnect after a Gateway disconnect (connected=%t reconnect=%t paused=%t active=%t)", connected, reconnectStarted, paused, active)
 	}
 	if !resumeController.Close(context.Background()) {
 		t.Fatal("resumed controller Close() failed")
@@ -462,15 +542,463 @@ func TestPausePersistsAcrossRestartAndResumeRechecksUnlockedActiveInstall(t *tes
 	}
 }
 
+func TestLockMonitorCannotUndoUserPause(t *testing.T) {
+	t.Parallel()
+	controller := newTestController(t, &runtimeFake{}, &installServiceFake{}, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, nil)
+	executor, err := desktopexecutor.NewWithLocalOperations(&runtimeFake{}, localOperationsFake{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.mu.Lock()
+	controller.executor = executor
+	controller.userPaused = true
+	controller.paused = true
+	controller.currentLock = desktopexecutor.SessionLockUnknown
+	controller.mu.Unlock()
+	if !(lockSink{controller: controller}).SetSessionLockState(context.Background(), desktopexecutor.SessionLockUnlocked) {
+		t.Fatal("lock monitor stopped after user pause")
+	}
+	if executor.NativeReady() {
+		t.Fatal("stale lock monitor callback reopened a user-paused executor")
+	}
+	controller.mu.Lock()
+	currentLock := controller.currentLock
+	controller.mu.Unlock()
+	if currentLock != desktopexecutor.SessionLockUnknown {
+		t.Fatalf("current lock state = %q, want unknown while paused", currentLock)
+	}
+	if !(lockSink{controller: controller}).SetSessionLockState(context.Background(), desktopexecutor.SessionLockLocked) {
+		t.Fatal("lock monitor stopped after locked callback during user pause")
+	}
+	controller.mu.Lock()
+	currentLock = controller.currentLock
+	controller.mu.Unlock()
+	if currentLock != desktopexecutor.SessionLockLocked || executor.NativeReady() {
+		t.Fatalf("locked callback during user pause left lock=%q native-ready=%t", currentLock, executor.NativeReady())
+	}
+	if !controller.Close(context.Background()) {
+		t.Fatal("controller Close() failed")
+	}
+}
+
+func TestLockMonitorCannotUndoPauseRestoredAfterResumeFailure(t *testing.T) {
+	t.Parallel()
+	controller := newTestController(t, &runtimeFake{}, &installServiceFake{}, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, nil)
+	executor, err := desktopexecutor.NewWithLocalOperations(&runtimeFake{}, localOperationsFake{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.mu.Lock()
+	controller.executor = executor
+	controller.userPaused = false
+	controller.paused = false
+	controller.mu.Unlock()
+	controller.restoreUserPause(context.Background())
+	if !(lockSink{controller: controller}).SetSessionLockState(context.Background(), desktopexecutor.SessionLockUnlocked) {
+		t.Fatal("lock monitor stopped after restoring the saved pause")
+	}
+	if executor.NativeReady() {
+		t.Fatal("stale lock monitor callback reopened an executor after Resume failed")
+	}
+	controller.mu.Lock()
+	userPaused := controller.userPaused
+	controller.mu.Unlock()
+	if !userPaused {
+		t.Fatal("failed Resume did not restore the saved pause")
+	}
+	if !controller.Close(context.Background()) {
+		t.Fatal("controller Close() failed")
+	}
+}
+
+func TestLockMonitorCannotUndoGatewayDisconnectFence(t *testing.T) {
+	t.Parallel()
+	controller := newTestController(t, &runtimeFake{}, &installServiceFake{active: true}, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, nil)
+	executor, err := desktopexecutor.NewWithLocalOperations(&runtimeFake{}, localOperationsFake{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !executor.SetSessionLockState(context.Background(), desktopexecutor.SessionLockUnlocked) {
+		t.Fatal("could not unlock test executor")
+	}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	if err := connection.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	controller.mu.Lock()
+	controller.executor = executor
+	controller.connection = connection
+	controller.currentLock = desktopexecutor.SessionLockUnlocked
+	controller.paused = false
+	controller.mu.Unlock()
+	connection.Close()
+	controller.watchGateway(connection)
+	if !(lockSink{controller: controller}).SetSessionLockState(context.Background(), desktopexecutor.SessionLockUnlocked) {
+		t.Fatal("lock monitor stopped after Gateway disconnect")
+	}
+	if executor.NativeReady() {
+		t.Fatal("lock monitor reopened execution after Gateway disconnect")
+	}
+	if !controller.Close(context.Background()) {
+		t.Fatal("controller Close() failed")
+	}
+}
+
+func TestLockMonitorCannotUndoIdleRelayFence(t *testing.T) {
+	t.Parallel()
+	controller := newTestController(t, &runtimeFake{}, &installServiceFake{active: false}, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, nil)
+	executor, err := desktopexecutor.NewWithLocalOperations(&runtimeFake{}, localOperationsFake{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !executor.SetSessionLockState(context.Background(), desktopexecutor.SessionLockUnlocked) {
+		t.Fatal("could not unlock test executor")
+	}
+	controller.mu.Lock()
+	controller.executor = executor
+	controller.currentLock = desktopexecutor.SessionLockUnlocked
+	controller.paused = false
+	controller.mu.Unlock()
+	controller.stopIdleRelay()
+	if !(lockSink{controller: controller}).SetSessionLockState(context.Background(), desktopexecutor.SessionLockUnlocked) {
+		t.Fatal("lock monitor stopped after idle relay cleanup")
+	}
+	if executor.NativeReady() {
+		t.Fatal("lock monitor reopened execution after idle cleanup")
+	}
+	if !controller.Close(context.Background()) {
+		t.Fatal("controller Close() failed")
+	}
+}
+
+func TestHostedLocalStateRemainsAvailableWhenAPIStatusIsUnavailable(t *testing.T) {
+	t.Parallel()
+	service := &installServiceFake{statusErr: errors.New("API unavailable"), localState: installation.LocalState{RelayPaused: true}}
+	controller := newTestController(t, &runtimeFake{}, service, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, nil)
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	state, err := controller.LocalState(context.Background(), testOrigin)
+	if err != nil || !state.RelayPaused {
+		t.Fatalf("hosted local state = %#v, %v", state, err)
+	}
+	state, err = controller.State(context.Background())
+	if err != nil || !state.RelayPaused || state.RelayActive != nil {
+		t.Fatalf("hosted controller state = %#v, %v", state, err)
+	}
+	state, err = controller.LifecycleState(context.Background(), testOrigin)
+	if err != nil || state.RelayActive != nil {
+		t.Fatalf("tray lifecycle state = %#v, %v, want local status and unknown relay activity", state, err)
+	}
+}
+
+func TestReadinessWaitRequiresTheMatchingSentHeartbeat(t *testing.T) {
+	t.Parallel()
+	runtime := &runtimeFake{}
+	controller := newTestController(t, runtime, &installServiceFake{}, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, nil)
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	executor, err := desktopexecutor.NewWithLocalOperations(runtime, localOperationsFake{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !executor.SetSessionLockState(context.Background(), desktopexecutor.SessionLockUnlocked) {
+		t.Fatal("could not unlock test executor")
+	}
+	controller.mu.Lock()
+	controller.executor = executor
+	controller.currentLock = desktopexecutor.SessionLockUnlocked
+	controller.mu.Unlock()
+	baseline := uint64(1)
+	connection := &gatewayFake{
+		connected: true, readiness: string(apicontract.DesktopControlReadinessReady),
+		readinessSequence: 2, acknowledgedSequence: 1, lastHeartbeat: time.Now(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	err = controller.waitForAcknowledgedReadiness(ctx, connection, baseline, string(apicontract.DesktopControlReadinessReady), false)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stale heartbeat acknowledgement = %v, want wait timeout", err)
+	}
+	connection.mu.Lock()
+	connection.acknowledgedSequence = 2
+	connection.lastHeartbeat = time.Now()
+	connection.mu.Unlock()
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := controller.waitForAcknowledgedReadiness(ctx, connection, baseline, string(apicontract.DesktopControlReadinessReady), false); err != nil {
+		t.Fatalf("matching readiness acknowledgement = %v", err)
+	}
+}
+
+func TestReadinessWaitUsesAFixedHeartbeatAcknowledgementTarget(t *testing.T) {
+	t.Parallel()
+	runtime := &runtimeFake{}
+	controller := newTestController(t, runtime, &installServiceFake{}, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, nil)
+	executor, err := desktopexecutor.NewWithLocalOperations(runtime, localOperationsFake{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !executor.SetSessionLockState(context.Background(), desktopexecutor.SessionLockUnlocked) {
+		t.Fatal("could not unlock test executor")
+	}
+	controller.mu.Lock()
+	controller.executor = executor
+	controller.currentLock = desktopexecutor.SessionLockUnlocked
+	controller.mu.Unlock()
+	connection := &advancingHeartbeatGateway{gatewayFake: &gatewayFake{
+		connected: true, readiness: string(apicontract.DesktopControlReadinessReady), readinessSequence: 2,
+		acknowledgedSequence: 1, lastHeartbeat: time.Now(),
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := controller.waitForAcknowledgedReadiness(ctx, connection, 1, string(apicontract.DesktopControlReadinessReady), false); err != nil {
+		t.Fatalf("fixed readiness acknowledgement target did not complete: %v", err)
+	}
+}
+
+func TestResumePassesABoundedOperationContextToDependencies(t *testing.T) {
+	t.Parallel()
+	service := &installServiceFake{}
+	controller := newTestController(t, &runtimeFake{}, service, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, nil)
+	controller.mu.Lock()
+	controller.userPaused = true
+	controller.mu.Unlock()
+	_, err := controller.Resume(context.Background())
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Resume() error = %v, want inactive relay rejection", err)
+	}
+	service.mu.Lock()
+	deadline := service.statusDeadline
+	service.mu.Unlock()
+	remaining := time.Until(deadline)
+	if remaining < resumeOperationTimeout-time.Second || remaining > resumeOperationTimeout {
+		t.Fatalf("Resume dependency deadline remaining = %s, want close to %s", remaining, resumeOperationTimeout)
+	}
+}
+
+type advancingHeartbeatGateway struct{ *gatewayFake }
+
+func (connection *advancingHeartbeatGateway) Status() desktopgateway.Status {
+	connection.gatewayFake.mu.Lock()
+	defer connection.gatewayFake.mu.Unlock()
+	connection.gatewayFake.readinessSequence++
+	connection.gatewayFake.acknowledgedSequence = connection.gatewayFake.readinessSequence - 1
+	return desktopgateway.Status{
+		Connected: connection.gatewayFake.connected, Readiness: connection.gatewayFake.readiness,
+		ReadinessSequence:             connection.gatewayFake.readinessSequence,
+		AcknowledgedHeartbeatSequence: connection.gatewayFake.acknowledgedSequence,
+		LastHeartbeatAt:               connection.gatewayFake.lastHeartbeat,
+	}
+}
+
+func TestPauseWorksWhenLocalRuntimeIsDegraded(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	runtime := &runtimeFake{}
+	service := &installServiceFake{active: true, installation: desktopcontrol.Installation{
+		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
+	}}
+	controller, err := New(Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: preference,
+		NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	state, err := controller.Pause(context.Background())
+	if err != nil || !state.UserPaused || !state.RelayPaused {
+		t.Fatalf("Pause() with degraded local runtime = %#v, %v", state, err)
+	}
+	if !preference.paused {
+		t.Fatal("Pause() did not persist user intent")
+	}
+	service.mu.Lock()
+	readiness := append([]apicontract.DesktopControlReadiness(nil), service.readiness...)
+	service.mu.Unlock()
+	if len(readiness) != 1 || readiness[0] != apicontract.DesktopControlReadinessPaused {
+		t.Fatalf("readiness reports = %v, want paused", readiness)
+	}
+}
+
+func TestPauseFencesLiveGatewayWhenAPIStatusIsUnavailable(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	service := &installServiceFake{statusErr: errors.New("API status unavailable"), installation: desktopcontrol.Installation{
+		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
+	}}
+	runtime := &runtimeFake{}
+	controller, err := New(Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: preference,
+		NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	executor, err := desktopexecutor.NewWithLocalOperations(runtime, localOperationsFake{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !executor.SetSessionLockState(context.Background(), desktopexecutor.SessionLockUnlocked) {
+		t.Fatal("could not unlock test executor")
+	}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	if err := connection.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	controller.mu.Lock()
+	controller.executor = executor
+	controller.connection = connection
+	controller.currentLock = desktopexecutor.SessionLockUnlocked
+	controller.paused = false
+	controller.mu.Unlock()
+	state, err := controller.Pause(context.Background())
+	if err != nil || !state.UserPaused || state.RelayActive != nil {
+		t.Fatalf("Pause() during API status outage = %#v, %v", state, err)
+	}
+	if !preference.paused || executor.NativeReady() {
+		t.Fatalf("local pause was not enforced: saved=%t native-ready=%t", preference.paused, executor.NativeReady())
+	}
+	if readiness := connection.Status().Readiness; readiness != string(apicontract.DesktopControlReadinessPaused) {
+		t.Fatalf("live Gateway readiness = %q, want paused", readiness)
+	}
+}
+
+func TestResumeRechecksLockBeforeOpeningCommandAdmission(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{paused: true}
+	service := &installServiceFake{active: true}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	options := Options{
+		Origin: testOrigin, Runtime: &runtimeFake{}, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{},
+		PausePreference: preference,
+		NewLockMonitor:  func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	connection.onReadiness = func(string) {
+		if !(lockSink{controller: controller}).SetSessionLockState(context.Background(), desktopexecutor.SessionLockLocked) {
+			t.Error("lock monitor stopped during resume")
+		}
+	}
+	if _, err := controller.Resume(context.Background()); !errors.Is(err, ErrLocked) {
+		t.Fatalf("Resume() after a lock transition = %v, want locked", err)
+	}
+	if !preference.paused {
+		t.Fatal("failed resume cleared the saved pause")
+	}
+	controller.mu.Lock()
+	userPaused, paused := controller.userPaused, controller.paused
+	controller.mu.Unlock()
+	if !userPaused || !paused {
+		t.Fatalf("failed resume opened command admission: userPaused=%t paused=%t", userPaused, paused)
+	}
+}
+
+func TestResumeKeepsPauseWhenFinalStateReadFails(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{paused: true}
+	service := &installServiceFake{active: true, localStateErr: errors.New("keyring read failed")}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	options := Options{
+		Origin: testOrigin, Runtime: &runtimeFake{}, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: preference,
+		NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Resume(context.Background()); err == nil {
+		t.Fatal("Resume() succeeded despite its final local state read failing")
+	}
+	if !preference.paused {
+		t.Fatal("failed Resume cleared the saved pause")
+	}
+	controller.mu.Lock()
+	userPaused, paused := controller.userPaused, controller.paused
+	executor := controller.executor
+	controller.mu.Unlock()
+	if !userPaused || !paused || executor == nil || executor.NativeReady() {
+		t.Fatalf("failed Resume opened command admission: userPaused=%t paused=%t executor=%v", userPaused, paused, executor)
+	}
+}
+
+func TestResumeDoesNotHoldLockFenceDuringSecretServiceRead(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{paused: true}
+	service := &installServiceFake{active: true, localStateStarted: make(chan struct{}), localStateRelease: make(chan struct{})}
+	probe := &mutableLockProbe{state: desktopexecutor.SessionLockUnlocked}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	options := Options{
+		Origin: testOrigin, Runtime: &runtimeFake{}, Installations: service,
+		LockProbe: probe, Local: localOperationsFake{}, PausePreference: preference,
+		NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	resumeResult := make(chan error, 1)
+	go func() {
+		_, err := controller.Resume(context.Background())
+		resumeResult <- err
+	}()
+	select {
+	case <-service.localStateStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Resume did not reach its local credential read")
+	}
+	probe.Set(desktopexecutor.SessionLockLocked)
+	lockApplied := make(chan struct{})
+	go func() {
+		(lockSink{controller: controller}).SetSessionLockState(context.Background(), desktopexecutor.SessionLockLocked)
+		close(lockApplied)
+	}()
+	select {
+	case <-lockApplied:
+	case <-time.After(time.Second):
+		close(service.localStateRelease)
+		t.Fatal("lock monitor was blocked by the local credential read")
+	}
+	close(service.localStateRelease)
+	if err := <-resumeResult; !errors.Is(err, ErrLocked) {
+		t.Fatalf("Resume() after lock during credential read = %v, want locked", err)
+	}
+	if !preference.paused {
+		t.Fatal("lock transition during credential read cleared the saved pause")
+	}
+}
+
 func TestPrepareConnectsThroughGatewayOwnedSessionLifecycle(t *testing.T) {
 	t.Parallel()
 	runtime := &runtimeFake{}
-	service := &installServiceFake{active: true, record: make(chan string, 4), claimReady: make(chan struct{}), installation: desktopcontrol.Installation{
+	service := &installServiceFake{active: true, statusErr: errors.New("API status unavailable"), record: make(chan string, 4), claimReady: make(chan struct{}), installation: desktopcontrol.Installation{
 		InstallationID: "install_01", MachineCredential: "secret", EnvironmentOrigin: testOrigin,
 		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
 	}}
 	connection := &gatewayFake{closed: make(chan struct{}), record: service.record}
-	controller := newTestController(t, runtime, service, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, func(_ desktopcontrol.Installation, _ string, _ desktopgateway.CommandHandler, _ desktopgateway.DiagnosticsProvider) (gateway, error) {
+	var handler desktopgateway.CommandHandler
+	controller := newTestController(t, runtime, service, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, func(_ desktopcontrol.Installation, _ string, commandHandler desktopgateway.CommandHandler, _ desktopgateway.DiagnosticsProvider) (gateway, error) {
+		handler = commandHandler
 		return connection, nil
 	})
 	state, err := controller.Prepare(context.Background(), testOrigin, "ticket")
@@ -483,6 +1011,20 @@ func TestPrepareConnectsThroughGatewayOwnedSessionLifecycle(t *testing.T) {
 	}
 	if !state.NativeExecutorReady || state.RelayPaused {
 		t.Fatalf("State() = %#v", state)
+	}
+	controller.mu.Lock()
+	controller.userPaused = true
+	controller.paused = true
+	controller.mu.Unlock()
+	frame := agentgatewayruntime.DesktopControlFrame{
+		Version: agentgatewayruntime.DesktopControlProtocolVersion,
+		Type:    agentgatewayruntime.DesktopControlFrameCommand, RequestID: "resume-pending",
+		Target:    &agentgatewayruntime.DesktopControlTarget{InstallationID: service.installation.InstallationID, WorkspaceID: "workspace_1", ConfigID: "config_1", PersonaID: "persona_1", RunID: "run_1", Generation: 1},
+		Operation: agentgatewayruntime.DesktopControlOperationStatus, Arguments: json.RawMessage(`{}`), DeadlineAt: time.Now().Add(time.Minute),
+	}
+	response := handler(context.Background(), frame, func(agentgatewayruntime.DesktopControlFrame) error { return nil })
+	if response.Type != agentgatewayruntime.DesktopControlFrameFailure || response.ErrorCode != "desktop_executor_unavailable" {
+		t.Fatalf("Gateway accepted work while lifecycle was paused: %#v", response)
 	}
 	service.mu.Lock()
 	prepared, claims := service.prepared, append([]string(nil), service.claimed...)
@@ -675,6 +1217,7 @@ func TestGatewayDisconnectKeepsLeaseFencedBeforeReconnect(t *testing.T) {
 	controller.mu.Lock()
 	controller.executor = executor
 	controller.connection = connection
+	controller.paused = false
 	controller.mu.Unlock()
 	go controller.watchGateway(connection)
 	connection.Close()
@@ -858,6 +1401,7 @@ func TestLockCleanupFailureStillReportsObservedLockState(t *testing.T) {
 	controller.executor = executor
 	controller.connection = connection
 	controller.currentLock = desktopexecutor.SessionLockUnlocked
+	controller.paused = false
 	controller.mu.Unlock()
 	if !(lockSink{controller: controller}).SetSessionLockState(context.Background(), desktopexecutor.SessionLockLocked) {
 		t.Fatal("monitor stopped after cleanup failure")

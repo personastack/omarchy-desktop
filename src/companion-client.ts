@@ -7,19 +7,27 @@ const MAX_REQUEST_BYTES = 13 * 1024 * 1024;
 const MAX_PENDING_REQUESTS = 8;
 const REQUEST_TIMEOUT_MS = 45_000;
 const DESKTOP_CONTROL_PREPARE_TIMEOUT_MS = 4 * 60_000;
+// The Go resume operation is bounded to eleven minutes; allow two minutes for
+// the typed response and companion shutdown to finish before closing the pipe.
+const DESKTOP_CONTROL_RESUME_TIMEOUT_MS = 13 * 60_000;
 const LOCAL_SESSION_TIMEOUT_MS = 4 * 60_000;
 const MAX_REQUEST_ID = Number.MAX_SAFE_INTEGER;
 
 export type DesktopControlState = Readonly<{
   installation_id: string | null;
   operating_system: "linux";
+  runtime_available: boolean;
   cua_ready: boolean;
   native_executor_ready: boolean;
   gateway_connected: boolean;
+  relay_active?: boolean;
   relay_paused: boolean;
+  user_paused: boolean;
 }>;
 
-type DesktopControlPrepared = DesktopControlState & Readonly<{ runtime_available: boolean }>;
+export type LifecycleAction = "state" | "pause" | "resume";
+
+type DesktopControlPrepared = DesktopControlState;
 
 export type DesktopControlError =
   | "invalid_request"
@@ -54,7 +62,7 @@ export type LocalSessionError =
   | "unavailable";
 
 type CompanionResult = DesktopControlResult | LocalSessionResult;
-type CompanionAction = DesktopControlCommand["action"] | "local_session";
+type CompanionAction = DesktopControlCommand["action"] | LifecycleAction | "local_session";
 
 type PendingRequest = Readonly<{
   action: CompanionAction;
@@ -88,6 +96,10 @@ export class CompanionClient {
     return this.send(command.action, command) as Promise<DesktopControlResult>;
   }
 
+  requestLifecycle(action: LifecycleAction): Promise<DesktopControlResult> {
+    return this.send(action, { version: "1", action, scope: "desktop:lifecycle" }) as Promise<DesktopControlResult>;
+  }
+
   requestLocalSession(command: LocalSessionCommand): Promise<LocalSessionResult> {
     return this.send("local_session", {
       version: "1",
@@ -116,7 +128,8 @@ export class CompanionClient {
     return new Promise((resolve) => {
       const timeoutMs = action === "prepare"
         ? DESKTOP_CONTROL_PREPARE_TIMEOUT_MS
-        : localAction === "prepare" || localAction === "configure" ? LOCAL_SESSION_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+        : action === "resume" ? DESKTOP_CONTROL_RESUME_TIMEOUT_MS
+          : localAction === "prepare" || localAction === "configure" ? LOCAL_SESSION_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
       const timeout = setTimeout(() => this.failAll(), timeoutMs);
       this.pending.set(id, { action, localAction, resolve, timeout });
       try {
@@ -206,7 +219,6 @@ function matchesCommandResponse(action: CompanionAction, localAction: LocalSessi
   if (!result.ok) return isError(result.error);
   if (action === "sync") return !hasLocalState(result);
   if (action === "prepare") return hasLocalState(result) && "runtime_available" in result && typeof result.runtime_available === "boolean";
-  if ("runtime_available" in result) return false;
   return hasLocalState(result);
 }
 
@@ -220,13 +232,12 @@ function parseResponse(value: unknown, action: CompanionAction): Readonly<{ id: 
     }
     if (hasExactKeys(value, ["id", "ok"])) return { id: Number(value.id), result: { ok: true } };
     if (!hasExactKeys(value, ["id", "ok", "result"]) || !isRecord(value.result)) return undefined;
-    if (hasExactKeys(value.result, ["installation_id", "operating_system", "cua_ready", "native_executor_ready", "gateway_connected", "relay_paused"]) &&
+    const hasRelayActivity = Object.hasOwn(value.result, "relay_active");
+    const fields = ["installation_id", "operating_system", "runtime_available", "cua_ready", "native_executor_ready", "gateway_connected", "relay_paused", "user_paused"];
+    const expectedFields = hasRelayActivity ? [...fields, "relay_active"] : fields;
+    if (hasExactKeys(value.result, expectedFields) &&
         isLocalState(value.result) && value.result.operating_system === "linux") {
       return { id: Number(value.id), result: { ok: true, ...value.result, operating_system: "linux" } };
-    }
-    if (hasExactKeys(value.result, ["installation_id", "operating_system", "runtime_available", "cua_ready", "native_executor_ready", "gateway_connected", "relay_paused"]) &&
-        isLocalState(value.result) && value.result.operating_system === "linux" && typeof value.result.runtime_available === "boolean") {
-      return { id: Number(value.id), result: { ok: true, ...value.result, operating_system: "linux", runtime_available: value.result.runtime_available } };
     }
     return undefined;
   }
@@ -255,8 +266,11 @@ function parseLocalSessionResult(value: unknown): LocalSessionResult | undefined
 
 function isLocalState(value: Record<string, unknown>): value is Record<string, unknown> & DesktopControlState {
   return (typeof value.installation_id === "string" || value.installation_id === null) && value.operating_system === "linux" &&
+    typeof value.runtime_available === "boolean" &&
     typeof value.cua_ready === "boolean" && typeof value.native_executor_ready === "boolean" &&
-    typeof value.gateway_connected === "boolean" && typeof value.relay_paused === "boolean";
+    typeof value.gateway_connected === "boolean" &&
+    (!Object.hasOwn(value, "relay_active") || typeof value.relay_active === "boolean") &&
+    typeof value.relay_paused === "boolean" && typeof value.user_paused === "boolean";
 }
 
 function hasLocalState(value: CompanionResult): value is Readonly<{ ok: true }> & (DesktopControlState | DesktopControlPrepared) {
