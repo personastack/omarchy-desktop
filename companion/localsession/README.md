@@ -1,0 +1,7 @@
+# Local session setup
+
+This package parses the finite hosted local-session command contract, probes the selected installed Codex or Claude Code CLI through the user's login shell, and implements the scope-bound state/select/prepare/configure manager. The probe checks the existing version and plugin marketplace help commands. Bundle validation uses the API client's producer-owned DTOs and enforces its origin-paired MCP endpoint, 365-day credential lifetime, byte limits, safe skill paths, and artifact digests before the installer is called.
+
+The manager persists only the selected harness in a private user config file. It issues one-use pending IDs bound to the current scope, persona, and harness for five minutes. The Linux file installer writes a PersonaStack-owned plugin source, installs it through the selected CLI's plugin manager, verifies ownership and cache readback, and hardens the credential-bearing plugin cache. The companion pipe protocol and Electron bridge now admit the hosted state/select/prepare/configure flow when the user's XDG directories are available. Hosted API behavior and real CLI compatibility remain unverified.
+
+CLI availability, bundle fakes, and a real Omarchy profile are separate evidence. The focused eric-pc tests establish parser, probe, bundle policy, pending request, preference file, and fake-CLI installer behavior only. They do not establish compatibility with current real CLI plugin managers, provider/MCP connectivity, or Omarchy acceptance.

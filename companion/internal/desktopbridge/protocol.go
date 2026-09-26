@@ -13,10 +13,11 @@ import (
 	"github.com/personastack/omarchy-desktop/companion/internal/credentialstore"
 	"github.com/personastack/omarchy-desktop/companion/internal/installation"
 	"github.com/personastack/omarchy-desktop/companion/internal/wirejson"
+	"github.com/personastack/omarchy-desktop/companion/localsession"
 	"github.com/personastack/personastack-api/pkg/client/desktopcontrol"
 )
 
-const MaxRequestBytes = 4 * 1024
+const MaxRequestBytes = 13 * 1024 * 1024
 const maxRequestID = 1<<53 - 1
 const maxScopeLength = 512
 
@@ -28,17 +29,19 @@ var (
 type Action string
 
 const (
-	ActionSync    Action = "sync"
-	ActionState   Action = "state"
-	ActionPrepare Action = "prepare"
+	ActionSync         Action = "sync"
+	ActionState        Action = "state"
+	ActionPrepare      Action = "prepare"
+	ActionLocalSession Action = "local_session"
 )
 
 type Request struct {
-	ID               uint64 `json:"id"`
-	Version          string `json:"version"`
-	Action           Action `json:"action"`
-	Scope            string `json:"scope"`
-	EnrollmentTicket string `json:"enrollment_ticket,omitempty"`
+	ID               uint64          `json:"id"`
+	Version          string          `json:"version"`
+	Action           Action          `json:"action"`
+	Scope            string          `json:"scope"`
+	EnrollmentTicket string          `json:"enrollment_ticket,omitempty"`
+	LocalSession     json.RawMessage `json:"local_session,omitempty"`
 }
 
 type ErrorCode string
@@ -49,6 +52,11 @@ const (
 	ErrorKeyringUnavailable ErrorCode = "keyring_unavailable"
 	ErrorRejected           ErrorCode = "rejected"
 	ErrorUnavailable        ErrorCode = "unavailable"
+	ErrorInvalidBundle      ErrorCode = "invalid_bundle"
+	ErrorStaleRequest       ErrorCode = "stale_request"
+	ErrorMissingHarness     ErrorCode = "missing_harness"
+	ErrorOutdatedHarness    ErrorCode = "outdated_harness"
+	ErrorUnsafeFiles        ErrorCode = "unsafe_files"
 )
 
 type Result struct {
@@ -62,10 +70,11 @@ type Result struct {
 }
 
 type Response struct {
-	ID     uint64    `json:"id"`
-	OK     bool      `json:"ok"`
-	Error  ErrorCode `json:"error,omitempty"`
-	Result *Result   `json:"result,omitempty"`
+	ID           uint64          `json:"id"`
+	OK           bool            `json:"ok"`
+	Error        ErrorCode       `json:"error,omitempty"`
+	Result       *Result         `json:"result,omitempty"`
+	LocalSession json.RawMessage `json:"local_session,omitempty"`
 }
 
 type Service interface {
@@ -73,10 +82,15 @@ type Service interface {
 }
 
 type Processor struct {
-	service Service
-	origin  string
-	scope   string
-	synced  bool
+	service       Service
+	localSessions LocalSessionService
+	origin        string
+	scope         string
+	synced        bool
+}
+
+type LocalSessionService interface {
+	Handle(context.Context, string, localsession.Command) (json.RawMessage, error)
 }
 
 func New(service Service, origin string) (*Processor, error) {
@@ -87,6 +101,15 @@ func New(service Service, origin string) (*Processor, error) {
 		return nil, ErrInvalidRequest
 	}
 	return &Processor{service: service, origin: origin}, nil
+}
+
+func NewWithLocalSessions(service Service, localSessions LocalSessionService, origin string) (*Processor, error) {
+	processor, err := New(service, origin)
+	if err != nil || localSessions == nil {
+		return nil, ErrInvalidRequest
+	}
+	processor.localSessions = localSessions
+	return processor, nil
 }
 
 func Parse(raw []byte) (Request, error) {
@@ -121,6 +144,14 @@ func Parse(raw []byte) (Request, error) {
 		if len(fields) != 5 || request.Scope == "" || !hasField(fields, "enrollment_ticket") || !ticketPattern.MatchString(request.EnrollmentTicket) {
 			return Request{}, ErrInvalidRequest
 		}
+	case ActionLocalSession:
+		if len(fields) != 5 || request.Scope == "" || !hasField(fields, "local_session") || hasField(fields, "enrollment_ticket") {
+			return Request{}, ErrInvalidRequest
+		}
+		command, err := localsession.Parse(request.LocalSession)
+		if err != nil || command.Scope != request.Scope {
+			return Request{}, ErrInvalidRequest
+		}
 	default:
 		return Request{}, ErrInvalidRequest
 	}
@@ -136,6 +167,25 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 	if request.Action == ActionSync {
 		p.scope, p.synced = request.Scope, true
 		response.OK = true
+		return response
+	}
+	if request.Action == ActionLocalSession {
+		if p.localSessions == nil {
+			response.Error = ErrorUnavailable
+			return response
+		}
+		command, err := localsession.Parse(request.LocalSession)
+		if err != nil || command.Scope != request.Scope {
+			response.Error = ErrorInvalidRequest
+			return response
+		}
+		result, err := p.localSessions.Handle(ctx, p.origin, command)
+		if err != nil {
+			response.Error = localSessionErrorCode(err)
+			return response
+		}
+		response.OK = true
+		response.LocalSession = result
 		return response
 	}
 	if !p.synced || p.scope != request.Scope {
@@ -179,6 +229,25 @@ func errorCode(err error) ErrorCode {
 		return ErrorKeyringUnavailable
 	case errors.Is(err, desktopcontrol.ErrRejected):
 		return ErrorRejected
+	default:
+		return ErrorUnavailable
+	}
+}
+
+func localSessionErrorCode(err error) ErrorCode {
+	switch {
+	case errors.Is(err, localsession.ErrInvalidRequest):
+		return ErrorInvalidRequest
+	case errors.Is(err, localsession.ErrInvalidBundle):
+		return ErrorInvalidBundle
+	case errors.Is(err, localsession.ErrStaleRequest):
+		return ErrorStaleRequest
+	case errors.Is(err, localsession.ErrMissingHarness):
+		return ErrorMissingHarness
+	case errors.Is(err, localsession.ErrOutdatedHarness):
+		return ErrorOutdatedHarness
+	case errors.Is(err, localsession.ErrUnsafeFiles):
+		return ErrorUnsafeFiles
 	default:
 		return ErrorUnavailable
 	}

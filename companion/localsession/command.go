@@ -32,6 +32,8 @@ const (
 
 var ErrInvalidRequest = errors.New("invalid local session request")
 var ErrInvalidBundle = errors.New("invalid local session bundle")
+var ErrUnsafeFiles = errors.New("PersonaStack cannot safely install local session files")
+var ErrUnavailable = errors.New("local session setup is unavailable")
 
 // Command is the finite native local-session message accepted from the hosted UI.
 // Bundle remains raw until its authority-owned typed contract validates it.

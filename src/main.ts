@@ -30,6 +30,7 @@ import {
   parseChatMainCommand,
   parseChatWindowCommand,
   parseDesktopControlCommand,
+  parseLocalSessionCommand,
   parseStackCommand,
   resolveAppURL,
   unwrapBridgePayload,
@@ -38,7 +39,7 @@ import {
   type ChatWindowCommand,
   type StackCommand,
 } from "./security.js";
-import { CompanionClient, type DesktopControlResult } from "./companion-client.js";
+import { CompanionClient, type DesktopControlResult, type LocalSessionError, type LocalSessionResult } from "./companion-client.js";
 
 const APP_NAME = "PersonaStack";
 const APP_ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMiIgaGVpZ2h0PSIzMiIgdmlld0JveD0iMCAwIDMyIDMyIj48cmVjdCB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHJ4PSI4IiBmaWxsPSIjNzY1NUZGIi8+PHBhdGggZD0iTTEwIDguNWg4LjVhNS41IDUuNSAwIDAgMSAwIDExSDExdjQuNWwtNC01LjUgNC01LjVWMTMuNWg3LjVhMS41IDEuNSAwIDAgMCAwLTNIMTB6IiBmaWxsPSJ3aGl0ZSIvPjwvc3ZnPg==";
@@ -256,6 +257,21 @@ function registerBridgeHandlers(): void {
     return result;
   });
 
+  ipcMain.handle("personastack:local-session", async (event, payload: unknown): Promise<LocalSessionResult> => {
+    const envelope = unwrapBridgePayload(payload);
+    const entry = envelope && bridgeGeneration(event, envelope.generation, ["main"]);
+    const command = envelope && parseLocalSessionCommand(envelope.payload);
+    if (!entry || !command) throw new Error(localSessionFailure("invalid_request"));
+    const client = getCompanionClient();
+    if (!client) throw new Error(localSessionFailure("unavailable"));
+    const result = await client.requestLocalSession(command);
+    if (!result.ok) throw new Error(localSessionFailure(result.error));
+    if (windows.get(event.sender.id) !== entry || bridgeGeneration(event, envelope.generation, ["main"]) !== entry) {
+      throw new Error(localSessionFailure("stale_request"));
+    }
+    return result;
+  });
+
   ipcMain.handle("personastack:open-external", async (event, rawURL: unknown) => {
     const envelope = unwrapBridgePayload(rawURL);
     if (!envelope || !bridgeGeneration(event, envelope.generation) || !isSafeExternalURL(envelope.payload) ||
@@ -283,6 +299,18 @@ function getCompanionClient(): CompanionClient | undefined {
     return client;
   } catch {
     return undefined;
+  }
+}
+
+function localSessionFailure(error: LocalSessionError): string {
+  switch (error) {
+    case "invalid_request": return "The local session request is invalid.";
+    case "invalid_bundle": return "The local session bundle is invalid. Try again.";
+    case "stale_request": return "The page changed. Start the local session again.";
+    case "missing_harness": return "Install the selected CLI, then try again.";
+    case "outdated_harness": return "Update the selected CLI, then try again.";
+    case "unsafe_files": return "PersonaStack cannot safely install the local session files.";
+    case "unavailable": return "The local harness could not be configured. Try again.";
   }
 }
 

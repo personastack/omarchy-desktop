@@ -32,6 +32,12 @@ export type DesktopControlCommand =
   | Readonly<{ version: "1"; action: "sync" | "state"; scope: string }>
   | Readonly<{ version: "1"; action: "prepare"; scope: string; enrollment_ticket: string }>;
 
+export type LocalSessionCommand =
+  | Readonly<{ version: "1"; action: "state"; scope: string }>
+  | Readonly<{ version: "1"; action: "select_harness"; scope: string; harness: "codex" | "claude_code" }>
+  | Readonly<{ version: "1"; action: "prepare"; scope: string; persona_id: string; harness: "codex" | "claude_code" }>
+  | Readonly<{ version: "1"; action: "configure"; scope: string; pending_id: string; bundle: Readonly<Record<string, unknown>> }>;
+
 export function resolveAppURL(args: readonly string[], packagedDefault?: string): URL {
   const switchIndex = args.indexOf(APP_URL_SWITCH);
   const override = switchIndex >= 0 ? args[switchIndex + 1] : undefined;
@@ -132,6 +138,27 @@ export function parseDesktopControlCommand(value: unknown): DesktopControlComman
   return undefined;
 }
 
+export function parseLocalSessionCommand(value: unknown): LocalSessionCommand | undefined {
+  if (!isRecord(value) || value.version !== "1" || typeof value.action !== "string" ||
+      !isBoundedUTF8Text(value.scope, 512) || value.scope.trim() !== value.scope) return undefined;
+  if (value.action === "state" && hasExactKeys(value, ["version", "action", "scope"])) {
+    return { version: "1", action: "state", scope: value.scope };
+  }
+  if (value.action === "select_harness" && hasExactKeys(value, ["version", "action", "scope", "harness"]) && isHarness(value.harness) && value.scope !== "") {
+    return { version: "1", action: "select_harness", scope: value.scope, harness: value.harness };
+  }
+  if (value.action === "prepare" && hasExactKeys(value, ["version", "action", "scope", "persona_id", "harness"]) &&
+      isHarness(value.harness) && value.scope !== "" && isValidID(value.persona_id)) {
+    return { version: "1", action: "prepare", scope: value.scope, persona_id: value.persona_id, harness: value.harness };
+  }
+  if (value.action === "configure" && hasExactKeys(value, ["version", "action", "scope", "pending_id", "bundle"]) &&
+      value.scope !== "" && typeof value.pending_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.pending_id) &&
+      isRecord(value.bundle) && hasBoundedJSONSize(value.bundle, 12 * 1024 * 1024)) {
+    return { version: "1", action: "configure", scope: value.scope, pending_id: value.pending_id, bundle: value.bundle };
+  }
+  return undefined;
+}
+
 export function isNewConcernEvent(value: unknown): boolean {
   return isRecord(value) && hasExactKeys(value, ["version", "event"]) && value.version === "1" && value.event === "created";
 }
@@ -176,4 +203,16 @@ function isValidID(value: unknown): value is string {
 
 function isBoundedNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 10_000;
+}
+
+function isHarness(value: unknown): value is "codex" | "claude_code" {
+  return value === "codex" || value === "claude_code";
+}
+
+function hasBoundedJSONSize(value: object, maxBytes: number): boolean {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength <= maxBytes;
+  } catch {
+    return false;
+  }
 }

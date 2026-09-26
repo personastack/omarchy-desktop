@@ -11,6 +11,7 @@ import (
 	"github.com/personastack/omarchy-desktop/companion/internal/credentialstore"
 	"github.com/personastack/omarchy-desktop/companion/internal/desktopbridge"
 	"github.com/personastack/omarchy-desktop/companion/internal/installation"
+	"github.com/personastack/omarchy-desktop/companion/localsession"
 	"github.com/personastack/personastack-api/pkg/client/desktopcontrol"
 )
 
@@ -26,7 +27,20 @@ func main() {
 	if err != nil {
 		os.Exit(2)
 	}
-	processor, err := desktopbridge.New(service, os.Args[1])
+	probe := localsession.NewProbe()
+	installer, installerErr := localsession.DefaultFileInstaller()
+	preferences, preferencesErr := localsession.NewFilePreferences()
+	var processor *desktopbridge.Processor
+	if installerErr == nil && preferencesErr == nil {
+		manager, managerErr := localsession.NewManager(probe, installer, preferences)
+		if managerErr == nil {
+			processor, err = desktopbridge.NewWithLocalSessions(service, manager, os.Args[1])
+		} else {
+			processor, err = desktopbridge.New(service, os.Args[1])
+		}
+	} else {
+		processor, err = desktopbridge.New(service, os.Args[1])
+	}
 	if err != nil {
 		os.Exit(2)
 	}
@@ -40,7 +54,7 @@ func serve(input io.Reader, output io.Writer, processor *desktopbridge.Processor
 		return errors.New("desktop bridge unavailable")
 	}
 	scanner := bufio.NewScanner(input)
-	scanner.Buffer(make([]byte, desktopbridge.MaxRequestBytes), desktopbridge.MaxRequestBytes)
+	scanner.Buffer(make([]byte, 64*1024), desktopbridge.MaxRequestBytes)
 	writer := bufio.NewWriter(output)
 	for scanner.Scan() {
 		request, err := desktopbridge.Parse(scanner.Bytes())

@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/personastack/omarchy-desktop/companion/internal/credentialstore"
 	"github.com/personastack/omarchy-desktop/companion/internal/installation"
+	"github.com/personastack/omarchy-desktop/companion/localsession"
 	"github.com/personastack/personastack-api/pkg/client/desktopcontrol"
 )
 
@@ -28,10 +30,28 @@ func TestParseAcceptsHostedDesktopControlCommands(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got, err := Parse([]byte(tc.raw))
-			if err != nil || got != tc.want {
+			if err != nil || !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("Parse() = %#v, %v, want %#v", got, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestParseAcceptsOnlyScopedLocalSessionCommands(t *testing.T) {
+	t.Parallel()
+	raw := `{"id":4,"version":"1","action":"local_session","scope":"workspace:a","local_session":{"version":"1","action":"state","scope":"workspace:a"}}`
+	request, err := Parse([]byte(raw))
+	if err != nil || request.Action != ActionLocalSession || string(request.LocalSession) != `{"version":"1","action":"state","scope":"workspace:a"}` {
+		t.Fatalf("Parse() local session = %#v, %v", request, err)
+	}
+	for _, input := range []string{
+		`{"id":4,"version":"1","action":"local_session","scope":"workspace:a","local_session":{"version":"1","action":"state","scope":"workspace:b"}}`,
+		`{"id":4,"version":"1","action":"local_session","scope":"workspace:a","local_session":{"version":"1","action":"state","scope":"workspace:a","extra":true}}`,
+		`{"id":4,"version":"1","action":"local_session","scope":"workspace:a","local_session":{"version":"1","action":"configure","scope":"workspace:a","pending_id":"x","bundle":{}}}`,
+	} {
+		if _, err := Parse([]byte(input)); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("Parse() accepted invalid local session command %s: %v", input, err)
+		}
 	}
 }
 
@@ -146,6 +166,43 @@ func TestProcessorMapsLocalStateErrorsToFiniteCodes(t *testing.T) {
 	}
 }
 
+func TestProcessorRoutesLocalSessionThroughItsOwnScopeContract(t *testing.T) {
+	t.Parallel()
+	local := &localSessionStub{result: json.RawMessage(`{"ok":true,"version":"2"}`)}
+	processor, err := NewWithLocalSessions(&serviceStub{}, local, "https://my.personastack.ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := localsession.Parse([]byte(`{"version":"1","action":"state","scope":"workspace:a"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := Request{ID: 1, Version: "1", Action: ActionLocalSession, Scope: "workspace:a", LocalSession: json.RawMessage(`{"version":"1","action":"state","scope":"workspace:a"}`)}
+	result := processor.Handle(context.Background(), request)
+	if !result.OK || string(result.LocalSession) != string(local.result) || local.calls != 1 || local.origin != "https://my.personastack.ai" || local.command.Action != command.Action {
+		t.Fatalf("local-session result = %#v, calls = %d, origin = %q", result, local.calls, local.origin)
+	}
+	request.Scope = "workspace:b"
+	denied := processor.Handle(context.Background(), request)
+	if denied.OK || denied.Error != ErrorInvalidRequest || local.calls != 1 {
+		t.Fatalf("wrong-scope local-session result = %#v, calls = %d", denied, local.calls)
+	}
+}
+
+func TestProcessorMapsLocalSessionErrorsToFiniteCodes(t *testing.T) {
+	t.Parallel()
+	local := &localSessionStub{err: localsession.ErrMissingHarness}
+	processor, err := NewWithLocalSessions(&serviceStub{}, local, "https://my.personastack.ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor.Handle(context.Background(), Request{ID: 1, Version: "1", Action: ActionSync, Scope: "workspace:a"})
+	result := processor.Handle(context.Background(), Request{ID: 2, Version: "1", Action: ActionLocalSession, Scope: "workspace:a", LocalSession: json.RawMessage(`{"version":"1","action":"state","scope":"workspace:a"}`)})
+	if result.OK || result.Error != ErrorMissingHarness || local.calls != 1 {
+		t.Fatalf("local error result = %#v, calls = %d", result, local.calls)
+	}
+}
+
 func TestNewRestrictsAppOrigin(t *testing.T) {
 	t.Parallel()
 	if _, err := New(&serviceStub{}, "https://attacker.example"); !errors.Is(err, ErrInvalidRequest) {
@@ -164,6 +221,21 @@ type serviceStub struct {
 	origin string
 	state  installation.LocalState
 	err    error
+}
+
+type localSessionStub struct {
+	calls   int
+	origin  string
+	command localsession.Command
+	result  json.RawMessage
+	err     error
+}
+
+func (s *localSessionStub) Handle(_ context.Context, origin string, command localsession.Command) (json.RawMessage, error) {
+	s.calls++
+	s.origin = origin
+	s.command = command
+	return s.result, s.err
 }
 
 func (s *serviceStub) LocalState(_ context.Context, origin string) (installation.LocalState, error) {

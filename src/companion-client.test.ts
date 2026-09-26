@@ -45,6 +45,34 @@ test("companion client accepts the sync acknowledgment shape", async () => {
   client.close();
 });
 
+test("companion client transports local-session commands and validates typed replies", async () => {
+  const fake = createFakeChild();
+  const client = new CompanionClient(fake.child);
+  fake.stdin.on("data", (chunk: Buffer) => {
+    const request = JSON.parse(chunk.toString("utf8")) as { id: number; action: string; scope: string; local_session: object };
+    assert.deepEqual(request, {
+      id: 1,
+      version: "1",
+      action: "local_session",
+      scope: "scope-a",
+      local_session: { version: "1", action: "state", scope: "scope-a" },
+    });
+    fake.stdout.write(`${JSON.stringify({ id: request.id, ok: true, local_session: { ok: true, version: "2", harness: "codex" } })}\n`);
+  });
+  const result = await client.requestLocalSession({ version: "1", action: "state", scope: "scope-a" });
+  assert.deepEqual(result, { ok: true, version: "2", harness: "codex" });
+  client.close();
+});
+
+test("companion client preserves finite local-session failure codes", async () => {
+  const fake = createFakeChild();
+  const client = new CompanionClient(fake.child);
+  const pending = client.requestLocalSession({ version: "1", action: "prepare", scope: "scope-a", persona_id: "persona_1", harness: "codex" });
+  fake.stdout.write('{"id":1,"ok":false,"error":"missing_harness"}\n');
+  assert.deepEqual(await pending, { ok: false, error: "missing_harness" });
+  client.close();
+});
+
 test("companion client rejects credential-bearing or malformed replies", async () => {
   const fake = createFakeChild();
   const client = new CompanionClient(fake.child);

@@ -12,6 +12,7 @@ import {
   isTrustedAppURL,
   isCurrentBridgeGeneration,
   parseDesktopControlCommand,
+  parseLocalSessionCommand,
   parseChatMainCommand,
   parseChatWindowCommand,
   parseStackCommand,
@@ -86,6 +87,26 @@ test("Desktop Control bridge accepts only hosted sync, state, and prepare comman
   assert.equal(parseDesktopControlCommand({ version: "1", action: "sync", scope: "é".repeat(300) }), undefined);
   assert.equal(parseDesktopControlCommand({ version: "1", action: "status" }), undefined);
   assert.equal(parseDesktopControlCommand({ version: "1", action: "prepare", scope: "", enrollment_ticket: ticket, extra: true }), undefined);
+});
+
+test("local-session bridge admits bounded versioned commands only", () => {
+  assert.deepEqual(parseLocalSessionCommand({ version: "1", action: "state", scope: "" }), {
+    version: "1", action: "state", scope: "",
+  });
+  assert.deepEqual(parseLocalSessionCommand({ version: "1", action: "select_harness", scope: "scope-a", harness: "codex" }), {
+    version: "1", action: "select_harness", scope: "scope-a", harness: "codex",
+  });
+  assert.deepEqual(parseLocalSessionCommand({ version: "1", action: "prepare", scope: "scope-a", persona_id: "persona_1", harness: "claude_code" }), {
+    version: "1", action: "prepare", scope: "scope-a", persona_id: "persona_1", harness: "claude_code",
+  });
+  assert.equal(parseLocalSessionCommand({ version: "1", action: "prepare", scope: "scope-a", persona_id: "../x", harness: "codex" }), undefined);
+  assert.equal(parseLocalSessionCommand({ version: "1", action: "select_harness", scope: "scope-a", harness: "other" }), undefined);
+  assert.equal(parseLocalSessionCommand({ version: "1", action: "state", scope: "scope-a", extra: true }), undefined);
+  assert.deepEqual(parseLocalSessionCommand({ version: "1", action: "configure", scope: "scope-a", pending_id: "c725451f-2d11-4e46-adfd-e92f2fc84c01", bundle: { bounded: true } }), {
+    version: "1", action: "configure", scope: "scope-a", pending_id: "c725451f-2d11-4e46-adfd-e92f2fc84c01", bundle: { bounded: true },
+  });
+  assert.equal(parseLocalSessionCommand({ version: "1", action: "configure", scope: "scope-a", pending_id: "bad", bundle: {} }), undefined);
+  assert.equal(parseLocalSessionCommand({ version: "1", action: "state", scope: "é".repeat(257) }), undefined);
 });
 
 test("concern notification accepts only the generic new-concern event", () => {
