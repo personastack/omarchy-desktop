@@ -13,8 +13,11 @@ test("built sandbox preload is one CommonJS file and installs the finite bridge"
   const invoked: Array<readonly [string, unknown]> = [];
   const listeners = new Map<string, (event: ClickEvent) => void>();
   class Anchor {
-    readonly href = "https://external.example/docs";
-    readonly protocol = "https:";
+    readonly protocol: string;
+
+    constructor(readonly href = "https://external.example/docs", readonly target = "") {
+      this.protocol = new URL(href).protocol;
+    }
   }
   interface ClickEvent {
     readonly isTrusted: boolean;
@@ -58,4 +61,43 @@ test("built sandbox preload is one CommonJS file and installs the finite bridge"
   assert.equal(invoked.length, 1);
   assert.equal(invoked[0]?.[0], "personastack:open-external");
   assert.equal(JSON.stringify(invoked[0]?.[1]), JSON.stringify({ generation: 7, payload: "https://external.example/docs" }));
+
+  let internalDefaultPrevented = false;
+  click({
+    isTrusted: true,
+    composedPath: () => [new Anchor("https://my.personastack.ai/privacy", "_blank")],
+    preventDefault: () => { internalDefaultPrevented = true; },
+  });
+  assert.equal(internalDefaultPrevented, true);
+  assert.equal(invoked[1]?.[0], "personastack:open-new-context");
+  assert.equal(JSON.stringify(invoked[1]?.[1]), JSON.stringify({ generation: 7, payload: "https://my.personastack.ai/privacy" }));
+
+  let internalInAppPrevented = false;
+  click({
+    isTrusted: true,
+    composedPath: () => [new Anchor("https://my.personastack.ai/user/personas", "_self")],
+    preventDefault: () => { internalInAppPrevented = true; },
+  });
+  assert.equal(internalInAppPrevented, false);
+  assert.equal(invoked.length, 2);
+
+  let mailtoPrevented = false;
+  click({
+    isTrusted: true,
+    composedPath: () => [new Anchor("mailto:support@personastack.ai", "_blank")],
+    preventDefault: () => { mailtoPrevented = true; },
+  });
+  assert.equal(mailtoPrevented, true);
+  assert.equal(invoked[2]?.[0], "personastack:open-new-context");
+  assert.equal(JSON.stringify(invoked[2]?.[1]), JSON.stringify({ generation: 7, payload: "mailto:support@personastack.ai" }));
+
+  let mailtoDefaultPrevented = false;
+  click({
+    isTrusted: true,
+    composedPath: () => [new Anchor("mailto:support@personastack.ai")],
+    preventDefault: () => { mailtoDefaultPrevented = true; },
+  });
+  assert.equal(mailtoDefaultPrevented, true);
+  assert.equal(invoked[3]?.[0], "personastack:open-new-context");
+  assert.equal(JSON.stringify(invoked[3]?.[1]), JSON.stringify({ generation: 7, payload: "mailto:support@personastack.ai" }));
 });

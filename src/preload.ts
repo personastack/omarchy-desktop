@@ -32,10 +32,15 @@ contextBridge.exposeInMainWorld("personastackDesktopPlatform", process.platform)
 document.addEventListener("click", (event) => {
   if (!event.isTrusted) return;
   const anchor = event.composedPath().find((target): target is HTMLAnchorElement => target instanceof HTMLAnchorElement);
-  if (!anchor || anchor.href === "" || shouldKeepPersonaStackLinkInApp(anchor.href, configuredAppURL)) return;
-  if (anchor.protocol !== "http:" && anchor.protocol !== "https:") return;
+  if (!anchor || anchor.href === "") return;
+  const opensNewContext = anchor.target.toLowerCase() === "_blank";
+  const isMailtoLink = anchor.protocol === "mailto:";
+  if (!opensNewContext && shouldKeepPersonaStackLinkInApp(anchor.href, configuredAppURL)) return;
+  if (!isMailtoLink && anchor.protocol !== "http:" && anchor.protocol !== "https:") return;
   event.preventDefault();
-  const channel = generation >= 0 ? "personastack:open-external" : "personastack:open-user-external";
+  const channel = generation < 0
+    ? "personastack:open-user-external"
+    : opensNewContext || isMailtoLink ? "personastack:open-new-context" : "personastack:open-external";
   const payload = generation >= 0 ? { generation, payload: anchor.href } : anchor.href;
   void ipcRenderer.invoke(channel, payload);
 }, true);

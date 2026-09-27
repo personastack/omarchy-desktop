@@ -51,6 +51,7 @@ import {
   isAllowedUserExternalLink,
   isGoogleOAuthURL,
   isSafeExternalURL,
+  isSafeNewContextURL,
   isTrustedAppURL,
   isCurrentBridgeGeneration,
   parseChatMainCommand,
@@ -503,6 +504,15 @@ function registerBridgeHandlers(): void {
     const envelope = unwrapBridgePayload(rawURL);
     if (!envelope || !bridgeGeneration(event, envelope.generation) || !isSafeExternalURL(envelope.payload) ||
         isTrustedAppURL(envelope.payload, appOriginURL())) return { ok: false };
+    await shell.openExternal(envelope.payload);
+    return { ok: true };
+  });
+
+  ipcMain.handle("personastack:open-new-context", async (event, rawURL: unknown) => {
+    const envelope = unwrapBridgePayload(rawURL);
+    if (!envelope || !bridgeGeneration(event, envelope.generation) || !isSafeNewContextURL(envelope.payload)) {
+      return { ok: false };
+    }
     await shell.openExternal(envelope.payload);
     return { ok: true };
   });

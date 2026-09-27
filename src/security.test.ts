@@ -7,6 +7,7 @@ import {
   authorizeBridgeFrame,
   handleFrameNavigation,
   isAllowedUserExternalLink,
+  isSafeNewContextURL,
   isEnterpriseOIDCStartURL,
   isTrustedPermissionRequest,
   shouldKeepPersonaStackLinkInApp,
@@ -34,6 +35,18 @@ test("URL resolution preserves packaged defaults and rejects invalid overrides",
   assert.equal(resolveAppURL([APP_URL_SWITCH, "file:///tmp/page"], "https://example.test/app").href, "https://example.test/app");
   assert.equal(resolveAppURL([APP_URL_SWITCH], "bad").href, "https://my.personastack.ai/user/personas");
   assert.equal(resolveAppURL([APP_URL_SWITCH, "https://user:pass@example.test"], "https://example.test").origin, "https://example.test");
+});
+
+test("new-context links allow HTTP, HTTPS, and mailto while rejecting unsafe schemes", () => {
+  assert.equal(isSafeNewContextURL("https://personastack.ai/privacy"), true);
+  assert.equal(isSafeNewContextURL("http://docs.example.test/"), true);
+  assert.equal(isSafeNewContextURL("mailto:support@personastack.ai"), true);
+  assert.equal(isSafeNewContextURL("mailto:support@personastack.ai?subject=Help"), true);
+  assert.equal(isSafeNewContextURL("mailto:support@personastack.ai#fragment"), false);
+  assert.equal(isSafeNewContextURL("mailto:personastack.ai"), false);
+  assert.equal(isSafeNewContextURL("javascript:alert(1)"), false);
+  assert.equal(isSafeNewContextURL("file:///etc/passwd"), false);
+  assert.equal(isSafeNewContextURL("mailto:support@personastack.ai%0d%0aBcc:evil@example.test"), false);
 });
 
 test("Google Services OAuth external URL requires the API-issued state and hosted callback", () => {

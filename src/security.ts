@@ -175,6 +175,17 @@ export function isSafeExternalURL(value: unknown): value is string {
   return url !== undefined;
 }
 
+export function isSafeNewContextURL(value: unknown): value is string {
+  if (isSafeExternalURL(value)) return true;
+  if (typeof value !== "string" || /[\u0000-\u001f\u007f]|%(?:0a|0d)/i.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "mailto:" && url.pathname.includes("@") && url.hash === "";
+  } catch {
+    return false;
+  }
+}
+
 export function isGoogleOAuthURL(value: unknown): value is string {
   const url = parseHTTPURL(value);
   return url !== undefined && url.protocol === "https:" && url.hostname.toLowerCase() === "accounts.google.com";
