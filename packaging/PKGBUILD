@@ -48,7 +48,7 @@ optdepends=(
   'kwallet: Secret Service provider for stored installation credentials'
 )
 source=(
-  "omarchy-desktop::git+https://github.com/personastack/omarchy-desktop.git#commit=806783423a72cf9a27a5b817310eaaf78cbff76e"
+  "omarchy-desktop::git+https://github.com/personastack/omarchy-desktop.git#commit=1e4e9232664b2e6c65dd43d4965fe1467510c4bd"
   "personastack-api::git+ssh://git@github.com/personastack/personastack-api.git#commit=fdf742c884168c4d6f2531b9cc65b966d018e7b3"
   "https://registry.npmjs.org/npm/-/npm-11.19.0.tgz"
 )
