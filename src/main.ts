@@ -24,10 +24,15 @@ import { closePopoutWindows, synchronizePopoutScope } from "./popout-scope.js";
 import { loadAndShowWindow } from "./window-load.js";
 import {
   authorizeBridgeFrame,
+  canFollowEnterpriseOIDCLinks,
+  handleFrameNavigation,
   shouldStartInBackground,
   isNewConcernEvent,
+  OIDC_NAVIGATION_WINDOW_MS,
   isAllowedOAuthPopupURL,
-  isAllowedMainNavigation,
+  isEnterpriseOIDCStartURL,
+  isTrustedPermissionRequest,
+  isAllowedUserExternalLink,
   isGoogleOAuthURL,
   isSafeExternalURL,
   isTrustedAppURL,
@@ -73,6 +78,7 @@ interface RegisteredWindow {
   readonly role: BridgeRole;
   readonly window: BrowserWindow;
   generation: number;
+  oidcNavigationExpiresAt?: number;
 }
 
 const appURL = resolveAppURL(process.argv, process.env.PERSONASTACK_DEFAULT_URL);
@@ -122,6 +128,7 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(() => {
+    configureBrowserPermissions();
     configureDownloads();
     createTray();
     openMainWindow(!launchInBackground);
@@ -130,6 +137,18 @@ if (!app.requestSingleInstanceLock()) {
 
 function appOriginURL(): URL {
   return new URL(appURL.href);
+}
+
+function configureBrowserPermissions(): void {
+  browserSession.setPermissionRequestHandler((contents, _permission, callback, details) => {
+    const entry = windows.get(contents.id);
+    callback(isTrustedPermissionRequest(entry?.role, details.isMainFrame, details.requestingUrl, undefined, appOriginURL()));
+  });
+  browserSession.setPermissionCheckHandler((contents, _permission, requestingOrigin, details) => {
+    const entry = contents ? windows.get(contents.id) : undefined;
+    const requestingURL = details.requestingUrl ?? details.securityOrigin ?? requestingOrigin;
+    return isTrustedPermissionRequest(entry?.role, details.isMainFrame, requestingURL, details.embeddingOrigin, appOriginURL());
+  });
 }
 
 function createWindow(role: BridgeRole, options: Electron.BrowserWindowConstructorOptions): BrowserWindow {
@@ -189,30 +208,57 @@ function configureWebContents(entry: RegisteredWindow): void {
     }
     return { action: "deny" };
   });
-  contents.on("will-navigate", (event, targetURL) => {
-    if (isAllowedMainNavigation(targetURL, appOriginURL())) return;
-    event.preventDefault();
-    if (entry.role === "main") invalidatePopouts();
+  contents.on("will-frame-navigate", (event) => {
+    handleFrameNavigation(
+      event,
+      event.url,
+      entry.role,
+      event.isMainFrame,
+      contents.mainFrame.url,
+      entry.oidcNavigationExpiresAt,
+      Date.now(),
+      appOriginURL(),
+      invalidatePopouts,
+    );
   });
-  contents.on("will-redirect", (event, targetURL) => {
-    if (isAllowedMainNavigation(targetURL, appOriginURL())) return;
-    event.preventDefault();
-    if (entry.role === "main") invalidatePopouts();
+  contents.on("will-redirect", (event, targetURL, _isInPlace, isMainFrame) => {
+    handleFrameNavigation(
+      event,
+      targetURL,
+      entry.role,
+      isMainFrame,
+      contents.mainFrame.url,
+      entry.oidcNavigationExpiresAt,
+      Date.now(),
+      appOriginURL(),
+      invalidatePopouts,
+    );
   });
-  contents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
-    if (isMainFrame && !isInPlace) entry.generation += 1;
+  contents.on("did-start-navigation", (_event, rawURL, isInPlace, isMainFrame) => {
+    if (!isMainFrame || isInPlace) return;
+    if (entry.role === "main" && isEnterpriseOIDCStartURL(rawURL, appOriginURL())) {
+      entry.oidcNavigationExpiresAt = Date.now() + OIDC_NAVIGATION_WINDOW_MS;
+    }
+    entry.generation += 1;
   });
   contents.on("did-navigate", (_event, rawURL) => {
-    const path = new URL(rawURL).pathname;
+    const navigatedURL = new URL(rawURL);
+    if (entry.role === "main" && isTrustedAppURL(rawURL, appOriginURL())) entry.oidcNavigationExpiresAt = undefined;
+    const path = navigatedURL.pathname;
     if (entry.role === "main" && (path === "/login" || path === "/logout")) invalidatePopouts();
   });
   contents.on("did-fail-load", (_event, _code, _description, _url, isMainFrame) => {
     if (!isMainFrame) return;
-    if (entry.role === "main") invalidatePopouts();
-    else closeWindow(entry.window);
+    if (entry.role === "main") {
+      entry.oidcNavigationExpiresAt = undefined;
+      invalidatePopouts();
+    } else closeWindow(entry.window);
   });
   contents.on("render-process-gone", () => {
-    if (entry.role === "main") invalidatePopouts();
+    if (entry.role === "main") {
+      entry.oidcNavigationExpiresAt = undefined;
+      invalidatePopouts();
+    }
     else closeWindow(entry.window);
   });
 }
@@ -250,6 +296,25 @@ function registerBridgeHandlers(): void {
   ipcMain.on("personastack:bridge:init", (event) => {
     const entry = authorizeSender(event);
     event.returnValue = entry ? entry.generation : -1;
+  });
+
+  ipcMain.on("personastack:bridge:app-origin", (event) => {
+    const entry = windows.get(event.sender.id);
+    event.returnValue = entry?.window.webContents === event.sender &&
+      event.senderFrame === event.sender.mainFrame ? appOriginURL().origin : "";
+  });
+
+  ipcMain.on("personastack:bridge:oidc-navigation", (event) => {
+    const entry = windows.get(event.sender.id);
+    event.returnValue = canFollowEnterpriseOIDCLinks(
+      entry?.role,
+      entry !== undefined && entry.window.webContents === event.sender,
+      event.senderFrame === event.sender.mainFrame,
+      event.senderFrame?.url ?? "",
+      entry?.oidcNavigationExpiresAt,
+      Date.now(),
+      appOriginURL(),
+    );
   });
 
   ipcMain.on("personastack:concern", (event, payload: unknown) => {
@@ -325,6 +390,21 @@ function registerBridgeHandlers(): void {
     if (!envelope || !bridgeGeneration(event, envelope.generation) || !isSafeExternalURL(envelope.payload) ||
         isTrustedAppURL(envelope.payload, appOriginURL())) return { ok: false };
     await shell.openExternal(envelope.payload);
+    return { ok: true };
+  });
+
+  ipcMain.handle("personastack:open-user-external", async (event, rawURL: unknown) => {
+    const entry = windows.get(event.sender.id);
+    if (!entry || entry.window.webContents !== event.sender ||
+        !isAllowedUserExternalLink(
+          entry.role,
+          true,
+          event.senderFrame === event.sender.mainFrame,
+          event.senderFrame?.url ?? "",
+          rawURL,
+          appOriginURL(),
+        )) return { ok: false };
+    await shell.openExternal(rawURL);
     return { ok: true };
   });
 }

@@ -4,8 +4,17 @@ import test from "node:test";
 import {
   APP_URL_SWITCH,
   BACKGROUND_SWITCH,
+  OIDC_NAVIGATION_WINDOW_MS,
   authorizeBridgeFrame,
+  canFollowEnterpriseOIDCLinks,
+  handleFrameNavigation,
+  isAllowedOIDCNavigation,
+  isAllowedUserExternalLink,
   isAllowedOAuthPopupURL,
+  isEnterpriseOIDCStartURL,
+  isTrustedPermissionRequest,
+  shouldFollowOIDCLinkInApp,
+  shouldKeepPersonaStackLinkInApp,
   isAllowedMainNavigation,
   isGoogleOAuthURL,
   isNewConcernEvent,
@@ -47,6 +56,7 @@ test("bridge admits only registered current main frames at the exact configured 
   };
   assert.equal(authorizeBridgeFrame(identity, appURL), true);
   assert.equal(authorizeBridgeFrame({ ...identity, frameURL: "https://attacker.my.personastack.ai/" }, appURL), false);
+  assert.equal(authorizeBridgeFrame({ ...identity, frameURL: "https://sso.example.com/", topFrameURL: "https://sso.example.com/" }, appURL), false);
   assert.equal(authorizeBridgeFrame({ ...identity, isMainFrame: false }, appURL), false);
   assert.equal(authorizeBridgeFrame({ ...identity, registered: false }, appURL), false);
   assert.equal(authorizeBridgeFrame({ ...identity, currentGeneration: false }, appURL), false);
@@ -63,6 +73,125 @@ test("bridge admits only registered current main frames at the exact configured 
   assert.equal(isGoogleOAuthURL("https://google.com/o/oauth2/auth"), false);
   assert.equal(isAllowedMainNavigation("https://accounts.google.com/o/oauth2/auth", appURL), true);
   assert.equal(isAllowedMainNavigation("https://attacker.example/", appURL), false);
+  assert.equal(isEnterpriseOIDCStartURL("https://my.personastack.ai/auth/oidc/start", appURL), true);
+  assert.equal(isEnterpriseOIDCStartURL("https://my.personastack.ai/auth/oidc/start/extra", appURL), false);
+  assert.equal(isEnterpriseOIDCStartURL("https://attacker.example/auth/oidc/start", appURL), false);
+  const attemptExpiresAt = 1_000 + OIDC_NAVIGATION_WINDOW_MS;
+  assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "main", true, attemptExpiresAt, 1_000), true);
+  assert.equal(isAllowedOIDCNavigation("http://sso.example.com/authorize", "main", true, attemptExpiresAt, 1_000), false);
+  assert.equal(isAllowedOIDCNavigation("javascript:alert(1)", "main", true, attemptExpiresAt, 1_000), false);
+  assert.equal(isAllowedOIDCNavigation("https://user:pass@sso.example.com/", "main", true, attemptExpiresAt, 1_000), false);
+  assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "main", true, attemptExpiresAt, attemptExpiresAt), false);
+  assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "main", true, undefined, 1_000), false);
+  assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "chat", true, attemptExpiresAt, 1_000), false);
+  assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "main", false, attemptExpiresAt, 1_000), false);
+  assert.equal(isAllowedMainNavigation("https://sso.example.com/authorize", appURL), false);
+  assert.equal(isTrustedPermissionRequest("main", true, "https://my.personastack.ai/login", undefined, appURL), true);
+  assert.equal(isTrustedPermissionRequest("main", false, "https://my.personastack.ai/login", undefined, appURL), false);
+  assert.equal(isTrustedPermissionRequest("chat", true, "https://my.personastack.ai/login", undefined, appURL), false);
+  assert.equal(isTrustedPermissionRequest("main", true, "https://sso.example.com/login", undefined, appURL), false);
+  assert.equal(isTrustedPermissionRequest("main", true, "https://my.personastack.ai/login", "https://sso.example.com", appURL), false);
+  assert.equal(canFollowEnterpriseOIDCLinks("main", true, true, "https://sso.example.com/login", attemptExpiresAt, 1_000, appURL), true);
+  assert.equal(canFollowEnterpriseOIDCLinks("main", true, true, "https://sso.example.com/login", attemptExpiresAt, attemptExpiresAt, appURL), false);
+  assert.equal(canFollowEnterpriseOIDCLinks("chat", true, true, "https://sso.example.com/login", attemptExpiresAt, 1_000, appURL), false);
+  assert.equal(canFollowEnterpriseOIDCLinks("main", false, true, "https://sso.example.com/login", attemptExpiresAt, 1_000, appURL), false);
+  assert.equal(shouldFollowOIDCLinkInApp(true, true, "https://sso.example.com/continue"), true);
+  assert.equal(shouldFollowOIDCLinkInApp(true, false, "https://sso.example.com/continue"), false);
+  assert.equal(shouldFollowOIDCLinkInApp(false, true, "https://sso.example.com/continue"), false);
+  assert.equal(shouldFollowOIDCLinkInApp(true, true, "http://sso.example.com/continue"), false);
+  assert.equal(shouldKeepPersonaStackLinkInApp("https://sso.example.com/continue", appURL), false);
+  assert.equal(shouldKeepPersonaStackLinkInApp("https://my.personastack.ai/login", appURL), true);
+  assert.equal(shouldKeepPersonaStackLinkInApp("https://my.personastack.ai/user/personas", appURL), true);
+  assert.equal(isAllowedUserExternalLink("main", true, true, "https://sso.example.com/login", "https://docs.example.com/", appURL), true);
+  assert.equal(isAllowedUserExternalLink("main", true, true, "https://sso.example.com/login", "http://docs.example.com/", appURL), true);
+  assert.equal(isAllowedUserExternalLink("main", true, true, "https://my.personastack.ai/login", "https://docs.example.com/", appURL), false);
+  assert.equal(isAllowedUserExternalLink("main", true, false, "https://sso.example.com/login", "https://docs.example.com/", appURL), false);
+  assert.equal(isAllowedUserExternalLink("chat", true, true, "https://sso.example.com/login", "https://docs.example.com/", appURL), false);
+  assert.equal(isAllowedUserExternalLink("main", false, true, "https://sso.example.com/login", "https://docs.example.com/", appURL), false);
+  assert.equal(isAllowedUserExternalLink("main", true, true, "https://sso.example.com/login", "javascript:alert(1)", appURL), false);
+  assert.equal(isAllowedUserExternalLink("main", true, true, "https://sso.example.com/login", "https://my.personastack.ai/login", appURL), true);
+  let prevented = false;
+  let popoutsInvalidated = false;
+  const navigationEvent = { preventDefault: () => { prevented = true; } };
+  const frameNavigationAllowed = handleFrameNavigation(
+    navigationEvent,
+    "https://attacker.example/frame",
+    "main",
+    false,
+    "https://my.personastack.ai/login",
+    attemptExpiresAt,
+    1_000,
+    appURL,
+    () => { popoutsInvalidated = true; },
+  );
+  assert.equal(frameNavigationAllowed, false);
+  assert.equal(prevented, true);
+  assert.equal(popoutsInvalidated, false);
+  prevented = false;
+  const googleSignInFrameAllowed = handleFrameNavigation(
+    navigationEvent,
+    "https://accounts.google.com/gsi/iframe/select?client_id=example",
+    "main",
+    false,
+    "https://my.personastack.ai/login",
+    undefined,
+    1_000,
+    appURL,
+    () => { popoutsInvalidated = true; },
+  );
+  assert.equal(googleSignInFrameAllowed, true);
+  assert.equal(prevented, false);
+  const idpSameOriginFrameAllowed = handleFrameNavigation(
+    navigationEvent,
+    "https://sso.example.com/frame/login",
+    "main",
+    false,
+    "https://sso.example.com/login",
+    attemptExpiresAt,
+    1_000,
+    appURL,
+    () => { popoutsInvalidated = true; },
+  );
+  assert.equal(idpSameOriginFrameAllowed, true);
+  const idpCrossOriginFrameBlocked = handleFrameNavigation(
+    navigationEvent,
+    "https://frames.attacker.example/frame",
+    "main",
+    false,
+    "https://sso.example.com/login",
+    attemptExpiresAt,
+    1_000,
+    appURL,
+    () => { popoutsInvalidated = true; },
+  );
+  assert.equal(idpCrossOriginFrameBlocked, false);
+  const expiredIdpFrameBlocked = handleFrameNavigation(
+    navigationEvent,
+    "https://sso.example.com/frame/login",
+    "main",
+    false,
+    "https://sso.example.com/login",
+    attemptExpiresAt,
+    attemptExpiresAt,
+    appURL,
+    () => { popoutsInvalidated = true; },
+  );
+  assert.equal(expiredIdpFrameBlocked, false);
+  prevented = false;
+  const topLevelExternalAllowed = handleFrameNavigation(
+    navigationEvent,
+    "https://accounts.google.com/o/oauth2/auth",
+    "main",
+    true,
+    "https://my.personastack.ai/login",
+    undefined,
+    1_000,
+    appURL,
+    () => { popoutsInvalidated = true; },
+  );
+  assert.equal(topLevelExternalAllowed, true);
+  assert.equal(prevented, false);
+  assert.equal(popoutsInvalidated, true);
   assert.equal(isAllowedOAuthPopupURL("https://accounts.google.com/o/oauth2/auth", appURL), true);
   assert.equal(isAllowedOAuthPopupURL("https://my.personastack.ai/auth/callback", appURL), true);
   assert.equal(isAllowedOAuthPopupURL("https://attacker.example/callback", appURL), false);

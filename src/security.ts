@@ -1,6 +1,7 @@
 export const DEFAULT_APP_URL = "https://my.personastack.ai/user/personas";
 export const APP_URL_SWITCH = "--personastack-url";
 export const BACKGROUND_SWITCH = "--background";
+export const OIDC_NAVIGATION_WINDOW_MS = 10 * 60_000;
 
 export type BridgeRole = "main" | "chat" | "stack" | "activity";
 
@@ -182,6 +183,112 @@ export function isGoogleOAuthURL(value: unknown): value is string {
 
 export function isAllowedMainNavigation(value: string, appURL: URL): boolean {
   return isInternalPersonaStackURL(value, appURL) || isGoogleOAuthURL(value);
+}
+
+export function handleFrameNavigation(
+  event: Readonly<{ preventDefault: () => void }>,
+  value: string,
+  role: BridgeRole,
+  isMainFrame: boolean,
+  topFrameURL: string,
+  expiresAt: number | undefined,
+  now: number,
+  appURL: URL,
+  invalidatePopouts: () => void,
+): boolean {
+  const allowed = isMainFrame
+    ? isAllowedMainNavigation(value, appURL) || isAllowedOIDCNavigation(value, role, true, expiresAt, now)
+    : isInternalPersonaStackURL(value, appURL) || isGoogleOAuthURL(value) ||
+      isSameOriginOIDCSubframe(value, topFrameURL, expiresAt, now, appURL);
+  if (role === "main" && isMainFrame && !isTrustedAppURL(value, appURL)) invalidatePopouts();
+  if (!allowed) event.preventDefault();
+  return allowed;
+}
+
+function isSameOriginOIDCSubframe(
+  value: string,
+  topFrameURL: string,
+  expiresAt: number | undefined,
+  now: number,
+  appURL: URL,
+): boolean {
+  const target = parseHTTPURL(value);
+  const topFrame = parseHTTPURL(topFrameURL);
+  return target !== undefined && topFrame !== undefined && target.protocol === "https:" &&
+    topFrame.origin !== appURL.origin && topFrame.origin === target.origin &&
+    typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > now;
+}
+
+export function shouldFollowOIDCLinkInApp(
+  canFollowOIDCLinks: boolean,
+  isTopLevel: boolean,
+  href: string,
+): boolean {
+  const target = parseHTTPURL(href);
+  return canFollowOIDCLinks && isTopLevel && target?.protocol === "https:";
+}
+
+export function shouldKeepPersonaStackLinkInApp(
+  href: string,
+  appURL: URL,
+): boolean {
+  return isInternalPersonaStackURL(href, appURL);
+}
+
+export function isAllowedUserExternalLink(
+  role: BridgeRole | undefined,
+  registered: boolean,
+  isMainFrame: boolean,
+  currentURL: string,
+  targetURL: unknown,
+  appURL: URL,
+): targetURL is string {
+  const current = parseHTTPURL(currentURL);
+  return registered && role === "main" && isMainFrame && current?.protocol === "https:" &&
+    current.origin !== appURL.origin && isSafeExternalURL(targetURL);
+}
+
+export function canFollowEnterpriseOIDCLinks(
+  role: BridgeRole | undefined,
+  registered: boolean,
+  isMainFrame: boolean,
+  currentURL: string,
+  expiresAt: number | undefined,
+  now: number,
+  appURL: URL,
+): boolean {
+  const current = parseHTTPURL(currentURL);
+  return registered && role === "main" && isMainFrame && current !== undefined &&
+    current.origin !== appURL.origin && typeof expiresAt === "number" &&
+    Number.isFinite(expiresAt) && expiresAt > now;
+}
+
+export function isEnterpriseOIDCStartURL(value: string, appURL: URL): boolean {
+  const url = parseHTTPURL(value);
+  return url !== undefined && url.origin === appURL.origin && url.pathname === "/auth/oidc/start";
+}
+
+export function isAllowedOIDCNavigation(
+  value: string,
+  role: BridgeRole,
+  isMainFrame: boolean,
+  expiresAt: number | undefined,
+  now: number,
+): boolean {
+  const url = parseHTTPURL(value);
+  return role === "main" && isMainFrame && url !== undefined &&
+    typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > now && url.protocol === "https:";
+}
+
+export function isTrustedPermissionRequest(
+  role: BridgeRole | undefined,
+  isMainFrame: boolean,
+  requestingURL: string,
+  embeddedByOrigin: string | undefined,
+  appURL: URL,
+): boolean {
+  return role === "main" && isMainFrame && isTrustedAppURL(requestingURL, appURL) &&
+    (embeddedByOrigin === undefined || isTrustedAppURL(embeddedByOrigin, appURL));
 }
 
 export function isAllowedOAuthPopupURL(value: unknown, appURL: URL): value is string {
