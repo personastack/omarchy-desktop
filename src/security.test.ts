@@ -10,13 +10,14 @@ import {
   handleFrameNavigation,
   isAllowedOIDCNavigation,
   isAllowedUserExternalLink,
-  isAllowedOAuthPopupURL,
   isEnterpriseOIDCStartURL,
   isTrustedPermissionRequest,
   shouldFollowOIDCLinkInApp,
   shouldKeepPersonaStackLinkInApp,
   isAllowedMainNavigation,
   isGoogleOAuthURL,
+  googleIntegrationOAuthStartState,
+  isAllowedGoogleIntegrationOAuthNavigation,
   isNewConcernEvent,
   isInternalPersonaStackURL,
   isTrustedAppURL,
@@ -24,7 +25,8 @@ import {
   parseDesktopControlCommand,
   parseLocalSessionCommand,
   parseChatMainCommand,
-  parseChatWindowCommand,
+	parseChatWindowCommand,
+	parseDesktopAuthHandoffCallback,
   parseStackCommand,
   resolveAppURL,
   shouldStartInBackground,
@@ -36,6 +38,52 @@ test("URL resolution preserves packaged defaults and rejects invalid overrides",
   assert.equal(resolveAppURL([APP_URL_SWITCH, "file:///tmp/page"], "https://example.test/app").href, "https://example.test/app");
   assert.equal(resolveAppURL([APP_URL_SWITCH], "bad").href, "https://my.personastack.ai/user/personas");
   assert.equal(resolveAppURL([APP_URL_SWITCH, "https://user:pass@example.test"], "https://example.test").origin, "https://example.test");
+});
+
+test("Google Services OAuth stays in the hosted session only for its bound callback", () => {
+  const appURL = new URL("https://my.personastack.ai/user/google-services");
+  const state = "a".repeat(64);
+  const authorizationURL = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  authorizationURL.searchParams.set("client_id", "client-id");
+  authorizationURL.searchParams.set("redirect_uri", "https://my.personastack.ai/callbacks/integrations/google/oauth/callback");
+  authorizationURL.searchParams.set("response_type", "code");
+  authorizationURL.searchParams.set("scope", "openid email");
+  authorizationURL.searchParams.set("state", state);
+
+  assert.equal(googleIntegrationOAuthStartState(authorizationURL.href, appURL), state);
+  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
+    authorizationURL.href, true, appURL.href, state, 20_000, 10_000, appURL,
+  ), true);
+  let prevented = false;
+  assert.equal(handleFrameNavigation(
+    { preventDefault: () => { prevented = true; } }, authorizationURL.href, "main", true, appURL.href,
+    undefined, 10_000, appURL, () => {}, state, 20_000,
+  ), true);
+  assert.equal(prevented, false);
+  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
+    "https://accounts.google.com/signin/v2/identifier", true, "https://accounts.google.com/o/oauth2/v2/auth", state, 20_000, 10_000, appURL,
+  ), true);
+  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
+    `https://my.personastack.ai/callbacks/integrations/google/oauth/callback?code=oauth-code&state=${state}`,
+    true, "https://accounts.google.com/consent", state, 20_000, 10_000, appURL,
+  ), true);
+  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
+    `https://my.personastack.ai/callbacks/integrations/google/oauth/callback?code=oauth-code&state=${"b".repeat(64)}`,
+    true, "https://accounts.google.com/consent", state, 20_000, 10_000, appURL,
+  ), false);
+  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
+    "https://accounts.google.com/signin/v2/identifier", true, appURL.href, undefined, undefined, 10_000, appURL,
+  ), false);
+  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
+    "https://accounts.google.com/signin/v2/identifier", true, "https://accounts.google.com/consent", state, 10_000, 10_000, appURL,
+  ), false);
+  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
+    authorizationURL.href.replace(encodeURIComponent("https://my.personastack.ai/callbacks/integrations/google/oauth/callback"), encodeURIComponent("https://attacker.example/callback")),
+    true, appURL.href, state, 20_000, 10_000, appURL,
+  ), false);
+  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
+    "https://accounts.google.com/signin/v2/identifier", false, "https://accounts.google.com/consent", state, 20_000, 10_000, appURL,
+  ), false);
 });
 
 test("background launch is explicit and leaves ordinary launches visible", () => {
@@ -71,7 +119,7 @@ test("bridge admits only registered current main frames at the exact configured 
   assert.equal(isInternalPersonaStackURL("https://example.org/", appURL), false);
   assert.equal(isGoogleOAuthURL("https://accounts.google.com/o/oauth2/auth"), true);
   assert.equal(isGoogleOAuthURL("https://google.com/o/oauth2/auth"), false);
-  assert.equal(isAllowedMainNavigation("https://accounts.google.com/o/oauth2/auth", appURL), true);
+	assert.equal(isAllowedMainNavigation("https://accounts.google.com/o/oauth2/auth", appURL), false);
   assert.equal(isAllowedMainNavigation("https://attacker.example/", appURL), false);
   assert.equal(isEnterpriseOIDCStartURL("https://my.personastack.ai/auth/oidc/start", appURL), true);
   assert.equal(isEnterpriseOIDCStartURL("https://my.personastack.ai/auth/oidc/start/extra", appURL), false);
@@ -86,6 +134,15 @@ test("bridge admits only registered current main frames at the exact configured 
   assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "chat", true, attemptExpiresAt, 1_000), false);
   assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "main", false, attemptExpiresAt, 1_000), false);
   assert.equal(isAllowedMainNavigation("https://sso.example.com/authorize", appURL), false);
+  const handoffAttempt = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const handoffCode = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+  assert.deepEqual(parseDesktopAuthHandoffCallback(`personastack://auth/callback?attempt_id=${handoffAttempt}&code=${handoffCode}`, handoffAttempt), {
+    attemptId: handoffAttempt,
+    code: handoffCode,
+  });
+  assert.equal(parseDesktopAuthHandoffCallback(`personastack://auth/callback?attempt_id=${handoffAttempt}&code=${handoffCode}&token=secret`, handoffAttempt), undefined);
+  assert.equal(parseDesktopAuthHandoffCallback(`personastack://auth/callback?attempt_id=${handoffAttempt}&code=${handoffCode}`, handoffAttempt.replace("A", "C")), undefined);
+  assert.equal(parseDesktopAuthHandoffCallback(`personastack://auth:444/callback?attempt_id=${handoffAttempt}&code=${handoffCode}`, handoffAttempt), undefined);
   assert.equal(isTrustedPermissionRequest("main", true, "https://my.personastack.ai/login", undefined, appURL), true);
   assert.equal(isTrustedPermissionRequest("main", false, "https://my.personastack.ai/login", undefined, appURL), false);
   assert.equal(isTrustedPermissionRequest("chat", true, "https://my.personastack.ai/login", undefined, appURL), false);
@@ -189,12 +246,9 @@ test("bridge admits only registered current main frames at the exact configured 
     appURL,
     () => { popoutsInvalidated = true; },
   );
-  assert.equal(topLevelExternalAllowed, true);
-  assert.equal(prevented, false);
+  assert.equal(topLevelExternalAllowed, false);
+  assert.equal(prevented, true);
   assert.equal(popoutsInvalidated, true);
-  assert.equal(isAllowedOAuthPopupURL("https://accounts.google.com/o/oauth2/auth", appURL), true);
-  assert.equal(isAllowedOAuthPopupURL("https://my.personastack.ai/auth/callback", appURL), true);
-  assert.equal(isAllowedOAuthPopupURL("https://attacker.example/callback", appURL), false);
 });
 
 test("chat and stack bridges accept only their finite exact payloads", () => {

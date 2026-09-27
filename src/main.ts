@@ -20,6 +20,7 @@ import {
 } from "electron";
 
 import { getAutostartStatus, setAutostartEnabled, type AutostartStatus } from "./autostart.js";
+import { beginDesktopAuthHandoff, consumeDesktopAuthHandoff, exchangeDesktopAuthHandoff, type PendingDesktopAuthHandoff } from "./desktop-auth-handoff.js";
 import { delegateChatWindowClose } from "./chat-window-close.js";
 import { applyChatWindowCommand as dispatchChatWindowCommand } from "./chat-window-command.js";
 import { closePopoutWindows, synchronizePopoutScope } from "./popout-scope.js";
@@ -28,10 +29,12 @@ import {
   authorizeBridgeFrame,
   canFollowEnterpriseOIDCLinks,
   handleFrameNavigation,
+  googleIntegrationOAuthStartState,
+  isAllowedGoogleIntegrationOAuthNavigation,
   shouldStartInBackground,
   isNewConcernEvent,
   OIDC_NAVIGATION_WINDOW_MS,
-  isAllowedOAuthPopupURL,
+  GOOGLE_OAUTH_NAVIGATION_WINDOW_MS,
   isEnterpriseOIDCStartURL,
   isTrustedPermissionRequest,
   isAllowedUserExternalLink,
@@ -81,6 +84,8 @@ interface RegisteredWindow {
   readonly window: BrowserWindow;
   generation: number;
   oidcNavigationExpiresAt?: number;
+  googleOAuthState?: string;
+  googleOAuthNavigationExpiresAt?: number;
 }
 
 const appURL = resolveAppURL(process.argv, process.env.PERSONASTACK_DEFAULT_URL);
@@ -105,6 +110,7 @@ let trayControlRefreshing = false;
 let trayControlRevision = 0;
 let trayControlRefreshTimer: NodeJS.Timeout | undefined;
 const launchInBackground = shouldStartInBackground(process.argv);
+let pendingDesktopAuthHandoff: PendingDesktopAuthHandoff | undefined;
 
 app.setName(APP_NAME);
 
@@ -116,7 +122,15 @@ if (process.platform === "linux") {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on("second-instance", () => openMainWindow());
+  app.on("second-instance", (_event, commandLine) => {
+    const callbackURL = commandLine.find(isDesktopAuthHandoffURL);
+    if (callbackURL) void completeDesktopAuthHandoff(callbackURL);
+    openMainWindow();
+  });
+  app.on("open-url", (event, callbackURL) => {
+    event.preventDefault();
+    void completeDesktopAuthHandoff(callbackURL);
+  });
 
   app.on("before-quit", (event) => {
     if (trayControlRefreshTimer) {
@@ -135,11 +149,41 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(() => {
+    const callbackURL = process.argv.find(isDesktopAuthHandoffURL);
+    if (callbackURL) void completeDesktopAuthHandoff(callbackURL);
     configureBrowserPermissions();
     configureDownloads();
     createTray();
     openMainWindow(!launchInBackground);
   });
+}
+
+function isDesktopAuthHandoffURL(value: string): boolean {
+  return value.startsWith("personastack://");
+}
+
+function beginSystemBrowserSignIn(): void {
+  const launch = beginDesktopAuthHandoff(appOriginURL(), Date.now());
+  pendingDesktopAuthHandoff = launch.attempt;
+  void shell.openExternal(launch.url).catch(() => {
+    if (pendingDesktopAuthHandoff?.attemptId === launch.attempt.attemptId) pendingDesktopAuthHandoff = undefined;
+    dialog.showErrorBox("PersonaStack sign-in", "PersonaStack could not open the system browser. Try again.");
+  });
+}
+
+async function completeDesktopAuthHandoff(callbackURL: string): Promise<void> {
+  const consumption = consumeDesktopAuthHandoff(pendingDesktopAuthHandoff, callbackURL, Date.now());
+  pendingDesktopAuthHandoff = consumption.pending;
+  const callback = consumption.callback;
+  if (!callback) return;
+
+  try {
+    await exchangeDesktopAuthHandoff((input, init) => browserSession.fetch(input, init), appOriginURL(), callback);
+    openMainWindow(true, "/user/personas");
+  } catch {
+    openMainWindow(true, "/login");
+    dialog.showErrorBox("PersonaStack sign-in", "Sign-in could not be completed. Return to PersonaStack and try again.");
+  }
 }
 
 function appOriginURL(): URL {
@@ -210,36 +254,34 @@ function configureWebContents(entry: RegisteredWindow): void {
   const contents = entry.window.webContents;
   contents.setWindowOpenHandler(({ url }) => {
     if (isGoogleOAuthURL(url)) {
-      openGoogleOAuthWindow(url);
+      const appOrigin = appOriginURL();
+      const now = Date.now();
+      const integrationOAuthNavigation = entry.role === "main" && (
+        googleIntegrationOAuthStartState(url, appOrigin) !== undefined ||
+        isAllowedGoogleIntegrationOAuthNavigation(
+          url,
+          true,
+          contents.mainFrame.url,
+          entry.googleOAuthState,
+          entry.googleOAuthNavigationExpiresAt,
+          now,
+          appOrigin,
+        )
+      );
+      if (integrationOAuthNavigation) {
+        void entry.window.loadURL(url);
+      } else {
+        beginSystemBrowserSignIn();
+      }
       return { action: "deny" };
     }
     return { action: "deny" };
   });
   contents.on("will-frame-navigate", (event) => {
-    handleFrameNavigation(
-      event,
-      event.url,
-      entry.role,
-      event.isMainFrame,
-      contents.mainFrame.url,
-      entry.oidcNavigationExpiresAt,
-      Date.now(),
-      appOriginURL(),
-      invalidatePopouts,
-    );
+    authorizeFrameNavigation(entry, event, event.url, event.isMainFrame);
   });
   contents.on("will-redirect", (event, targetURL, _isInPlace, isMainFrame) => {
-    handleFrameNavigation(
-      event,
-      targetURL,
-      entry.role,
-      isMainFrame,
-      contents.mainFrame.url,
-      entry.oidcNavigationExpiresAt,
-      Date.now(),
-      appOriginURL(),
-      invalidatePopouts,
-    );
+    authorizeFrameNavigation(entry, event, targetURL, isMainFrame);
   });
   contents.on("did-start-navigation", (_event, rawURL, isInPlace, isMainFrame) => {
     if (!isMainFrame || isInPlace) return;
@@ -250,7 +292,11 @@ function configureWebContents(entry: RegisteredWindow): void {
   });
   contents.on("did-navigate", (_event, rawURL) => {
     const navigatedURL = new URL(rawURL);
-    if (entry.role === "main" && isTrustedAppURL(rawURL, appOriginURL())) entry.oidcNavigationExpiresAt = undefined;
+    if (entry.role === "main" && isTrustedAppURL(rawURL, appOriginURL())) {
+      entry.oidcNavigationExpiresAt = undefined;
+      entry.googleOAuthState = undefined;
+      entry.googleOAuthNavigationExpiresAt = undefined;
+    }
     const path = navigatedURL.pathname;
     if (entry.role === "main" && (path === "/login" || path === "/logout")) invalidatePopouts();
   });
@@ -258,16 +304,51 @@ function configureWebContents(entry: RegisteredWindow): void {
     if (!isMainFrame) return;
     if (entry.role === "main") {
       entry.oidcNavigationExpiresAt = undefined;
+      entry.googleOAuthState = undefined;
+      entry.googleOAuthNavigationExpiresAt = undefined;
       invalidatePopouts();
     } else closeWindow(entry.window);
   });
   contents.on("render-process-gone", () => {
     if (entry.role === "main") {
       entry.oidcNavigationExpiresAt = undefined;
+      entry.googleOAuthState = undefined;
+      entry.googleOAuthNavigationExpiresAt = undefined;
       invalidatePopouts();
     }
     else closeWindow(entry.window);
   });
+}
+
+function authorizeFrameNavigation(
+  entry: RegisteredWindow,
+  event: Readonly<{ preventDefault: () => void }>,
+  targetURL: string,
+  isMainFrame: boolean,
+): void {
+  const contents = entry.window.webContents;
+  const now = Date.now();
+  const appOrigin = appOriginURL();
+  if (entry.role === "main" && isMainFrame && isTrustedAppURL(contents.mainFrame.url, appOrigin)) {
+    const state = googleIntegrationOAuthStartState(targetURL, appOrigin);
+    if (state) {
+      entry.googleOAuthState = state;
+      entry.googleOAuthNavigationExpiresAt = now + GOOGLE_OAUTH_NAVIGATION_WINDOW_MS;
+    }
+  }
+  handleFrameNavigation(
+    event,
+    targetURL,
+    entry.role,
+    isMainFrame,
+    contents.mainFrame.url,
+    entry.oidcNavigationExpiresAt,
+    now,
+    appOrigin,
+    invalidatePopouts,
+    entry.googleOAuthState,
+    entry.googleOAuthNavigationExpiresAt,
+  );
 }
 
 function authorizeSender(event: IpcMainEvent | IpcMainInvokeEvent, roles?: readonly BridgeRole[]): RegisteredWindow | undefined {
@@ -449,35 +530,6 @@ function localSessionFailure(error: LocalSessionError): string {
   }
 }
 
-function openGoogleOAuthWindow(initialURL: string): void {
-  if (!isGoogleOAuthURL(initialURL)) return;
-  const popup = new BrowserWindow({
-    width: 520,
-    height: 700,
-    show: false,
-    title: "Sign in with Google",
-    webPreferences: {
-      partition: sessionPartition,
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      webSecurity: true,
-      allowRunningInsecureContent: false,
-    },
-  });
-  popup.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  popup.webContents.on("will-navigate", (event, rawURL) => {
-    if (!isAllowedOAuthPopupURL(rawURL, appOriginURL())) event.preventDefault();
-  });
-  popup.webContents.on("did-navigate", (_event, rawURL) => {
-    if (isTrustedAppURL(rawURL, appOriginURL())) popup.close();
-  });
-  popup.webContents.on("will-redirect", (event, rawURL) => {
-    if (!isAllowedOAuthPopupURL(rawURL, appOriginURL())) event.preventDefault();
-  });
-  popup.once("ready-to-show", () => popup.show());
-  void popup.loadURL(initialURL).catch(() => popup.close());
-}
 
 function applyChatMainCommand(command: ChatMainCommand): void {
   if (command.action === "sync") {

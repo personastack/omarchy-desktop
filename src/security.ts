@@ -2,6 +2,7 @@ export const DEFAULT_APP_URL = "https://my.personastack.ai/user/personas";
 export const APP_URL_SWITCH = "--personastack-url";
 export const BACKGROUND_SWITCH = "--background";
 export const OIDC_NAVIGATION_WINDOW_MS = 10 * 60_000;
+export const GOOGLE_OAUTH_NAVIGATION_WINDOW_MS = 10 * 60_000;
 
 export type BridgeRole = "main" | "chat" | "stack" | "activity";
 
@@ -182,7 +183,72 @@ export function isGoogleOAuthURL(value: unknown): value is string {
 }
 
 export function isAllowedMainNavigation(value: string, appURL: URL): boolean {
-  return isInternalPersonaStackURL(value, appURL) || isGoogleOAuthURL(value);
+  return isInternalPersonaStackURL(value, appURL);
+}
+
+export function googleIntegrationOAuthStartState(value: string, appURL: URL): string | undefined {
+  const url = parseHTTPURL(value);
+  if (!url || url.protocol !== "https:" || url.hostname.toLowerCase() !== "accounts.google.com" ||
+      !["/o/oauth2/auth", "/o/oauth2/v2/auth"].includes(url.pathname)) return undefined;
+  for (const key of ["client_id", "redirect_uri", "response_type", "scope", "state"]) {
+    if (url.searchParams.getAll(key).length !== 1) return undefined;
+  }
+  if (url.searchParams.get("response_type") !== "code" || !url.searchParams.get("client_id") || !url.searchParams.get("scope")) return undefined;
+  const redirect = parseHTTPURL(url.searchParams.get("redirect_uri"));
+  if (!redirect || redirect.protocol !== "https:" || redirect.origin !== appURL.origin || redirect.pathname !== "/callbacks/integrations/google/oauth/callback" ||
+      redirect.search !== "" || redirect.hash !== "") return undefined;
+  const state = url.searchParams.get("state");
+  return state && /^[a-f0-9]{64}$/.test(state) ? state : undefined;
+}
+
+export function isAllowedGoogleIntegrationOAuthNavigation(
+  value: string,
+  isMainFrame: boolean,
+  topFrameURL: string,
+  expectedState: string | undefined,
+  expiresAt: number | undefined,
+  now: number,
+  appURL: URL,
+): boolean {
+  if (!isMainFrame || !expectedState || expiresAt === undefined || expiresAt <= now) return false;
+  const target = parseHTTPURL(value);
+  const topFrame = parseHTTPURL(topFrameURL);
+  if (!target || !topFrame) return false;
+  if (target.protocol === "https:" && target.hostname.toLowerCase() === "accounts.google.com") {
+    if (topFrame.origin === appURL.origin) return googleIntegrationOAuthStartState(value, appURL) === expectedState;
+    return topFrame.protocol === "https:" && topFrame.hostname.toLowerCase() === "accounts.google.com";
+  }
+  return topFrame.protocol === "https:" && topFrame.hostname.toLowerCase() === "accounts.google.com" &&
+    target.origin === appURL.origin && target.pathname === "/callbacks/integrations/google/oauth/callback" &&
+    target.searchParams.getAll("state").length === 1 && target.searchParams.get("state") === expectedState &&
+    target.username === "" && target.password === "" && target.hash === "";
+}
+
+export interface DesktopAuthHandoffCallback {
+	readonly attemptId: string;
+	readonly code: string;
+}
+
+export function parseDesktopAuthHandoffCallback(value: unknown, expectedAttemptId: string): DesktopAuthHandoffCallback | undefined {
+	if (typeof value !== "string") return undefined;
+	let url: URL;
+	try {
+		url = new URL(value);
+	} catch {
+		return undefined;
+	}
+	if (url.protocol !== "personastack:" || url.host !== "auth" || url.pathname !== "/callback" ||
+		url.username !== "" || url.password !== "" || url.hash !== "") return undefined;
+	const entries = Array.from(url.searchParams.entries());
+	if (entries.length !== 2 || !url.searchParams.has("attempt_id") || !url.searchParams.has("code")) return undefined;
+	const attemptId = url.searchParams.get("attempt_id") ?? "";
+	const code = url.searchParams.get("code") ?? "";
+	if (attemptId !== expectedAttemptId || !isHandoffValue(attemptId) || !isHandoffValue(code)) return undefined;
+	return { attemptId, code };
+}
+
+function isHandoffValue(value: string): boolean {
+	return /^[A-Za-z0-9_-]{43}$/.test(value);
 }
 
 export function handleFrameNavigation(
@@ -195,9 +261,12 @@ export function handleFrameNavigation(
   now: number,
   appURL: URL,
   invalidatePopouts: () => void,
+  googleOAuthState?: string,
+  googleOAuthExpiresAt?: number,
 ): boolean {
   const allowed = isMainFrame
-    ? isAllowedMainNavigation(value, appURL) || isAllowedOIDCNavigation(value, role, true, expiresAt, now)
+    ? isAllowedMainNavigation(value, appURL) || isAllowedOIDCNavigation(value, role, true, expiresAt, now) ||
+      (role === "main" && isAllowedGoogleIntegrationOAuthNavigation(value, true, topFrameURL, googleOAuthState, googleOAuthExpiresAt, now, appURL))
     : isInternalPersonaStackURL(value, appURL) || isGoogleOAuthURL(value) ||
       isSameOriginOIDCSubframe(value, topFrameURL, expiresAt, now, appURL);
   if (role === "main" && isMainFrame && !isTrustedAppURL(value, appURL)) invalidatePopouts();
@@ -289,10 +358,6 @@ export function isTrustedPermissionRequest(
 ): boolean {
   return role === "main" && isMainFrame && isTrustedAppURL(requestingURL, appURL) &&
     (embeddedByOrigin === undefined || isTrustedAppURL(embeddedByOrigin, appURL));
-}
-
-export function isAllowedOAuthPopupURL(value: unknown, appURL: URL): value is string {
-  return isGoogleOAuthURL(value) || (typeof value === "string" && isTrustedAppURL(value, appURL));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

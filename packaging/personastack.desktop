@@ -2,8 +2,9 @@
 Type=Application
 Name=PersonaStack
 Comment=PersonaStack desktop client
-Exec=personastack
+Exec=personastack %u
 Icon=personastack
 Terminal=false
 Categories=Network;Utility;
 StartupNotify=true
+MimeType=x-scheme-handler/personastack;
