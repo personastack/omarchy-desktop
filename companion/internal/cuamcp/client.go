@@ -37,6 +37,7 @@ var (
 	ErrAlreadyStarted   = errors.New("Cua MCP already started")
 	ErrNotStarted       = errors.New("Cua MCP not started")
 	ErrInvalidFrame     = errors.New("Cua MCP frame invalid")
+	ErrProtocolMismatch = errors.New("Cua MCP protocol version mismatch")
 	ErrInvalidCatalog   = errors.New("Cua MCP tool catalog invalid")
 	ErrInvalidTool      = errors.New("Cua MCP tool not exposed")
 	ErrToolFailed       = errors.New("Cua MCP tool failed")
@@ -114,7 +115,7 @@ type initializeParams struct {
 }
 
 type initializeResult struct {
-	ProtocolVersion string `json:"protocolVersion"`
+	ProtocolVersion json.RawMessage `json:"protocolVersion"`
 }
 
 type clientInfo struct {
@@ -264,9 +265,18 @@ func (c *Client) StartWithLifetime(ctx context.Context, lifetime context.Context
 		return Catalog{}, err
 	}
 	var initialize initializeResult
-	if !validObject(initialized) || json.Unmarshal(initialized, &initialize) != nil || initialize.ProtocolVersion != protocolVersion {
+	if !validObject(initialized) || json.Unmarshal(initialized, &initialize) != nil {
 		c.stopLocked()
 		return Catalog{}, ErrInvalidFrame
+	}
+	var negotiatedVersion string
+	if len(initialize.ProtocolVersion) == 0 || json.Unmarshal(initialize.ProtocolVersion, &negotiatedVersion) != nil || !validProtocolVersion(negotiatedVersion) {
+		c.stopLocked()
+		return Catalog{}, ErrInvalidFrame
+	}
+	if negotiatedVersion != protocolVersion {
+		c.stopLocked()
+		return Catalog{}, fmt.Errorf("%w: expected %s, server negotiated %s", ErrProtocolMismatch, protocolVersion, negotiatedVersion)
 	}
 	if err := c.notifyLocked(deadlineContext, "notifications/initialized"); err != nil {
 		c.stopLocked()
@@ -297,6 +307,11 @@ func (c *Client) StartWithLifetime(ctx context.Context, lifetime context.Context
 		}
 	}
 	return catalog, nil
+}
+
+func validProtocolVersion(value string) bool {
+	parsed, err := time.Parse("2006-01-02", value)
+	return err == nil && parsed.Format("2006-01-02") == value
 }
 
 func (c *Client) Call(ctx context.Context, operation agentgatewayruntime.DesktopControlOperation, name string, arguments json.RawMessage) (json.RawMessage, error) {

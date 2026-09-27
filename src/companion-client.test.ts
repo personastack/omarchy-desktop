@@ -15,7 +15,7 @@ test("companion client correlates local state replies", async () => {
     fake.stdout.write(`${JSON.stringify({
       id: request.id,
       ok: true,
-      result: { installation_id: null, operating_system: "linux", runtime_available: false, cua_ready: false, native_executor_ready: false, gateway_connected: false, relay_paused: true, user_paused: false },
+      result: { installation_id: null, operating_system: "linux", runtime_available: false, cua_ready: false, cua_upgrade_required: false, native_executor_ready: false, gateway_connected: false, relay_paused: true, user_paused: false },
     })}\n`);
   });
   const result = await client.request({ version: "1", action: "state", scope: "" });
@@ -25,6 +25,7 @@ test("companion client correlates local state replies", async () => {
     operating_system: "linux",
     runtime_available: false,
     cua_ready: false,
+    cua_upgrade_required: false,
     native_executor_ready: false,
     gateway_connected: false,
     relay_paused: true,
@@ -58,7 +59,7 @@ test("companion client accepts typed tray lifecycle state replies", async () => 
       fake.stdout.write(`${JSON.stringify({
         id: request.id,
         ok: true,
-        result: { installation_id: null, operating_system: "linux", runtime_available: true, cua_ready: false, native_executor_ready: false, gateway_connected: false, relay_active: true, relay_paused: action === "pause", user_paused: action === "pause" },
+        result: { installation_id: null, operating_system: "linux", runtime_available: true, cua_ready: false, cua_upgrade_required: false, native_executor_ready: false, gateway_connected: false, relay_active: true, relay_paused: action === "pause", user_paused: action === "pause" },
       })}\n`);
     });
     const result = await client.requestLifecycle(action);
@@ -116,7 +117,7 @@ test("tray lifecycle requests use the app-wide scope without workspace sync", as
     fake.stdout.write(`${JSON.stringify({
       id: request.id,
       ok: true,
-      result: { installation_id: null, operating_system: "linux", runtime_available: true, cua_ready: false, native_executor_ready: false, gateway_connected: false, relay_active: false, relay_paused: true, user_paused: false },
+      result: { installation_id: null, operating_system: "linux", runtime_available: true, cua_ready: false, cua_upgrade_required: false, native_executor_ready: false, gateway_connected: false, relay_active: false, relay_paused: true, user_paused: false },
     })}\n`);
   });
   const result = await client.requestLifecycle("state");
@@ -163,6 +164,28 @@ test("companion client preserves finite session-lock failures", async () => {
   }
 });
 
+test("companion client preserves typed Cua update-required state", async () => {
+  const fake = createFakeChild();
+  const client = new CompanionClient(fake.child);
+  const pending = client.requestLifecycle("state");
+  fake.stdout.write('{"id":1,"ok":true,"result":{"installation_id":null,"operating_system":"linux","runtime_available":true,"cua_ready":false,"cua_upgrade_required":true,"native_executor_ready":false,"gateway_connected":false,"relay_active":false,"relay_paused":true,"user_paused":false}}\n');
+  const result = await pending;
+  assert.equal(result.ok, true);
+  if (result.ok && "cua_upgrade_required" in result) assert.equal(result.cua_upgrade_required, true);
+  else assert.fail("missing Cua update-required state");
+  await client.close();
+});
+
+test("companion client rejects non-boolean Cua update-required state", async () => {
+  const fake = createFakeChild();
+  const client = new CompanionClient(fake.child);
+  const pending = client.requestLifecycle("state");
+  fake.stdout.write('{"id":1,"ok":true,"result":{"installation_id":null,"operating_system":"linux","runtime_available":true,"cua_ready":false,"cua_upgrade_required":"yes","native_executor_ready":false,"gateway_connected":false,"relay_active":false,"relay_paused":true,"user_paused":false}}\n');
+  assert.deepEqual(await pending, { ok: false, error: "unavailable" });
+  assert.equal(client.isOpen, false);
+  await client.close();
+});
+
 test("companion client rejects credential-bearing or malformed replies", async () => {
   const fake = createFakeChild();
   const client = new CompanionClient(fake.child);
@@ -191,7 +214,7 @@ test("prepare response includes a Linux platform and local readiness", async () 
     fake.stdout.write(`${JSON.stringify({
       id: request.id,
       ok: true,
-      result: { installation_id: "install_01", operating_system: "linux", runtime_available: true, cua_ready: true, native_executor_ready: false, gateway_connected: false, relay_active: true, relay_paused: false, user_paused: false },
+      result: { installation_id: "install_01", operating_system: "linux", runtime_available: true, cua_ready: true, cua_upgrade_required: false, native_executor_ready: false, gateway_connected: false, relay_active: true, relay_paused: false, user_paused: false },
     })}\n`);
   });
   const result = await client.request({ version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: "A".repeat(43) });
@@ -199,6 +222,7 @@ test("prepare response includes a Linux platform and local readiness", async () 
     ok: true,
     installation_id: "install_01",
     cua_ready: true,
+    cua_upgrade_required: false,
     native_executor_ready: false,
     gateway_connected: false,
     relay_active: true,
@@ -214,13 +238,14 @@ test("prepare preserves a finite unavailable-runtime result", async () => {
   const fake = createFakeChild();
   const client = new CompanionClient(fake.child);
   const pending = client.request({ version: "1", action: "prepare", scope: "workspace:request", enrollment_ticket: "A".repeat(43) });
-  fake.stdout.write('{"id":1,"ok":true,"result":{"installation_id":null,"operating_system":"linux","runtime_available":false,"cua_ready":false,"native_executor_ready":false,"gateway_connected":false,"relay_active":false,"relay_paused":true,"user_paused":false}}\n');
+  fake.stdout.write('{"id":1,"ok":true,"result":{"installation_id":null,"operating_system":"linux","runtime_available":false,"cua_ready":false,"cua_upgrade_required":false,"native_executor_ready":false,"gateway_connected":false,"relay_active":false,"relay_paused":true,"user_paused":false}}\n');
   assert.deepEqual(await pending, {
     ok: true,
     installation_id: null,
     operating_system: "linux",
     runtime_available: false,
     cua_ready: false,
+    cua_upgrade_required: false,
     native_executor_ready: false,
     gateway_connected: false,
     relay_active: false,

@@ -21,6 +21,57 @@ import (
 
 const pinnedCUAProtocolVersion = "2025-06-18"
 
+func TestClientReportsProtocolMismatchAsUpgradeRequired(t *testing.T) {
+	t.Parallel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal("resolve test executable")
+	}
+	client, err := New(executable)
+	if err != nil {
+		t.Fatalf("create Cua client: %v", err)
+	}
+	client.command = func(ctx context.Context, path string) *exec.Cmd {
+		return exec.CommandContext(ctx, path, "-test.run=^TestCUAHelperProcess$", "--", "mcp-protocol-mismatch")
+	}
+	if _, err := client.Start(context.Background()); !errors.Is(err, ErrProtocolMismatch) {
+		t.Fatalf("Start() error = %v, want protocol mismatch", err)
+	}
+	if client.Alive() {
+		t.Fatal("mismatched server process remains alive")
+	}
+}
+
+func TestClientRejectsMalformedInitializeProtocolVersions(t *testing.T) {
+	t.Parallel()
+	for _, helperMode := range []string{
+		"mcp-protocol-missing", "mcp-protocol-null", "mcp-protocol-number", "mcp-protocol-empty", "mcp-protocol-whitespace",
+		"mcp-protocol-malformed", "mcp-protocol-invalid-date",
+	} {
+		helperMode := helperMode
+		t.Run(helperMode, func(t *testing.T) {
+			t.Parallel()
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal("resolve test executable")
+			}
+			client, err := New(executable)
+			if err != nil {
+				t.Fatalf("create Cua client: %v", err)
+			}
+			client.command = func(ctx context.Context, path string) *exec.Cmd {
+				return exec.CommandContext(ctx, path, "-test.run=^TestCUAHelperProcess$", "--", helperMode)
+			}
+			if _, err := client.Start(context.Background()); !errors.Is(err, ErrInvalidFrame) {
+				t.Fatalf("Start() error = %v, want invalid frame", err)
+			}
+			if client.Alive() {
+				t.Fatal("malformed server process remains alive")
+			}
+		})
+	}
+}
+
 func TestClientRunsBoundedMCPCallsInOneOwnedProcess(t *testing.T) {
 	t.Parallel()
 	executable, err := os.Executable()
@@ -522,7 +573,15 @@ func TestChildEnvironmentKeepsDesktopSessionAndDropsSecrets(t *testing.T) {
 }
 
 func TestCUAHelperProcess(t *testing.T) {
-	if len(os.Args) < 2 || os.Args[len(os.Args)-1] != "mcp" {
+	if len(os.Args) < 2 {
+		return
+	}
+	helperMode := os.Args[len(os.Args)-1]
+	if helperMode != "mcp" && helperMode != "mcp-protocol-mismatch" &&
+		helperMode != "mcp-protocol-missing" && helperMode != "mcp-protocol-null" &&
+		helperMode != "mcp-protocol-number" && helperMode != "mcp-protocol-empty" &&
+		helperMode != "mcp-protocol-whitespace" && helperMode != "mcp-protocol-malformed" &&
+		helperMode != "mcp-protocol-invalid-date" {
 		return
 	}
 	input := bufio.NewScanner(os.Stdin)
@@ -549,7 +608,32 @@ func TestCUAHelperProcess(t *testing.T) {
 				os.Exit(20)
 			}
 			fmt.Println(`{"jsonrpc":"2.0","method":"notifications/progress","params":{}}`)
-			fmt.Printf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"protocolVersion\":%q,\"capabilities\":{},\"serverInfo\":{\"name\":\"fake-cua\",\"version\":\"test\"}}}\n", *request.ID, pinnedCUAProtocolVersion)
+			switch helperMode {
+			case "mcp-protocol-missing":
+				fmt.Printf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"capabilities\":{},\"serverInfo\":{\"name\":\"fake-cua\",\"version\":\"test\"}}}\n", *request.ID)
+				continue
+			case "mcp-protocol-null", "mcp-protocol-number", "mcp-protocol-empty", "mcp-protocol-whitespace", "mcp-protocol-malformed", "mcp-protocol-invalid-date":
+				protocolValue := "null"
+				switch helperMode {
+				case "mcp-protocol-number":
+					protocolValue = "42"
+				case "mcp-protocol-empty":
+					protocolValue = `""`
+				case "mcp-protocol-whitespace":
+					protocolValue = `"   "`
+				case "mcp-protocol-malformed":
+					protocolValue = `"garbage"`
+				case "mcp-protocol-invalid-date":
+					protocolValue = `"2025-99-99"`
+				}
+				fmt.Printf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"protocolVersion\":%s,\"capabilities\":{},\"serverInfo\":{\"name\":\"fake-cua\",\"version\":\"test\"}}}\n", *request.ID, protocolValue)
+				continue
+			}
+			serverVersion := pinnedCUAProtocolVersion
+			if helperMode == "mcp-protocol-mismatch" {
+				serverVersion = "2025-11-25"
+			}
+			fmt.Printf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"protocolVersion\":%q,\"capabilities\":{},\"serverInfo\":{\"name\":\"fake-cua\",\"version\":\"test\"}}}\n", *request.ID, serverVersion)
 		case "tools/list":
 			fmt.Printf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"tools\":[", *request.ID)
 			names := make([]string, 0, len(exposedTools))

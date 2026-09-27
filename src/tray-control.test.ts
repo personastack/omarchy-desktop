@@ -8,6 +8,7 @@ const baseState: DesktopControlState = {
   operating_system: "linux",
   runtime_available: true,
   cua_ready: true,
+  cua_upgrade_required: false,
   native_executor_ready: true,
   gateway_connected: true,
   relay_active: true,
@@ -24,6 +25,7 @@ test("tray actions distinguish user pause and allow pausing a degraded active re
   assert.equal(trayControlAction({ state: { ...baseState, runtime_available: false } }), undefined);
   assert.equal(trayControlAction({ state: { ...baseState, installation_id: null, relay_paused: true } }), undefined);
   assert.equal(trayControlCanSetUp({ state: { ...baseState, installation_id: null } }), true);
+  assert.equal(trayControlCanSetUp({ state: { ...baseState, installation_id: null, cua_upgrade_required: true } }), false);
   assert.equal(trayControlCanSetUp({ state: { ...baseState, installation_id: null, runtime_available: false } }), false);
   assert.equal(trayControlCanDisconnect({ state: baseState }), true);
   assert.equal(trayControlCanRepair({ state: baseState }), true);
@@ -38,6 +40,7 @@ test("tray actions distinguish user pause and allow pausing a degraded active re
   assert.equal(trayControlStatus({ state: { ...baseState, relay_paused: true } }), "Desktop Control: Remote control is not active");
   assert.equal(trayControlStatus({ state: { ...baseState, relay_active: undefined } }), "Desktop Control: Relay status unavailable");
   assert.equal(trayControlStatus({ state: { ...baseState, runtime_available: false, installation_id: null, relay_paused: true } }), "Desktop Control: Native runtime unavailable");
+  assert.equal(trayControlStatus({ state: { ...baseState, cua_ready: false, cua_upgrade_required: true } }), "Desktop Control: App update required");
 });
 
 test("a successful state refresh does not erase a failed lifecycle action", () => {
@@ -83,6 +86,32 @@ test("runtime availability changes count as tray state changes", () => {
   const available = { state: baseState };
   const unavailable = { state: { ...baseState, runtime_available: false } };
   assert.equal(sameTrayControlSnapshot(available, unavailable), false);
+});
+
+test("Cua incompatibility has a typed update-required tray status", () => {
+  const state = { ...baseState, cua_ready: false, cua_upgrade_required: true };
+  assert.equal(trayControlStatus({ state }), "Desktop Control: App update required");
+  assert.equal(trayControlStatus({ state: { ...state, user_paused: true, relay_paused: true } }), "Desktop Control: App update required");
+  assert.equal(trayControlStatus({ state: { ...state, relay_active: false } }), "Desktop Control: App update required");
+  assert.equal(trayControlStatus({ state: { ...state, relay_active: undefined } }), "Desktop Control: App update required");
+  assert.equal(trayControlStatus({ state: { ...state, installation_id: null } }), "Desktop Control: App update required");
+  assert.equal(sameTrayControlSnapshot({ state: baseState }, { state }), false);
+});
+
+test("failed repair preserves update-required status after a fresh state read", () => {
+  const incompatible = { ...baseState, cua_ready: false, cua_upgrade_required: true };
+  const failedRepair = applyTrayActionResult({ state: incompatible, stateFresh: true }, { ok: false, error: "unavailable" });
+  assert.equal(failedRepair.actionError, "unavailable");
+  assert.equal(trayControlStatus(failedRepair), "Desktop Control: App update required");
+  const refreshed = applyTrayStateRead(failedRepair, { ok: true, ...incompatible });
+  assert.equal(refreshed.actionError, "unavailable");
+  assert.equal(refreshed.stateFresh, true);
+  assert.equal(trayControlStatus(refreshed), "Desktop Control: App update required");
+});
+
+test("initial state read failure takes precedence over the empty-state message", () => {
+  assert.equal(trayControlStatus({ refreshError: "unavailable" }), "Desktop Control: Needs attention");
+  assert.equal(trayControlStatus({ actionError: "unavailable" }), "Desktop Control: Needs attention");
 });
 
 test("a successful action clears prior errors and records the authoritative state", () => {

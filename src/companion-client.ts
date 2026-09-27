@@ -19,6 +19,7 @@ export type DesktopControlState = Readonly<{
   operating_system: "linux";
   runtime_available: boolean;
   cua_ready: boolean;
+  cua_upgrade_required: boolean;
   native_executor_ready: boolean;
   gateway_connected: boolean;
   relay_active?: boolean;
@@ -235,7 +236,7 @@ function parseResponse(value: unknown, action: CompanionAction): Readonly<{ id: 
     if (hasExactKeys(value, ["id", "ok"])) return { id: Number(value.id), result: { ok: true } };
     if (!hasExactKeys(value, ["id", "ok", "result"]) || !isRecord(value.result)) return undefined;
     const hasRelayActivity = Object.hasOwn(value.result, "relay_active");
-    const fields = ["installation_id", "operating_system", "runtime_available", "cua_ready", "native_executor_ready", "gateway_connected", "relay_paused", "user_paused"];
+    const fields = ["installation_id", "operating_system", "runtime_available", "cua_ready", "cua_upgrade_required", "native_executor_ready", "gateway_connected", "relay_paused", "user_paused"];
     const expectedFields = hasRelayActivity ? [...fields, "relay_active"] : fields;
     if (hasExactKeys(value.result, expectedFields) &&
         isLocalState(value.result) && value.result.operating_system === "linux") {
@@ -269,7 +270,7 @@ function parseLocalSessionResult(value: unknown): LocalSessionResult | undefined
 function isLocalState(value: Record<string, unknown>): value is Record<string, unknown> & DesktopControlState {
   return (typeof value.installation_id === "string" || value.installation_id === null) && value.operating_system === "linux" &&
     typeof value.runtime_available === "boolean" &&
-    typeof value.cua_ready === "boolean" && typeof value.native_executor_ready === "boolean" &&
+    typeof value.cua_ready === "boolean" && typeof value.cua_upgrade_required === "boolean" && typeof value.native_executor_ready === "boolean" &&
     typeof value.gateway_connected === "boolean" &&
     (!Object.hasOwn(value, "relay_active") || typeof value.relay_active === "boolean") &&
     typeof value.relay_paused === "boolean" && typeof value.user_paused === "boolean";

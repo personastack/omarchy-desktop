@@ -968,7 +968,9 @@ func (controller *Controller) LocalState(ctx context.Context, origin string) (in
 	executor := controller.executor
 	connection := controller.connection
 	controller.mu.Unlock()
-	state.CuaReady = controller.runtime.State().Ready
+	runtimeState := controller.runtime.State()
+	state.CuaReady = runtimeState.Ready
+	state.CuaUpgradeRequired = runtimeState.UpgradeRequired
 	state.NativeExecutorReady = executor != nil && executor.NativeReady()
 	state.GatewayConnected = connection != nil && connection.Status().Connected
 	controller.mu.Lock()

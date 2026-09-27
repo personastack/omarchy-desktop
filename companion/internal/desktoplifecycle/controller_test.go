@@ -23,6 +23,7 @@ import (
 
 type runtimeFake struct {
 	mu               sync.Mutex
+	state            cuaruntime.State
 	prepareCalls     int
 	repairCalls      int
 	stopCalls        int
@@ -40,15 +41,17 @@ func (runtime *runtimeFake) Repair(context.Context) (cuaruntime.State, error) {
 	runtime.repairCalls++
 	runtime.events = append(runtime.events, "repair")
 	if runtime.repairErr != nil {
-		return cuaruntime.State{}, runtime.repairErr
+		return runtime.state, runtime.repairErr
 	}
-	return cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}, nil
+	runtime.state = cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}
+	return runtime.state, nil
 }
 
 func (runtime *runtimeFake) Prepare(context.Context) (cuaruntime.State, error) {
 	runtime.mu.Lock()
 	runtime.prepareCalls++
 	runtime.events = append(runtime.events, "prepare")
+	runtime.state = cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}
 	block := runtime.prepareBlockCall == runtime.prepareCalls
 	started, release := runtime.prepareStarted, runtime.prepareRelease
 	runtime.mu.Unlock()
@@ -66,6 +69,9 @@ func (*runtimeFake) Call(context.Context, agentgatewayruntime.DesktopControlOper
 func (runtime *runtimeFake) State() cuaruntime.State {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	if runtime.state.UpgradeRequired {
+		return runtime.state
+	}
 	return cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}
 }
 
@@ -79,6 +85,7 @@ func (runtime *runtimeFake) Stop() {
 	runtime.mu.Lock()
 	runtime.stopCalls++
 	runtime.events = append(runtime.events, "stop")
+	runtime.state = cuaruntime.State{UpgradeRequired: runtime.state.UpgradeRequired}
 	runtime.mu.Unlock()
 }
 
@@ -617,7 +624,7 @@ func TestRepairKeepsRuntimeFencedWhenThePinnedDriverCannotBeRestored(t *testing.
 	t.Parallel()
 	preference := &pausePreferenceFake{}
 	repairErr := errors.New("managed Cua files are foreign")
-	runtime := &runtimeFake{repairErr: repairErr}
+	runtime := &runtimeFake{state: cuaruntime.State{UpgradeRequired: true}, repairErr: repairErr}
 	service := &installServiceFake{active: true}
 	options := Options{
 		Origin: testOrigin, Runtime: runtime, Installations: service,
@@ -630,7 +637,7 @@ func TestRepairKeepsRuntimeFencedWhenThePinnedDriverCannotBeRestored(t *testing.
 	}
 	t.Cleanup(func() { controller.Close(context.Background()) })
 	state, err := controller.Repair(context.Background())
-	if !errors.Is(err, repairErr) || !state.UserPaused || !state.RelayPaused {
+	if !errors.Is(err, repairErr) || !state.UserPaused || !state.RelayPaused || !state.CuaUpgradeRequired {
 		t.Fatalf("Repair() state=%#v err=%v", state, err)
 	}
 	service.mu.Lock()

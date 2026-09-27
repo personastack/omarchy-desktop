@@ -58,7 +58,7 @@ func parseHealthReport(raw json.RawMessage) (HealthReportSnapshot, error) {
 }
 
 func validHealthReport(report HealthReportSnapshot) bool {
-	if report.SchemaVersion != "1" || report.Platform != "linux" || strings.TrimSpace(report.DriverVersion) == "" ||
+	if report.SchemaVersion != "1" || report.Platform != "linux" || !validDriverVersion(report.DriverVersion) ||
 		(report.Overall != "ok" && report.Overall != "degraded" && report.Overall != "failed") || len(report.Checks) == 0 {
 		return false
 	}
@@ -101,6 +101,24 @@ func validHealthReport(report HealthReportSnapshot) bool {
 		wantOverall = "degraded"
 	}
 	return report.Overall == wantOverall
+}
+
+func validDriverVersion(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || (len(part) > 1 && part[0] == '0') {
+			return false
+		}
+		for _, digit := range part {
+			if digit < '0' || digit > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func coreHealthCheck(name string) bool {

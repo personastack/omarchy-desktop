@@ -22,7 +22,7 @@ export function isCurrentTrayControlAction(snapshot: TrayControlSnapshot, action
 
 export function trayControlCanSetUp(snapshot: TrayControlSnapshot): boolean {
   const state = snapshot.state;
-  return !snapshot.refreshError && snapshot.stateFresh !== false && !!state?.runtime_available && !state.installation_id;
+  return !snapshot.refreshError && snapshot.stateFresh !== false && !!state?.runtime_available && !state.cua_upgrade_required && !state.installation_id;
 }
 
 export function trayControlCanDisconnect(snapshot: TrayControlSnapshot): boolean {
@@ -37,6 +37,7 @@ export function trayControlCanRepair(snapshot: TrayControlSnapshot): boolean {
 
 export function trayControlStatus(snapshot: TrayControlSnapshot): string {
   const state = snapshot.state;
+  if (state?.cua_upgrade_required) return "Desktop Control: App update required";
   if (snapshot.actionError || snapshot.refreshError) return "Desktop Control: Needs attention";
   if (!state) return "Desktop Control: Checking status…";
   if (!state.runtime_available) return "Desktop Control: Native runtime unavailable";
@@ -78,6 +79,7 @@ export function sameTrayControlSnapshot(left: TrayControlSnapshot, right: TrayCo
 function sameState(left: DesktopControlState | undefined, right: DesktopControlState | undefined): boolean {
   if (!left || !right) return left === right;
   return left.installation_id === right.installation_id && left.cua_ready === right.cua_ready &&
+    left.cua_upgrade_required === right.cua_upgrade_required &&
     left.native_executor_ready === right.native_executor_ready && left.gateway_connected === right.gateway_connected &&
     left.relay_active === right.relay_active && left.relay_paused === right.relay_paused && left.user_paused === right.user_paused &&
     left.runtime_available === right.runtime_available;

@@ -72,6 +72,7 @@ type Result struct {
 	OperatingSystem     string  `json:"operating_system"`
 	RuntimeAvailable    *bool   `json:"runtime_available,omitempty"`
 	CuaReady            bool    `json:"cua_ready"`
+	CuaUpgradeRequired  bool    `json:"cua_upgrade_required"`
 	NativeExecutorReady bool    `json:"native_executor_ready"`
 	GatewayConnected    bool    `json:"gateway_connected"`
 	RelayActive         *bool   `json:"relay_active,omitempty"`
@@ -303,7 +304,7 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 	}
 	response.OK = true
 	result := &Result{
-		InstallationID: state.InstallationID, CuaReady: state.CuaReady,
+		InstallationID: state.InstallationID, CuaReady: state.CuaReady, CuaUpgradeRequired: state.CuaUpgradeRequired,
 		NativeExecutorReady: state.NativeExecutorReady, GatewayConnected: state.GatewayConnected,
 		RelayActive: state.RelayActive, RelayPaused: state.RelayPaused, UserPaused: state.UserPaused, OperatingSystem: "linux",
 	}

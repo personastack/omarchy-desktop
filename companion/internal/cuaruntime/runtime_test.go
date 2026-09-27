@@ -367,12 +367,55 @@ func TestPrepareStopsDriverWhenHealthDoesNotMatchPinnedLinuxRuntime(t *testing.T
 	client := &clientStub{catalog: cuamcp.Catalog{Available: []string{"click"}}, report: badReport}
 	runtime := mustRuntime(t, &installerStub{path: "/owned/cua-driver"}, func(context.Context, string) (Client, error) { return client, nil })
 	state, err := runtime.Prepare(context.Background())
-	if !errors.Is(err, ErrNotReady) || state != (State{}) || runtime.State() != (State{}) || client.stops != 1 {
+	if !errors.Is(err, ErrUpgradeRequired) || state != (State{}) || runtime.State() != (State{UpgradeRequired: true}) || client.stops != 1 {
 		t.Fatalf("Prepare() = %#v, %v; current=%#v stops=%d", state, err, runtime.State(), client.stops)
 	}
 	if _, err := runtime.Call(context.Background(), agentgatewayruntime.DesktopControlOperationObserve, "get_desktop_state", json.RawMessage(`{}`)); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Call() before readiness error = %v", err)
 	}
+}
+
+func TestProtocolMismatchPersistsTypedUpgradeStateUntilRepairSucceeds(t *testing.T) {
+	t.Parallel()
+	first := &clientStub{startErr: cuamcp.ErrProtocolMismatch}
+	second := &clientStub{startErr: errors.New("still incompatible")}
+	third := &clientStub{startErr: errors.New("retry still fails")}
+	fourth := &clientStub{catalog: cuamcp.Catalog{Available: []string{"click"}}, report: readyReport()}
+	factoryCalls := 0
+	runtime := mustRuntime(t, &installerStub{path: "/owned/cua-driver"}, func(context.Context, string) (Client, error) {
+		factoryCalls++
+		switch factoryCalls {
+		case 1:
+			return first, nil
+		case 2:
+			return second, nil
+		case 3:
+			return third, nil
+		default:
+			return fourth, nil
+		}
+	})
+	if _, err := runtime.Prepare(context.Background()); !errors.Is(err, cuamcp.ErrProtocolMismatch) {
+		t.Fatalf("Prepare() error = %v, want protocol mismatch", err)
+	}
+	if got := runtime.State(); got != (State{UpgradeRequired: true}) {
+		t.Fatalf("state after protocol mismatch = %#v", got)
+	}
+	runtime.Stop()
+	if got := runtime.State(); got != (State{UpgradeRequired: true}) {
+		t.Fatalf("state after stop = %#v", got)
+	}
+	if _, err := runtime.Repair(context.Background()); err == nil || runtime.State() != (State{UpgradeRequired: true}) {
+		t.Fatalf("failed repair cleared update state: err=%v state=%#v", err, runtime.State())
+	}
+	if _, err := runtime.Prepare(context.Background()); err == nil || runtime.State() != (State{UpgradeRequired: true}) {
+		t.Fatalf("failed prepare cleared update state: err=%v state=%#v", err, runtime.State())
+	}
+	state, err := runtime.Repair(context.Background())
+	if err != nil || !state.Ready || state.UpgradeRequired || runtime.State() != state {
+		t.Fatalf("Repair() = %#v, %v; current=%#v", state, err, runtime.State())
+	}
+	runtime.Close()
 }
 
 func TestPrepareStopsDriverWhenStartOrHealthProbeFails(t *testing.T) {

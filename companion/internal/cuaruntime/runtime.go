@@ -14,8 +14,9 @@ import (
 )
 
 var (
-	ErrUnavailable = errors.New("managed Cua runtime unavailable")
-	ErrNotReady    = errors.New("managed Cua runtime did not pass Linux readiness")
+	ErrUnavailable     = errors.New("managed Cua runtime unavailable")
+	ErrNotReady        = errors.New("managed Cua runtime did not pass Linux readiness")
+	ErrUpgradeRequired = errors.New("PersonaStack Desktop upgrade required for the pinned Cua runtime")
 )
 
 type Installer interface {
@@ -35,9 +36,10 @@ type Client interface {
 type Factory func(context.Context, string) (Client, error)
 
 type State struct {
-	Ready         bool
-	DriverVersion string
-	ToolCount     int
+	Ready           bool
+	UpgradeRequired bool
+	DriverVersion   string
+	ToolCount       int
 }
 
 type Runtime struct {
@@ -181,6 +183,9 @@ func (r *Runtime) prepare(ctx context.Context, repair bool) (State, error) {
 	r.mu.Unlock()
 	catalog, err := client.StartWithLifetime(setupCtx, processCtx)
 	if err != nil {
+		if errors.Is(err, cuamcp.ErrProtocolMismatch) {
+			r.recordUpgradeRequired()
+		}
 		return State{}, fmt.Errorf("start Cua MCP process: %w", err)
 	}
 	if _, err := client.CheckPermissions(setupCtx); err != nil {
@@ -189,6 +194,10 @@ func (r *Runtime) prepare(ctx context.Context, repair bool) (State, error) {
 	report, err := client.HealthReport(setupCtx)
 	if err != nil {
 		return State{}, fmt.Errorf("read Cua Linux health report: %w", err)
+	}
+	if report.DriverVersion != cuainstaller.DriverVersion {
+		r.recordUpgradeRequired()
+		return State{}, ErrUpgradeRequired
 	}
 	if !report.ReadyFor(cuainstaller.DriverVersion) || !client.Alive() {
 		return State{}, ErrNotReady
@@ -211,6 +220,14 @@ func (r *Runtime) prepare(ctx context.Context, repair bool) (State, error) {
 	state := r.state
 	r.mu.Unlock()
 	return state, nil
+}
+
+func (r *Runtime) recordUpgradeRequired() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.closed {
+		r.state = State{UpgradeRequired: true}
+	}
 }
 
 // Call routes the executor's finite Cua request to the ready managed child.
@@ -261,6 +278,7 @@ func (r *Runtime) Close() {
 	preparingClient := r.preparingClient
 	r.preparingClient = nil
 	client, runCancel := r.detachLocked()
+	r.state = State{}
 	r.mu.Unlock()
 	if setupCancel != nil {
 		setupCancel()
@@ -290,7 +308,7 @@ func (r *Runtime) detachLocked() (Client, context.CancelFunc) {
 	client, cancel := r.client, r.runCancel
 	r.client = nil
 	r.runCancel = nil
-	r.state = State{}
+	r.state = State{UpgradeRequired: r.state.UpgradeRequired}
 	return client, cancel
 }
 

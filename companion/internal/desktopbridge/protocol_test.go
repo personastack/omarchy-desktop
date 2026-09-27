@@ -197,6 +197,24 @@ func TestProcessorReadsTrayLifecycleStateWithoutHostedWorkspaceSync(t *testing.T
 	}
 }
 
+func TestProcessorPreservesTypedCuaUpgradeState(t *testing.T) {
+	t.Parallel()
+	active := true
+	lifecycle := &controlRuntimeStub{state: installation.LocalState{CuaUpgradeRequired: true, RelayActive: &active}}
+	processor, err := NewWithControlRuntime(&serviceStub{}, nil, lifecycle, "https://my.personastack.ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := processor.Handle(context.Background(), Request{ID: 1, Version: "1", Action: ActionState, Scope: LifecycleScope})
+	if !response.OK || response.Result == nil || !response.Result.CuaUpgradeRequired || response.Result.CuaReady {
+		t.Fatalf("typed Cua upgrade state = %#v", response)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil || !strings.Contains(string(encoded), `"cua_upgrade_required":true`) {
+		t.Fatalf("encoded state = %s, %v", encoded, err)
+	}
+}
+
 func TestProcessorPrepareReportsUnimplementedRuntimeWithoutEnrollment(t *testing.T) {
 	t.Parallel()
 	service := &serviceStub{state: installation.LocalState{RelayPaused: true}}

@@ -46,6 +46,7 @@ type Status struct {
 type LocalState struct {
 	InstallationID      *string `json:"installation_id"`
 	CuaReady            bool    `json:"cua_ready"`
+	CuaUpgradeRequired  bool    `json:"cua_upgrade_required"`
 	NativeExecutorReady bool    `json:"native_executor_ready"`
 	GatewayConnected    bool    `json:"gateway_connected"`
 	RelayActive         *bool   `json:"relay_active,omitempty"`
