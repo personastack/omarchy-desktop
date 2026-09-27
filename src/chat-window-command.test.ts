@@ -10,6 +10,7 @@ import type { ChatWindowCommand } from "./security.js";
 
 class FakeChatWindow implements ChatWindowCommandTarget {
   destroyed = false;
+  resizable = true;
   position: [number, number] = [100, 80];
   size: [number, number] = [440, 640];
   minimumSize: [number, number] = [340, 360];
@@ -23,6 +24,7 @@ class FakeChatWindow implements ChatWindowCommandTarget {
     this.size = [Math.max(width, this.minimumSize[0]), Math.max(height, this.minimumSize[1])];
   }
   setMinimumSize(width: number, height: number): void { this.minimumSize = [width, height]; }
+  setResizable(resizable: boolean): void { this.resizable = resizable; }
   minimize(): void { this.minimized = true; }
   isAlwaysOnTop(): boolean { return this.alwaysOnTop; }
   setAlwaysOnTop(flag: boolean, level?: string): void {
@@ -39,13 +41,14 @@ function command(action: ChatWindowCommand["action"]): ChatWindowCommand {
     : { version: "1", action };
 }
 
-function dependencies(): ChatWindowCommandDependencies & { closed: number; matchedBounds: unknown[] } {
+function dependencies(): ChatWindowCommandDependencies & { readonly closed: number; readonly matchedBounds: unknown[] } {
+  const state = { closed: 0, matchedBounds: [] as unknown[] };
   return {
-    closed: 0,
-    matchedBounds: [],
-    close() { this.closed += 1; },
-    workAreaFor(bounds) {
-      this.matchedBounds.push(bounds);
+    get closed() { return state.closed; },
+    matchedBounds: state.matchedBounds,
+    close: () => { state.closed += 1; },
+    workAreaFor: (bounds) => {
+      state.matchedBounds.push(bounds);
       return { x: 0, y: 0, width: 1000, height: 800 };
     },
   };
@@ -65,10 +68,12 @@ test("chat window commands preserve collapse size and expand state", () => {
   const window = new FakeChatWindow();
   const deps = dependencies();
   const saved = applyChatWindowCommand(command("collapse"), window, undefined, deps);
+  assert.equal(window.resizable, false);
   assert.deepEqual(window.size, [72, 72]);
   assert.deepEqual(saved, [440, 640]);
 
   applyChatWindowCommand(command("expand"), window, saved, deps);
+  assert.equal(window.resizable, true);
   assert.deepEqual(window.minimumSize, [340, 360]);
   assert.deepEqual(window.size, [440, 640]);
 });

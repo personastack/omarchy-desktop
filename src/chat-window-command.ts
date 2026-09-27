@@ -2,8 +2,8 @@ import {
   applyChatWindowSizeAction,
   clampChatPosition,
   type ChatWindowSizer,
-  type WorkArea,
   type WindowPosition,
+  type WorkAreaFor,
 } from "./chat-window-state.js";
 import type { ChatWindowCommand } from "./security.js";
 
@@ -11,20 +11,11 @@ export interface ChatWindowCommandTarget extends ChatWindowSizer {
   minimize(): void;
   isAlwaysOnTop(): boolean;
   setAlwaysOnTop(flag: boolean, level?: "normal" | "floating" | "torn-off-menu" | "modal-panel" | "main-menu" | "status" | "pop-up-menu" | "screen-saver"): void;
-  getPosition(): number[];
-  setPosition(x: number, y: number): void;
-}
-
-export interface ChatWindowDisplayBounds {
-  readonly x: number;
-  readonly y: number;
-  readonly width: number;
-  readonly height: number;
 }
 
 export interface ChatWindowCommandDependencies {
   readonly close: () => void;
-  readonly workAreaFor: (bounds: ChatWindowDisplayBounds) => WorkArea;
+  readonly workAreaFor: WorkAreaFor;
 }
 
 export function applyChatWindowCommand(
@@ -41,9 +32,9 @@ export function applyChatWindowCommand(
       dependencies.close();
       return savedExpandedSize;
     case "collapse":
-      return applyChatWindowSizeAction("collapse", window, savedExpandedSize);
+      return applyChatWindowSizeAction("collapse", window, savedExpandedSize, dependencies.workAreaFor);
     case "expand":
-      return applyChatWindowSizeAction("expand", window, savedExpandedSize);
+      return applyChatWindowSizeAction("expand", window, savedExpandedSize, dependencies.workAreaFor);
     case "pin":
       window.setAlwaysOnTop(!window.isAlwaysOnTop(), "floating");
       return savedExpandedSize;
