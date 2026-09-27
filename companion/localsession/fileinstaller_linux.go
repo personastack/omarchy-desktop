@@ -59,6 +59,8 @@ type pluginManifest struct {
 	Name        string `json:"name"`
 	Version     string `json:"version"`
 	Description string `json:"description"`
+	Skills      string `json:"skills,omitempty"`
+	MCPServers  string `json:"mcpServers,omitempty"`
 }
 
 type mcpHeaders struct {
@@ -329,9 +331,14 @@ func (f *FileInstaller) writeSource(directory string, paths installerPaths, bund
 	if err := makePrivateDirectories(paths.root, directory, marketplace, filepath.Join(marketplace, "plugins"), plugin, pluginMetadata); err != nil {
 		return err
 	}
-	if err := writeJSON(filepath.Join(pluginMetadata, "plugin.json"), pluginManifest{
+	manifest := pluginManifest{
 		Name: paths.pluginName, Version: "1.0.0", Description: "Active PersonaStack local persona context and MCP connection.",
-	}); err != nil {
+	}
+	if bundle.Harness == apicontract.LocalSessionHarnessCodex {
+		manifest.Skills = "./skills/"
+		manifest.MCPServers = "./.mcp.json"
+	}
+	if err := writeJSON(filepath.Join(pluginMetadata, "plugin.json"), manifest); err != nil {
 		return err
 	}
 	server := mcpServer{Type: "http", URL: bundle.MCPURL, Headers: mcpHeaders{Authorization: "Bearer " + bundle.BearerToken}}

@@ -80,6 +80,23 @@ func TestFileInstallerConfiguresCodexAndClaudeThroughPluginManagers(t *testing.T
 				t.Fatalf("active plugin ownership = %#v, %v", active, err)
 			}
 			pluginSource := filepath.Join(active.Source, "marketplace", "plugins", paths.pluginName)
+			metadataDirectory := ".claude-plugin"
+			wantSkills, wantMCPServers := "", ""
+			if harness == HarnessCodex {
+				metadataDirectory = ".codex-plugin"
+				wantSkills, wantMCPServers = "./skills/", "./.mcp.json"
+			}
+			manifestData, err := os.ReadFile(filepath.Join(pluginSource, metadataDirectory, "plugin.json"))
+			if err != nil {
+				t.Fatalf("read plugin manifest: %v", err)
+			}
+			var manifest pluginManifest
+			if err := json.Unmarshal(manifestData, &manifest); err != nil {
+				t.Fatalf("decode plugin manifest: %v", err)
+			}
+			if manifest.Skills != wantSkills || manifest.MCPServers != wantMCPServers {
+				t.Fatalf("plugin component references = skills:%q mcpServers:%q, want skills:%q mcpServers:%q", manifest.Skills, manifest.MCPServers, wantSkills, wantMCPServers)
+			}
 			mcpPath := filepath.Join(pluginSource, ".mcp.json")
 			mcpInfo, err := os.Stat(mcpPath)
 			if err != nil || mcpInfo.Mode().Perm() != 0o600 {
