@@ -2,7 +2,7 @@
 
 **A desktop client for PersonaStack on Omarchy. Early work in progress.**
 
-This repository is building an Omarchy desktop application with the same user-visible functionality as the PersonaStack macOS app. The Electron shell and a small set of hosted-window bridges are implemented. The product is incomplete, not packaged, and not ready to install. There are no release packages.
+This repository is building an Omarchy desktop application with the same user-visible functionality as the PersonaStack macOS app. The Electron shell and a small set of hosted-window bridges are implemented. The product is incomplete and not ready to install. A local Arch package recipe exists, but there are no release packages.
 
 ## Planned functionality
 
