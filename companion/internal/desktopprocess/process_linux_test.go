@@ -101,9 +101,26 @@ func TestCloseStdinDeliversEOFAndRejectsFurtherWrites(t *testing.T) {
 	if err := manager.Write(context.Background(), started.ExecutionID, []byte("late")); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("write after EOF = %v", err)
 	}
-	result, err := manager.Read(context.Background(), started.ExecutionID, 0, 3*time.Second)
-	if err != nil || result.State != StateExited || !strings.Contains(joinStream(result.Chunks, "stdout"), "stdin-closed") {
-		t.Fatalf("EOF result = %#v, %v", result, err)
+	chunks := append([]Chunk(nil), started.Chunks...)
+	cursor := started.NextCursor
+	deadline := time.Now().Add(3 * time.Second)
+	var result Read
+	for {
+		result, err = manager.Read(context.Background(), started.ExecutionID, cursor, time.Until(deadline))
+		if err != nil {
+			t.Fatalf("read after stdin EOF: %#v, %v", result, err)
+		}
+		chunks = append(chunks, result.Chunks...)
+		cursor = result.NextCursor
+		if result.State != StateRunning {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("process did not exit after stdin EOF: %#v", result)
+		}
+	}
+	if result.State != StateExited || !strings.Contains(joinStream(chunks, "stdout"), "stdin-closed") {
+		t.Fatalf("EOF result = %#v, stdout=%q", result, joinStream(chunks, "stdout"))
 	}
 	if !manager.CloseAll(context.Background()) {
 		t.Fatal("CloseAll did not confirm cleanup")
