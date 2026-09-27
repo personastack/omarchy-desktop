@@ -3,8 +3,12 @@ import { createConnection, type Socket } from "node:net";
 import { join } from "node:path";
 
 export interface HyprlandPinnedWindow {
-  getNativeWindowHandle(): Buffer;
   isDestroyed(): boolean;
+}
+
+export interface HyprlandWindowIdentity {
+  readonly initialTitle: string;
+  readonly processID: number;
 }
 
 export interface HyprlandEventSocket {
@@ -22,9 +26,15 @@ export interface HyprlandPinDependencies {
 
 interface HyprlandClient {
   readonly address: string;
-  readonly xwaylandWindow: number;
+  readonly initialTitle: string;
+  readonly processID: number;
   readonly workspace: number;
   readonly monitor: number;
+}
+
+interface PinnedWindow {
+  readonly window: HyprlandPinnedWindow;
+  readonly processID: number;
 }
 
 interface HyprlandMonitor {
@@ -88,11 +98,14 @@ function parseClients(raw: string): HyprlandClient[] {
     const address = typeof item?.address === "string" && /^0x[\da-f]+$/i.test(item.address)
       ? item.address
       : undefined;
-    const xwaylandWindow = item?.xwayland === true ? positiveInteger(item.xwaylandWindow) : undefined;
+    const initialTitle = typeof item?.initialTitle === "string" && /^PersonaStackChat:[0-9a-f-]{36}$/.test(item.initialTitle)
+      ? item.initialTitle
+      : undefined;
+    const processID = positiveInteger(item?.pid);
     const workspaceID = safeInteger(workspace?.id);
     const monitor = safeInteger(item?.monitor);
-    return address && xwaylandWindow !== undefined && workspaceID !== undefined && monitor !== undefined
-      ? [{ address, xwaylandWindow, workspace: workspaceID, monitor }]
+    return address && item?.xwayland === true && initialTitle && processID !== undefined && workspaceID !== undefined && monitor !== undefined
+      ? [{ address, initialTitle, processID, workspace: workspaceID, monitor }]
       : [];
   });
 }
@@ -114,19 +127,8 @@ function parseMonitors(raw: string): HyprlandMonitor[] {
   });
 }
 
-function x11WindowID(window: HyprlandPinnedWindow): number | undefined {
-  if (window.isDestroyed()) return undefined;
-  try {
-    const handle = window.getNativeWindowHandle();
-    if (handle.length < 4) return undefined;
-    return positiveInteger(handle.readUInt32LE(0));
-  } catch {
-    return undefined;
-  }
-}
-
 export class HyprlandPinAdapter {
-  private readonly pinned = new Map<number, HyprlandPinnedWindow>();
+  private readonly pinned = new Map<string, PinnedWindow>();
   private readonly socketPath: string | undefined;
   private socket: HyprlandEventSocket | undefined;
   private eventBuffer = "";
@@ -147,17 +149,16 @@ export class HyprlandPinAdapter {
     }
   }
 
-  async setPinned(window: HyprlandPinnedWindow, pinned: boolean): Promise<boolean> {
+  async setPinned(window: HyprlandPinnedWindow, pinned: boolean, identity?: HyprlandWindowIdentity): Promise<boolean> {
     if (!pinned) {
-      for (const [id, pinnedWindow] of this.pinned) {
-        if (pinnedWindow === window) this.pinned.delete(id);
+      for (const [initialTitle, pinnedWindow] of this.pinned) {
+        if (pinnedWindow.window === window && (!identity || initialTitle === identity.initialTitle)) this.pinned.delete(initialTitle);
       }
       if (this.pinned.size === 0) this.stopEvents();
       return true;
     }
-    const id = x11WindowID(window);
-    if (!this.socketPath || id === undefined) return false;
-    this.pinned.set(id, window);
+    if (!this.socketPath || window.isDestroyed() || !isWindowIdentity(identity)) return false;
+    this.pinned.set(identity.initialTitle, { window, processID: identity.processID });
     this.connectEvents();
     await this.refresh();
     return true;
@@ -234,12 +235,17 @@ export class HyprlandPinAdapter {
       ]);
       const clients = parseClients(clientJSON);
       const monitors = parseMonitors(monitorJSON);
-      for (const [id, window] of this.pinned) {
+      for (const [initialTitle, pinnedWindow] of this.pinned) {
+        const window = pinnedWindow.window;
         if (window.isDestroyed()) {
-          this.pinned.delete(id);
+          this.pinned.delete(initialTitle);
           continue;
         }
-        const client = clients.find((candidate) => candidate.xwaylandWindow === id);
+        const matches = clients.filter((candidate) =>
+          candidate.initialTitle === initialTitle && candidate.processID === pinnedWindow.processID,
+        );
+        if (matches.length !== 1) continue;
+        const [client] = matches;
         const visibleWorkspace = client && monitors.some((monitor) =>
           monitor.id === client.monitor && monitor.activeWorkspace === client.workspace,
         );
@@ -270,4 +276,10 @@ export class HyprlandPinAdapter {
     this.eventBuffer = "";
     socket?.destroy();
   }
+}
+
+function isWindowIdentity(identity: HyprlandWindowIdentity | undefined): identity is HyprlandWindowIdentity {
+  return identity !== undefined &&
+    /^PersonaStackChat:[0-9a-f-]{36}$/.test(identity.initialTitle) &&
+    Number.isSafeInteger(identity.processID) && identity.processID > 0;
 }

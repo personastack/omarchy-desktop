@@ -90,7 +90,8 @@ import {
 } from "./tray-control.js";
 
 const APP_NAME = "PersonaStack";
-const APP_ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMiIgaGVpZ2h0PSIzMiIgdmlld0JveD0iMCAwIDMyIDMyIj48cmVjdCB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHJ4PSI4IiBmaWxsPSIjNzY1NUZGIi8+PHBhdGggZD0iTTEwIDguNWg4LjVhNS41IDUuNSAwIDAgMSAwIDExSDExdjQuNWwtNC01LjUgNC01LjVWMTMuNWg3LjVhMS41IDEuNSAwIDAgMCAwLTNIMTB6IiBmaWxsPSJ3aGl0ZSIvPjwvc3ZnPg==";
+const APP_ICON = nativeImage.createFromPath(join(import.meta.dirname, "assets", "personastack.png"));
+if (APP_ICON.isEmpty()) throw new Error("The packaged PersonaStack PNG icon could not be loaded.");
 
 interface RegisteredWindow {
   readonly role: BridgeRole;
@@ -106,6 +107,7 @@ const windows = new Map<number, RegisteredWindow>();
 const chats = new Map<string, BrowserWindow>();
 const stackWindows = new Map<string, BrowserWindow>();
 const expandedChatSizes = new Map<BrowserWindow, readonly [number, number]>();
+const chatWindowIdentities = new WeakMap<BrowserWindow, string>();
 const hyprlandPin = new HyprlandPinAdapter();
 const programmaticChatClose = new WeakSet<BrowserWindow>();
 const closingWindows = new WeakSet<BrowserWindow>();
@@ -266,7 +268,7 @@ function openMainWindow(show = true, route?: string): void {
     minHeight: 600,
     show: false,
     title: APP_NAME,
-    icon: nativeImage.createFromDataURL(APP_ICON),
+    icon: APP_ICON,
   });
   if (show) mainWindow.once("ready-to-show", () => mainWindow?.show());
   mainWindow.on("close", (event) => {
@@ -461,7 +463,12 @@ function registerBridgeHandlers(): void {
     if (!entry || !command) return { ok: false };
     applyChatWindowCommand(command, entry.window);
     if (command.action === "pin" && process.platform === "linux") {
-      await hyprlandPin.setPinned(entry.window, entry.window.isAlwaysOnTop());
+      const initialTitle = chatWindowIdentities.get(entry.window);
+      await hyprlandPin.setPinned(
+        entry.window,
+        entry.window.isAlwaysOnTop(),
+        initialTitle ? { initialTitle, processID: process.pid } : undefined,
+      );
     }
     return { ok: true, collapsed: command.action === "collapse", pinned: entry.window.isAlwaysOnTop() };
   });
@@ -591,6 +598,7 @@ function applyChatMainCommand(command: ChatMainCommand): void {
 }
 
 function createChatWindow(personaID: string): BrowserWindow {
+  const initialTitle = `PersonaStackChat:${randomUUID()}`;
   const window = createWindow("chat", {
     width: 440,
     height: 640,
@@ -600,11 +608,13 @@ function createChatWindow(personaID: string): BrowserWindow {
     frame: false,
     transparent: true,
     resizable: true,
-    title: "Persona chat",
-    icon: nativeImage.createFromDataURL(APP_ICON),
+    title: initialTitle,
+    icon: APP_ICON,
   });
+  chatWindowIdentities.set(window, initialTitle);
+  window.once("show", () => window.setTitle("Persona chat"));
   window.on("closed", () => {
-    void hyprlandPin.setPinned(window, false);
+    void hyprlandPin.setPinned(window, false, { initialTitle, processID: process.pid });
     expandedChatSizes.delete(window);
     if (chats.get(personaID) === window) chats.delete(personaID);
   });
@@ -651,7 +661,7 @@ function openStackWindow(command: StackCommand): void {
     transparent: view === "graph",
     resizable: true,
     title: isStack ? `Stack ${command.view}` : "Persona activity",
-    icon: nativeImage.createFromDataURL(APP_ICON),
+    icon: APP_ICON,
   });
   stackWindows.set(key, window);
   window.on("close", () => closingWindows.add(window));
@@ -712,7 +722,7 @@ function isCurrentChatDocument(window: BrowserWindow): boolean {
 }
 
 function createTray(): void {
-  tray = new Tray(nativeImage.createFromDataURL(APP_ICON));
+  tray = new Tray(APP_ICON);
   tray.setToolTip(`${APP_NAME} is running`);
   updateTrayMenu();
   if (app.isPackaged) void refreshLaunchAtLoginStatus();

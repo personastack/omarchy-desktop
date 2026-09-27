@@ -25,27 +25,34 @@ class FakeSocket implements HyprlandEventSocket {
 }
 
 class FakeWindow implements HyprlandPinnedWindow {
-  readonly handle = Buffer.alloc(4);
-
-  constructor(id: number) {
-    this.handle.writeUInt32LE(id);
-  }
-
-  getNativeWindowHandle(): Buffer {
-    return this.handle;
-  }
-
   isDestroyed(): boolean {
     return false;
   }
 }
 
+const identity = {
+  initialTitle: "PersonaStackChat:01234567-89ab-cdef-0123-456789abcdef",
+  processID: 42,
+} as const;
+
 function profile(workspace: number, monitor: number): { readonly clients: string; readonly monitors: string } {
   return {
     clients: JSON.stringify([{
       address: "0xabc123",
+      mapped: true,
+      hidden: false,
+      visible: true,
+      acceptsInput: true,
+      at: [0, 0],
+      size: [440, 640],
+      floating: true,
+      class: "electron",
+      title: "Persona chat",
+      initialClass: "electron",
+      initialTitle: identity.initialTitle,
+      pid: identity.processID,
       xwayland: true,
-      xwaylandWindow: 4_194_305,
+      pinned: false,
       workspace: { id: workspace },
       monitor,
     }]),
@@ -78,7 +85,7 @@ test("pinned chat rises on its active workspace without invoking focus", async (
     connect: () => socket,
   });
 
-  assert.equal(await adapter.setPinned(new FakeWindow(4_194_305), true), true);
+  assert.equal(await adapter.setPinned(new FakeWindow(), true, identity), true);
   const initialRaise = ["dispatch", "alterzorder", "top,address:0xabc123"];
   assert.equal(calls.some((args) => JSON.stringify(args) === JSON.stringify(initialRaise)), true);
 
@@ -105,18 +112,67 @@ test("pinned chat is not raised when its workspace is inactive on its monitor", 
     connect: () => socket,
   });
 
-  assert.equal(await adapter.setPinned(new FakeWindow(4_194_305), true), true);
+  assert.equal(await adapter.setPinned(new FakeWindow(), true, identity), true);
   assert.equal(calls.some((args) => args[0] === "dispatch"), false);
   adapter.close();
 });
 
 test("pin adapter rejects unsafe Hyprland instance signatures", async () => {
-  const target = new FakeWindow(4_194_305);
+  const target = new FakeWindow();
   const adapter = new HyprlandPinAdapter({
     env: { XDG_RUNTIME_DIR: "/run/user/1000", HYPRLAND_INSTANCE_SIGNATURE: "../other" },
     run: async () => "[]",
     connect: () => new FakeSocket(),
   });
 
-  assert.equal(await adapter.setPinned(target, true), false);
+  assert.equal(await adapter.setPinned(target, true, identity), false);
+});
+
+test("pin adapter refuses ambiguous compositor identity matches", async () => {
+  const calls: string[][] = [];
+  const socket = new FakeSocket();
+  const current = profile(2, 1);
+  const clients = JSON.parse(current.clients) as Array<Record<string, unknown>>;
+  const first = clients[0];
+  assert.ok(first);
+  const duplicate = { ...first, address: "0xdef456" };
+  const ambiguous = JSON.stringify([...clients, duplicate]);
+  const adapter = new HyprlandPinAdapter({
+    env: { XDG_RUNTIME_DIR: "/run/user/1000", HYPRLAND_INSTANCE_SIGNATURE: "test-1" },
+    run: async (args) => {
+      calls.push([...args]);
+      if (args[0] === "-j" && args[1] === "clients") return ambiguous;
+      if (args[0] === "-j" && args[1] === "monitors") return current.monitors;
+      return "ok";
+    },
+    connect: () => socket,
+  });
+
+  assert.equal(await adapter.setPinned(new FakeWindow(), true, identity), true);
+  assert.equal(calls.some((args) => args[0] === "dispatch"), false);
+  adapter.close();
+});
+
+test("pin adapter requires both the app title token and process identity", async () => {
+  const calls: string[][] = [];
+  const socket = new FakeSocket();
+  const current = profile(2, 1);
+  const clients = JSON.parse(current.clients) as Array<Record<string, unknown>>;
+  const first = clients[0];
+  assert.ok(first);
+  const unrelated = { ...first, pid: identity.processID + 1 };
+  const adapter = new HyprlandPinAdapter({
+    env: { XDG_RUNTIME_DIR: "/run/user/1000", HYPRLAND_INSTANCE_SIGNATURE: "test-1" },
+    run: async (args) => {
+      calls.push([...args]);
+      if (args[0] === "-j" && args[1] === "clients") return JSON.stringify([unrelated]);
+      if (args[0] === "-j" && args[1] === "monitors") return current.monitors;
+      return "ok";
+    },
+    connect: () => socket,
+  });
+
+  assert.equal(await adapter.setPinned(new FakeWindow(), true, identity), true);
+  assert.equal(calls.some((args) => args[0] === "dispatch"), false);
+  adapter.close();
 });

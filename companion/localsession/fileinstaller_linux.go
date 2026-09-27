@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/personastack/omarchy-desktop/companion/internal/subprocess"
 	"github.com/personastack/omarchy-desktop/companion/internal/wirejson"
 	"github.com/personastack/personastack-api/pkg/client/apicontract"
 	"gopkg.in/yaml.v3"
@@ -981,13 +982,13 @@ func verifyPrivateFile(file *os.File) error {
 func runPluginCommand(parent context.Context, executable string, arguments, environment []string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(parent, pluginCommandTimeout)
 	defer cancel()
-	command := exec.CommandContext(ctx, executable, arguments...)
+	command := exec.Command(executable, arguments...)
 	command.Env = environment
 	command.Stdin = strings.NewReader("")
 	command.Stderr = io.Discard
 	output := &limitedBuffer{limit: maxProbeBytes}
 	command.Stdout = output
-	if err := command.Run(); err != nil {
+	if err := subprocess.Run(ctx, command); err != nil {
 		return nil, ErrUnsafeFiles
 	}
 	if !json.Valid(output.Bytes()) && strings.Contains(strings.Join(arguments, " "), "--json") {

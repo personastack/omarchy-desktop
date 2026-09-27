@@ -388,6 +388,9 @@ func TestPatchRejectsOversizedResultBeforeReplacement(t *testing.T) {
 
 func TestFailedSearchDoesNotRetainContinuationState(t *testing.T) {
 	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root can read mode-000 files, so this process cannot exercise permission denial")
+	}
 	root := t.TempDir()
 	path := filepath.Join(root, "unreadable.txt")
 	if err := os.WriteFile(path, []byte("secret"), 0o000); err != nil {
@@ -713,6 +716,28 @@ func TestOpenRejectsSpecialFilesAndUnsafePaths(t *testing.T) {
 		if _, err := Metadata(path); !errors.Is(err, ErrInvalidPath) {
 			t.Errorf("Metadata(%q) error = %v", path, err)
 		}
+	}
+}
+
+func TestAppendRejectsFIFOWithoutReader(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	fifo := filepath.Join(root, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	completed := make(chan error, 1)
+	go func() {
+		_, err := Write(fifo, []byte("value"), WriteAppend, nil)
+		completed <- err
+	}()
+	select {
+	case err := <-completed:
+		if !errors.Is(err, ErrNotRegularFile) {
+			t.Fatalf("FIFO append error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("FIFO append blocked before rejecting the special file")
 	}
 }
 

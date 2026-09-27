@@ -556,11 +556,13 @@ func TestChildEnvironmentKeepsDesktopSessionAndDropsSecrets(t *testing.T) {
 	environment := childEnvironment([]string{
 		"PATH=/usr/bin", "HOME=/home/test", "WAYLAND_DISPLAY=wayland-1",
 		"XDG_RUNTIME_DIR=/run/user/1000", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+		"HYPRLAND_INSTANCE_SIGNATURE=instance_123",
 		"PERSONASTACK_MACHINE_CREDENTIAL=secret", "CUA_DRIVER_RS_TELEMETRY_ENABLED=1",
 	})
 	joined := strings.Join(environment, "\n")
 	for _, expected := range []string{
 		"PATH=/usr/bin", "WAYLAND_DISPLAY=wayland-1", "XDG_RUNTIME_DIR=/run/user/1000",
+		"HYPRLAND_INSTANCE_SIGNATURE=instance_123",
 		"CUA_DRIVER_RS_TELEMETRY_ENABLED=0", "CUA_DRIVER_RS_UPDATE_CHECK=false",
 	} {
 		if !strings.Contains(joined, expected) {

@@ -431,7 +431,7 @@ func Write(path string, content []byte, mode WriteMode, offset *int64) (Entry, e
 				return Entry{}, operationError(closeErr, ErrWriteOutcomeUnknown)
 			}
 		case WriteAppend:
-			file, appendErr := os.OpenFile(clean, os.O_WRONLY|os.O_APPEND|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+			file, appendErr := os.OpenFile(clean, os.O_WRONLY|os.O_APPEND|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 			if appendErr != nil {
 				return Entry{}, operationError(appendErr, ErrNotRegularFile)
 			}

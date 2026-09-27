@@ -931,7 +931,7 @@ func childEnvironment(environment []string) []string {
 	allowed := map[string]struct{}{
 		"PATH": {}, "HOME": {}, "USER": {}, "LOGNAME": {}, "SHELL": {}, "TMPDIR": {},
 		"LANG": {}, "LC_ALL": {}, "LC_CTYPE": {}, "DISPLAY": {}, "WAYLAND_DISPLAY": {},
-		"XDG_RUNTIME_DIR": {}, "XDG_SESSION_TYPE": {}, "XDG_CURRENT_DESKTOP": {},
+		"XDG_RUNTIME_DIR": {}, "XDG_SESSION_TYPE": {}, "XDG_CURRENT_DESKTOP": {}, "HYPRLAND_INSTANCE_SIGNATURE": {},
 		"XDG_SESSION_DESKTOP": {}, "XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {},
 		"DBUS_SESSION_BUS_ADDRESS": {}, "AT_SPI_BUS_ADDRESS": {}, "XAUTHORITY": {},
 		"GDK_BACKEND": {}, "QT_ACCESSIBILITY": {},

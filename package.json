@@ -6,7 +6,7 @@
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json && esbuild src/preload.ts --bundle --platform=browser --format=cjs --external:electron --outfile=dist/preload.cjs && rm -f dist/preload.js",
+    "build": "tsc -p tsconfig.json && mkdir -p dist/assets && cp assets/personastack.png dist/assets/personastack.png && esbuild src/preload.ts --bundle --platform=browser --format=cjs --external:electron --outfile=dist/preload.cjs && rm -f dist/preload.js",
     "start": "npm run build && npm run build:companion && electron .",
     "test": "npm run build && node --test dist/*.test.js",
     "build:companion": "mkdir -p companion/bin && GOTOOLCHAIN=go1.27.1 go build -C companion -o bin/personastack-companion ./cmd/personastack-companion",

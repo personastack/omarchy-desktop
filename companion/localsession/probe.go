@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/personastack/omarchy-desktop/companion/internal/subprocess"
 )
 
 const (
@@ -260,13 +262,13 @@ func isExecutable(path string) bool {
 func runCommand(parent context.Context, executable string, arguments, environment []string, limit int) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(parent, probeTimeout)
 	defer cancel()
-	command := exec.CommandContext(ctx, executable, arguments...)
+	command := exec.Command(executable, arguments...)
 	command.Env = environment
 	command.Stdin = strings.NewReader("")
 	command.Stderr = io.Discard
 	output := &limitedBuffer{limit: limit}
 	command.Stdout = output
-	if err := command.Run(); err != nil {
+	if err := subprocess.Run(ctx, command); err != nil {
 		return nil, err
 	}
 	return output.Bytes(), nil
