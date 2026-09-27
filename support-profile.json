@@ -37,6 +37,19 @@
         "Inkscape 1.4.4-6"
       ]
     },
+    "raw_background_input_scope": {
+      "status": "experimental and application-qualified",
+      "qualified_applications": [
+        "Calc from libreoffice-fresh 26.2.5-3",
+        "Inkscape 1.4.4-6"
+      ],
+      "excluded_targets": [
+        "Chromium and Electron",
+        "XWayland raw background input"
+      ],
+      "replacement_requires_compositor_restart": true,
+      "native_certified": false
+    },
     "build_kit_asset": "cua-hyprland-plugin-0.30.1-039783f9221a08c0daf9cda65a460fc4f346fa6e-build-kit.tar.gz",
     "build_kit_asset_type": "Arch build kit",
     "build_kit_sha256": "eac41a8092edeecc03b46d18c78d7448726d652334ec49404b26336399417969",
@@ -72,6 +85,6 @@
       "companion_test_result": "passed"
     },
     "selected_for_runtime": true,
-    "selection_reason": "The source comparison found unchanged MCP, tool-list, health-report, and documented Linux tool-name contracts. Linux now reports overlay exclusion in an additive result field; the companion's bounded image path regression proves that field survives. The matching 0.30.1 driver and plugin build-kit assets pass published SHA-256 checks. Omarchy, changed Linux capture/window-owner behavior, plugin ABI compatibility, and all native application actions remain unverified."
+    "selection_reason": "The source comparison found unchanged MCP, tool-list, health-report, and documented Linux tool-name contracts. Linux now reports overlay exclusion in an additive result field; the companion's bounded image path regression proves that field survives. The matching 0.30.1 driver and plugin build-kit assets pass published SHA-256 checks. Omarchy, changed Linux capture/window-owner behavior, plugin ABI compatibility, and all native application actions remain unverified. The plugin's documented raw background-input scope excludes Electron and XWayland, so this pinned candidate does not provide background-input parity for this app."
   }
 }

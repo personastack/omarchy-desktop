@@ -18,7 +18,7 @@ The client must not create a second login, authorization service, integration st
 
 ## Supported environment
 
-No environment is currently supported. The first candidate is Omarchy Edge on x86_64 with an exact Omarchy, Hyprland, Electron, Cua Driver, Cua Hyprland input plugin and Secret Service profile recorded by the feasibility gate. ARM64, other Linux distributions, other compositors, stable-channel Omarchy and unsupported Cua applications are outside the initial claim until separately proven.
+No environment is currently supported. The first candidate is Omarchy Edge on x86_64 with an exact Omarchy, Hyprland, Electron, Cua Driver, Cua Hyprland input plugin and Secret Service profile recorded by the feasibility gate. The pinned optional input-v3 plugin is experimental and only qualifies the documented Calc and Inkscape package versions on its exact Hyprland ABI and compiler toolchain. Its documented raw background-input path excludes Chromium, Electron, and XWayland. The desktop app uses Electron through XWayland, so this plugin alone cannot provide the required background-input parity. No alternate Hyprland raw background-input adapter is implemented. Do not report the GUI-control parity row as complete until every required action has a verified route on the candidate profile. ARM64, other Linux distributions, other compositors, stable-channel Omarchy and unsupported Cua applications are outside the initial claim until separately proven.
 
 ## Authentication
 
