@@ -48,7 +48,7 @@ test("companion client accepts the sync acknowledgment shape", async () => {
 });
 
 test("companion client accepts typed tray lifecycle state replies", async () => {
-  for (const action of ["pause", "resume", "disconnect"] as const) {
+  for (const action of ["pause", "resume", "repair", "disconnect"] as const) {
     const fake = createFakeChild();
     const client = new CompanionClient(fake.child);
     fake.stdin.on("data", (chunk: Buffer) => {
@@ -81,6 +81,25 @@ test("resume timeout leaves response and cleanup grace after the bounded compani
   try {
     const pending = client.requestLifecycle("resume");
     assert.equal(resumeTimeout, 13 * 60_000);
+    await client.close();
+    assert.deepEqual(await pending, { ok: false, error: "unavailable" });
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("repair timeout covers pinned download and runtime health checks", async () => {
+  const fake = createFakeChild();
+  const client = new CompanionClient(fake.child);
+  const originalSetTimeout = globalThis.setTimeout;
+  let repairTimeout: number | undefined;
+  globalThis.setTimeout = ((callback: Parameters<typeof setTimeout>[0], delay?: number) => {
+    repairTimeout = delay;
+    return originalSetTimeout(callback, 3_600_000);
+  }) as typeof globalThis.setTimeout;
+  try {
+    const pending = client.requestLifecycle("repair");
+    assert.equal(repairTimeout, 9 * 60_000);
     await client.close();
     assert.deepEqual(await pending, { ok: false, error: "unavailable" });
   } finally {

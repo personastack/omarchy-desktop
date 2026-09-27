@@ -24,6 +24,7 @@ import (
 const (
 	reconnectInterval      = 5 * time.Second
 	resumeOperationTimeout = 11 * time.Minute
+	repairOperationTimeout = 8 * time.Minute
 )
 
 var (
@@ -39,6 +40,7 @@ func (err codedError) DesktopControlErrorCode() string { return err.code }
 
 type cuaRuntime interface {
 	Prepare(context.Context) (cuaruntime.State, error)
+	Repair(context.Context) (cuaruntime.State, error)
 	Call(context.Context, agentgatewayruntime.DesktopControlOperation, string, json.RawMessage) (json.RawMessage, error)
 	State() cuaruntime.State
 	Stop()
@@ -551,6 +553,121 @@ func (controller *Controller) Pause(ctx context.Context) (installation.LocalStat
 	return controller.LocalState(ctx, controller.origin)
 }
 
+// Repair restarts the managed Cua child and repairs its pinned files when the
+// existing tree is still verifiably owned by PersonaStack.
+func (controller *Controller) Repair(ctx context.Context) (installation.LocalState, error) {
+	if ctx == nil {
+		return installation.LocalState{}, ErrUnavailable
+	}
+	ctx, cancel := context.WithTimeout(ctx, repairOperationTimeout)
+	defer cancel()
+	select {
+	case controller.prepareGate <- struct{}{}:
+	case <-ctx.Done():
+		return installation.LocalState{}, ctx.Err()
+	}
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			<-controller.prepareGate
+		}
+	}()
+	controller.mu.Lock()
+	if controller.closed || controller.disconnecting || controller.disconnected {
+		controller.mu.Unlock()
+		return installation.LocalState{}, ErrUnavailable
+	}
+	wasUserPaused := controller.userPaused
+	controller.mu.Unlock()
+	if _, err := controller.installations.StoredInstallation(ctx, controller.origin); err != nil {
+		return installation.LocalState{}, err
+	}
+	if err := controller.pausePreference.Save(controller.origin, true); err != nil {
+		return installation.LocalState{}, err
+	}
+	controller.lockStateMu.Lock()
+	controller.mu.Lock()
+	controller.userPaused = true
+	controller.paused = true
+	stop := controller.monitorStop
+	controller.monitorStop = nil
+	executor := controller.executor
+	connection := controller.connection
+	controller.mu.Unlock()
+	if executor != nil {
+		_ = executor.SetSessionLockState(controller.ctx, desktopexecutor.SessionLockUnknown)
+	}
+	controller.lockStateMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	controller.runtime.Stop()
+	if connection != nil && connection.Status().Connected {
+		controller.readinessMu.Lock()
+		_ = connection.SetReadiness(string(apicontract.DesktopControlReadinessPaused))
+		controller.readinessMu.Unlock()
+	}
+	_ = controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessPaused)
+	if _, err := controller.runtime.Repair(ctx); err != nil {
+		state, stateErr := controller.LocalState(ctx, controller.origin)
+		return state, errors.Join(err, stateErr)
+	}
+	if wasUserPaused {
+		controller.runtime.Stop()
+		return controller.LifecycleState(ctx, controller.origin)
+	}
+	status, err := controller.installations.Status(ctx, controller.origin)
+	if err != nil {
+		controller.runtime.Stop()
+		state, stateErr := controller.LocalState(ctx, controller.origin)
+		return state, errors.Join(err, stateErr)
+	}
+	if !status.RelayActive {
+		if preferenceErr := controller.clearRepairPause(ctx); preferenceErr != nil {
+			controller.runtime.Stop()
+			state, stateErr := controller.LocalState(ctx, controller.origin)
+			return state, errors.Join(preferenceErr, stateErr)
+		}
+		controller.runtime.Stop()
+		return controller.LifecycleState(ctx, controller.origin)
+	}
+	lockState, lockErr := controller.probe.State(ctx)
+	if lockErr != nil || lockState != desktopexecutor.SessionLockUnlocked {
+		if lockErr != nil || lockState == desktopexecutor.SessionLockUnknown {
+			_ = controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessUnknown)
+		} else {
+			if preferenceErr := controller.clearRepairPause(ctx); preferenceErr != nil {
+				controller.runtime.Stop()
+				state, stateErr := controller.LocalState(ctx, controller.origin)
+				return state, errors.Join(preferenceErr, stateErr)
+			}
+			_ = controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessLocked)
+		}
+		controller.runtime.Stop()
+		if lockErr == nil && lockState == desktopexecutor.SessionLockLocked {
+			controller.startReconnectLoop()
+		}
+		return controller.LifecycleState(ctx, controller.origin)
+	}
+	state, resumeErr := controller.resumeWithGate(ctx)
+	if resumeErr != nil {
+		controller.runtime.Stop()
+		state, stateErr := controller.LocalState(ctx, controller.origin)
+		return state, errors.Join(resumeErr, stateErr)
+	}
+	return state, nil
+}
+
+func (controller *Controller) clearRepairPause(ctx context.Context) error {
+	if err := controller.pausePreference.Save(controller.origin, false); err != nil {
+		return err
+	}
+	controller.mu.Lock()
+	controller.userPaused = false
+	controller.mu.Unlock()
+	return nil
+}
+
 // Disconnect revokes every workspace mapping for this installation and then
 // removes its protected local credential. A failed revoke leaves execution
 // fenced and the credential available for a retry.
@@ -691,6 +808,16 @@ func (controller *Controller) Resume(ctx context.Context) (installation.LocalSta
 	case <-ctx.Done():
 		return installation.LocalState{}, ctx.Err()
 	}
+	return controller.resumeWithGate(ctx)
+}
+
+// resumeWithGate resumes control while the caller owns prepareGate.
+func (controller *Controller) resumeWithGate(ctx context.Context) (installation.LocalState, error) {
+	if ctx == nil {
+		return installation.LocalState{}, ErrUnavailable
+	}
+	ctx, cancel := context.WithTimeout(ctx, resumeOperationTimeout)
+	defer cancel()
 	controller.mu.Lock()
 	if controller.closed || controller.disconnecting || controller.disconnected {
 		controller.mu.Unlock()

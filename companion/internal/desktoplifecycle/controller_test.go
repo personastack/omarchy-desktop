@@ -22,16 +22,40 @@ import (
 )
 
 type runtimeFake struct {
-	mu           sync.Mutex
-	prepareCalls int
-	stopCalls    int
-	closed       bool
+	mu               sync.Mutex
+	prepareCalls     int
+	repairCalls      int
+	stopCalls        int
+	closed           bool
+	repairErr        error
+	events           []string
+	prepareBlockCall int
+	prepareStarted   chan struct{}
+	prepareRelease   chan struct{}
+}
+
+func (runtime *runtimeFake) Repair(context.Context) (cuaruntime.State, error) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.repairCalls++
+	runtime.events = append(runtime.events, "repair")
+	if runtime.repairErr != nil {
+		return cuaruntime.State{}, runtime.repairErr
+	}
+	return cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}, nil
 }
 
 func (runtime *runtimeFake) Prepare(context.Context) (cuaruntime.State, error) {
 	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
 	runtime.prepareCalls++
+	runtime.events = append(runtime.events, "prepare")
+	block := runtime.prepareBlockCall == runtime.prepareCalls
+	started, release := runtime.prepareStarted, runtime.prepareRelease
+	runtime.mu.Unlock()
+	if block {
+		close(started)
+		<-release
+	}
 	return cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}, nil
 }
 
@@ -54,6 +78,7 @@ func (runtime *runtimeFake) Close() {
 func (runtime *runtimeFake) Stop() {
 	runtime.mu.Lock()
 	runtime.stopCalls++
+	runtime.events = append(runtime.events, "stop")
 	runtime.mu.Unlock()
 }
 
@@ -243,8 +268,9 @@ func (probe *mutableLockProbe) Set(state desktopexecutor.SessionLockState) {
 }
 
 type pausePreferenceFake struct {
-	paused bool
-	err    error
+	paused       bool
+	err          error
+	saveFalseErr error
 }
 
 func (preference *pausePreferenceFake) Load(string) (bool, error) {
@@ -253,6 +279,9 @@ func (preference *pausePreferenceFake) Load(string) (bool, error) {
 func (preference *pausePreferenceFake) Save(_ string, paused bool) error {
 	if preference.err != nil {
 		return preference.err
+	}
+	if !paused && preference.saveFalseErr != nil {
+		return preference.saveFalseErr
 	}
 	preference.paused = paused
 	return nil
@@ -581,6 +610,284 @@ func TestPausePersistsAcrossRestartAndResumeRechecksUnlockedActiveInstall(t *tes
 	}
 	if paused, err := preference.Load(testOrigin); err != nil || paused {
 		t.Fatalf("cleared pause = %t, %v", paused, err)
+	}
+}
+
+func TestRepairKeepsRuntimeFencedWhenThePinnedDriverCannotBeRestored(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	repairErr := errors.New("managed Cua files are foreign")
+	runtime := &runtimeFake{repairErr: repairErr}
+	service := &installServiceFake{active: true}
+	options := Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: preference,
+		NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	state, err := controller.Repair(context.Background())
+	if !errors.Is(err, repairErr) || !state.UserPaused || !state.RelayPaused {
+		t.Fatalf("Repair() state=%#v err=%v", state, err)
+	}
+	service.mu.Lock()
+	readiness := append([]apicontract.DesktopControlReadiness(nil), service.readiness...)
+	service.mu.Unlock()
+	if !preference.paused || len(readiness) != 1 || readiness[0] != apicontract.DesktopControlReadinessPaused || runtime.repairCalls != 1 {
+		t.Fatalf("repair failure lost its safe state: saved=%t readiness=%v repairCalls=%d", preference.paused, readiness, runtime.repairCalls)
+	}
+}
+
+func TestRepairRestoresAnPreviouslyActiveRelay(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	runtime := &runtimeFake{}
+	service := &installServiceFake{missing: true, active: true}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	options := Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: preference,
+		NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			return connection, nil
+		},
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Prepare(context.Background(), testOrigin, "ticket"); err != nil {
+		t.Fatalf("Prepare() = %v", err)
+	}
+	state, err := controller.Repair(context.Background())
+	if err != nil || !state.CuaReady || !state.NativeExecutorReady || !state.GatewayConnected || state.RelayPaused || state.UserPaused {
+		t.Fatalf("Repair() state=%#v err=%v", state, err)
+	}
+	if preference.paused || runtime.repairCalls != 1 || connection.Status().Readiness != string(apicontract.DesktopControlReadinessReady) {
+		t.Fatalf("repair did not restore prior active state: saved=%t repairCalls=%d readiness=%q", preference.paused, runtime.repairCalls, connection.Status().Readiness)
+	}
+}
+
+func TestRepairFailureOrInactiveStateCannotAutoResumeOnReconnect(t *testing.T) {
+	t.Parallel()
+	statusFailure := errors.New("relay status unavailable")
+	stateReadFailure := errors.New("local state unavailable")
+	for _, test := range []struct {
+		name       string
+		active     bool
+		statusErr  error
+		lockState  desktopexecutor.SessionLockState
+		lockErr    error
+		stateErr   error
+		wantRepair bool
+		userPaused bool
+	}{
+		{name: "status failure", active: true, statusErr: statusFailure, lockState: desktopexecutor.SessionLockUnlocked, wantRepair: true, userPaused: true},
+		{name: "inactive relay", active: false, lockState: desktopexecutor.SessionLockUnlocked},
+		{name: "lock probe failure", active: true, lockState: desktopexecutor.SessionLockUnknown, lockErr: errors.New("lock probe failed"), userPaused: true},
+		{name: "resume failure", active: true, lockState: desktopexecutor.SessionLockUnlocked, stateErr: stateReadFailure, wantRepair: true, userPaused: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			preference := &pausePreferenceFake{}
+			service := &installServiceFake{active: test.active, statusErr: test.statusErr, localStateErr: test.stateErr}
+			runtime := &runtimeFake{}
+			controller, err := New(Options{
+				Origin: testOrigin, Runtime: runtime, Installations: service,
+				LockProbe: lockProbeFake{state: test.lockState, err: test.lockErr}, Local: localOperationsFake{}, PausePreference: preference,
+				NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+				NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+					return &gatewayFake{closed: make(chan struct{})}, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { controller.Close(context.Background()) })
+			_, repairErr := controller.Repair(context.Background())
+			if (repairErr != nil) != test.wantRepair {
+				t.Fatalf("Repair() error = %v, want error=%t", repairErr, test.wantRepair)
+			}
+			if preference.paused != test.userPaused {
+				t.Fatalf("saved pause = %t, want %t", preference.paused, test.userPaused)
+			}
+			controller.mu.Lock()
+			userPaused, paused := controller.userPaused, controller.paused
+			controller.mu.Unlock()
+			if userPaused != test.userPaused || !paused {
+				t.Fatalf("repair result lost its pause fence: userPaused=%t paused=%t", userPaused, paused)
+			}
+			runtime.mu.Lock()
+			lastEvent := runtime.events[len(runtime.events)-1]
+			runtime.mu.Unlock()
+			if lastEvent != "stop" {
+				t.Fatalf("last runtime action = %q, want stop while repair remains paused", lastEvent)
+			}
+			service.mu.Lock()
+			service.statusErr = nil
+			service.active = true
+			service.localStateErr = nil
+			service.mu.Unlock()
+			if !test.userPaused {
+				if !controller.Close(context.Background()) {
+					t.Fatal("close controller before simulated restart")
+				}
+				restartedRuntime := &runtimeFake{}
+				restarted, err := New(Options{
+					Origin: testOrigin, Runtime: restartedRuntime, Installations: service,
+					LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: preference,
+					NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { restarted.Close(context.Background()) })
+				if err := restarted.Recover(context.Background()); err != nil {
+					t.Fatalf("Recover() after inactive repair = %v", err)
+				}
+				restarted.mu.Lock()
+				restartedPaused, restartedUserPaused := restarted.paused, restarted.userPaused
+				restarted.mu.Unlock()
+				restartedRuntime.mu.Lock()
+				prepareCalls := restartedRuntime.prepareCalls
+				restartedRuntime.mu.Unlock()
+				if restartedPaused || restartedUserPaused || prepareCalls != 1 {
+					t.Fatalf("inactive repair blocked restart recovery: paused=%t userPaused=%t prepareCalls=%d", restartedPaused, restartedUserPaused, prepareCalls)
+				}
+				return
+			}
+			if err := controller.resumeIdleRelay(context.Background()); !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("reconnect resume = %v, want explicit retry required", err)
+			}
+		})
+	}
+}
+
+func TestRepairStopsCuaWhenClearingLockedPauseFails(t *testing.T) {
+	t.Parallel()
+	pauseErr := errors.New("pause preference write failed")
+	preference := &pausePreferenceFake{saveFalseErr: pauseErr}
+	runtime := &runtimeFake{}
+	controller, err := New(Options{
+		Origin: testOrigin, Runtime: runtime, Installations: &installServiceFake{active: true},
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockLocked}, Local: localOperationsFake{}, PausePreference: preference,
+		NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	_, err = controller.Repair(context.Background())
+	if !errors.Is(err, pauseErr) {
+		t.Fatalf("Repair() error = %v, want pause persistence error", err)
+	}
+	runtime.mu.Lock()
+	lastEvent := runtime.events[len(runtime.events)-1]
+	runtime.mu.Unlock()
+	if lastEvent != "stop" {
+		t.Fatalf("last runtime action = %q, want stop after pause persistence failure", lastEvent)
+	}
+	if !preference.paused {
+		t.Fatal("failed pause clear changed the persisted pause")
+	}
+}
+
+func TestRepairRestartsActiveRelayAfterLockedSessionUnlocks(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	probe := &mutableLockProbe{state: desktopexecutor.SessionLockLocked}
+	runtime := &runtimeFake{}
+	controller, err := New(Options{
+		Origin: testOrigin, Runtime: runtime, Installations: &installServiceFake{active: true},
+		LockProbe: probe, Local: localOperationsFake{}, PausePreference: preference, ReconnectEvery: 10 * time.Millisecond,
+		NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	state, err := controller.Repair(context.Background())
+	if err != nil || state.UserPaused || !state.RelayPaused || preference.paused {
+		t.Fatalf("Repair() while locked state=%#v savedPause=%t err=%v", state, preference.paused, err)
+	}
+	probe.Set(desktopexecutor.SessionLockUnlocked)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		controller.mu.Lock()
+		paused := controller.paused
+		controller.mu.Unlock()
+		if !paused {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("active relay stayed fenced after the session unlocked")
+}
+
+func TestRepairSerializesPauseUntilItsResumeCompletes(t *testing.T) {
+	t.Parallel()
+	preference := &pausePreferenceFake{}
+	runtime := &runtimeFake{}
+	service := &installServiceFake{active: true}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	controller, err := New(Options{
+		Origin: testOrigin, Runtime: runtime, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: preference,
+		NewLockMonitor: func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil },
+		NewGateway: func(desktopcontrol.Installation, string, desktopgateway.CommandHandler, desktopgateway.DiagnosticsProvider) (gateway, error) {
+			return connection, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Prepare(context.Background(), testOrigin, "ticket"); err != nil {
+		t.Fatalf("Prepare() before Repair() = %v", err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	runtime.mu.Lock()
+	runtime.prepareBlockCall = runtime.prepareCalls + 1
+	runtime.prepareStarted = started
+	runtime.prepareRelease = release
+	runtime.mu.Unlock()
+	repairDone := make(chan error, 1)
+	go func() {
+		_, err := controller.Repair(context.Background())
+		repairDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("Repair() did not reach its serialized Resume()")
+	}
+	pauseDone := make(chan error, 1)
+	go func() {
+		_, err := controller.Pause(context.Background())
+		pauseDone <- err
+	}()
+	select {
+	case err := <-pauseDone:
+		t.Fatalf("Pause() returned before serialized repair resume finished: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-repairDone; err != nil {
+		t.Fatalf("Repair() = %v", err)
+	}
+	if err := <-pauseDone; err != nil {
+		t.Fatalf("Pause() after Repair() = %v", err)
+	}
+	controller.mu.Lock()
+	userPaused, paused := controller.userPaused, controller.paused
+	controller.mu.Unlock()
+	if !preference.paused || !userPaused || !paused {
+		t.Fatalf("Pause() was lost across Repair(): saved=%t userPaused=%t paused=%t", preference.paused, userPaused, paused)
 	}
 }
 

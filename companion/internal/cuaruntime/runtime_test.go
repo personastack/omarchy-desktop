@@ -89,6 +89,32 @@ func TestPrepareKeepsChildAliveAfterSetupContextIsCanceled(t *testing.T) {
 	}
 }
 
+func TestRepairStopsOwnedChildAndStartsAValidatedReplacement(t *testing.T) {
+	t.Parallel()
+	installer := &installerStub{path: "/owned/cua-driver"}
+	first := &clientStub{catalog: cuamcp.Catalog{Available: []string{"click"}}, report: readyReport()}
+	second := &clientStub{catalog: cuamcp.Catalog{Available: []string{"click"}}, report: readyReport()}
+	factoryCalls := 0
+	runtime := mustRuntime(t, installer, func(context.Context, string) (Client, error) {
+		factoryCalls++
+		if factoryCalls == 1 {
+			return first, nil
+		}
+		return second, nil
+	})
+	if _, err := runtime.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, err := runtime.Repair(context.Background())
+	if err != nil || !state.Ready || runtime.State() != state {
+		t.Fatalf("Repair() = %#v, %v", state, err)
+	}
+	if installer.repairCalls != 1 || installer.calls != 1 || first.stops != 1 || second.starts != 1 || !second.Alive() {
+		t.Fatalf("installer install/repair=%d/%d, old stops=%d, replacement starts=%d alive=%t", installer.calls, installer.repairCalls, first.stops, second.starts, second.Alive())
+	}
+	runtime.Close()
+}
+
 func TestPrepareQueuedCallReturnsWhenItsContextIsCanceled(t *testing.T) {
 	t.Parallel()
 	entered := make(chan struct{})
@@ -441,9 +467,19 @@ func readyReport() cuamcp.HealthReportSnapshot {
 }
 
 type installerStub struct {
-	path    string
-	calls   int
-	install func(context.Context) (string, error)
+	path        string
+	calls       int
+	repairCalls int
+	install     func(context.Context) (string, error)
+	repair      func(context.Context) (string, error)
+}
+
+func (i *installerStub) Repair(ctx context.Context) (string, error) {
+	i.repairCalls++
+	if i.repair != nil {
+		return i.repair(ctx)
+	}
+	return i.path, nil
 }
 
 func (i *installerStub) Install(ctx context.Context) (string, error) {

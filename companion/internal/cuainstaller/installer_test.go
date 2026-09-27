@@ -55,6 +55,259 @@ func TestInstallerVerifiesAndReusesPinnedRuntime(t *testing.T) {
 	}
 }
 
+func TestRepairReplacesDamagedFilesInOwnedTree(t *testing.T) {
+	t.Parallel()
+	archive, selected := fixtureRelease(t, []archiveEntry{{name: "cua-driver", mode: 0o755, content: []byte("pinned driver")}})
+	client := &fakeHTTP{body: archive}
+	root := filepath.Join(t.TempDir(), "cua", selected.version)
+	installer, err := newInstallerForRelease(root, "linux", "amd64", client, selected, fixtureNotices)
+	if err != nil {
+		t.Fatal("create fixture installer")
+	}
+	executable, err := installer.Install(context.Background())
+	if err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if err := os.WriteFile(executable, []byte("damaged"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.Repair(context.Background()); err != nil {
+		t.Fatalf("Repair() error = %v", err)
+	}
+	if err := installer.Verify(); err != nil {
+		t.Fatalf("Verify() after repair = %v", err)
+	}
+	content, err := os.ReadFile(executable)
+	if err != nil || string(content) != "pinned driver" || client.calls != 2 {
+		t.Fatalf("repaired executable=%q err=%v download calls=%d", content, err, client.calls)
+	}
+}
+
+func TestRepairPublishesBeforeRemovingReadOnlyOwnedDirectories(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory write permissions")
+	}
+	archive, selected := fixtureRelease(t, []archiveEntry{
+		{name: "cua-driver", mode: 0o755, content: []byte("pinned driver")},
+		{name: "wayland-helper/", directory: true},
+		{name: "wayland-helper/install.sh", mode: 0o755, content: []byte("install helper")},
+	})
+	root := filepath.Join(t.TempDir(), "cua", selected.version)
+	installer, err := newInstallerForRelease(root, "linux", "amd64", &fakeHTTP{body: archive}, selected, fixtureNotices)
+	if err != nil {
+		t.Fatal("create fixture installer")
+	}
+	if _, err := installer.Install(context.Background()); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "cua-driver"), []byte("damaged"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(root, "cua-driver"), 0); err != nil {
+		t.Fatal(err)
+	}
+	readOnlyDirectory := filepath.Join(root, "wayland-helper")
+	if err := os.Chmod(readOnlyDirectory, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.Repair(context.Background()); err != nil {
+		t.Fatalf("Repair() error = %v", err)
+	}
+	if err := installer.Verify(); err != nil {
+		t.Fatalf("Verify() after repair = %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(root, "cua-driver"))
+	if err != nil || string(content) != "pinned driver" {
+		t.Fatalf("repaired executable = %q, %v", content, err)
+	}
+}
+
+func TestRepairRestoresOwnedTreeWhenPublishingStageFails(t *testing.T) {
+	t.Parallel()
+	archive, selected := fixtureRelease(t, []archiveEntry{{name: "cua-driver", mode: 0o755, content: []byte("pinned driver")}})
+	root := filepath.Join(t.TempDir(), "cua", selected.version)
+	installer, err := newInstallerForRelease(root, "linux", "amd64", &fakeHTTP{body: archive}, selected, fixtureNotices)
+	if err != nil {
+		t.Fatal("create fixture installer")
+	}
+	executable, err := installer.Install(context.Background())
+	if err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if err := os.WriteFile(executable, []byte("damaged"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	publishErr := errors.New("injected stage publication failure")
+	originalRename := installer.rename
+	failed := false
+	installer.rename = func(oldPath, newPath string) error {
+		if filepath.Base(oldPath) != filepath.Base(root) && newPath == root && !failed {
+			failed = true
+			return publishErr
+		}
+		return originalRename(oldPath, newPath)
+	}
+	if _, err := installer.Repair(context.Background()); !errors.Is(err, publishErr) {
+		t.Fatalf("Repair() error = %v, want injected publication error", err)
+	}
+	marker := filepath.Join(root, ".personastack-cua.json")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("failed publish did not restore owned tree marker: %v", err)
+	}
+	installer.rename = originalRename
+	if _, err := installer.Repair(context.Background()); err != nil {
+		t.Fatalf("retry Repair() after publication failure = %v", err)
+	}
+	if err := installer.Verify(); err != nil {
+		t.Fatalf("Verify() after retry = %v", err)
+	}
+}
+
+func TestRepairVerifiesPublishedTreeBeforeRemovingBackup(t *testing.T) {
+	t.Parallel()
+	archive, selected := fixtureRelease(t, []archiveEntry{{name: "cua-driver", mode: 0o755, content: []byte("pinned driver")}})
+	root := filepath.Join(t.TempDir(), "cua", selected.version)
+	installer, err := newInstallerForRelease(root, "linux", "amd64", &fakeHTTP{body: archive}, selected, fixtureNotices)
+	if err != nil {
+		t.Fatal("create fixture installer")
+	}
+	executable, err := installer.Install(context.Background())
+	if err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if err := os.WriteFile(executable, []byte("damaged"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	originalRename := installer.rename
+	installer.rename = func(oldPath, newPath string) error {
+		if err := originalRename(oldPath, newPath); err != nil {
+			return err
+		}
+		if filepath.Base(oldPath) != filepath.Base(root) && newPath == root {
+			return os.WriteFile(executable, []byte("changed during publication"), 0o700)
+		}
+		return nil
+	}
+	if _, err := installer.Repair(context.Background()); err == nil {
+		t.Fatal("Repair() succeeded with a changed published executable")
+	}
+	backups, err := filepath.Glob(filepath.Join(filepath.Dir(root), ".cua-driver-repair-*"))
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("preserved repair backups = %v, err = %v", backups, err)
+	}
+	if err := verifyTreeMode(context.Background(), backups[0], selected, fixtureNotices, false, true); err != nil {
+		t.Fatalf("original owned tree was not preserved: %v", err)
+	}
+	oldExecutable, err := os.ReadFile(filepath.Join(backups[0], "cua-driver"))
+	if err != nil || string(oldExecutable) != "damaged" {
+		t.Fatalf("original damaged executable = %q, err = %v", oldExecutable, err)
+	}
+}
+
+func TestRepairPreservesUnexpectedFilesAddedDuringSwap(t *testing.T) {
+	t.Parallel()
+	archive, selected := fixtureRelease(t, []archiveEntry{{name: "cua-driver", mode: 0o755, content: []byte("pinned driver")}})
+	root := filepath.Join(t.TempDir(), "cua", selected.version)
+	installer, err := newInstallerForRelease(root, "linux", "amd64", &fakeHTTP{body: archive}, selected, fixtureNotices)
+	if err != nil {
+		t.Fatal("create fixture installer")
+	}
+	executable, err := installer.Install(context.Background())
+	if err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if err := os.WriteFile(executable, []byte("damaged"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	extra := filepath.Join(root, "user-data")
+	originalRename := installer.rename
+	added := false
+	installer.rename = func(oldPath, newPath string) error {
+		if oldPath == root && newPath != root {
+			if err := os.WriteFile(extra, []byte("preserve"), 0o600); err != nil {
+				return err
+			}
+			added = true
+		}
+		return originalRename(oldPath, newPath)
+	}
+	if _, err := installer.Repair(context.Background()); !errors.Is(err, ErrForeignInstall) {
+		t.Fatalf("Repair() error = %v, want changed tree rejection", err)
+	}
+	if !added {
+		t.Fatal("repair did not exercise the post-verification tree change")
+	}
+	content, err := os.ReadFile(extra)
+	if err != nil || string(content) != "preserve" {
+		t.Fatalf("unexpected file after failed repair = %q, %v", content, err)
+	}
+	installer.rename = originalRename
+	if err := os.Remove(extra); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.Repair(context.Background()); err != nil {
+		t.Fatalf("retry Repair() after removing test file = %v", err)
+	}
+}
+
+func TestRepairCompletesWhenContextCancelsDuringPublication(t *testing.T) {
+	t.Parallel()
+	archive, selected := fixtureRelease(t, []archiveEntry{{name: "cua-driver", mode: 0o755, content: []byte("pinned driver")}})
+	root := filepath.Join(t.TempDir(), "cua", selected.version)
+	installer, err := newInstallerForRelease(root, "linux", "amd64", &fakeHTTP{body: archive}, selected, fixtureNotices)
+	if err != nil {
+		t.Fatal("create fixture installer")
+	}
+	executable, err := installer.Install(context.Background())
+	if err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if err := os.WriteFile(executable, []byte("damaged"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	originalRename := installer.rename
+	installer.rename = func(oldPath, newPath string) error {
+		if filepath.Base(oldPath) != filepath.Base(root) && newPath == root {
+			cancel()
+		}
+		return originalRename(oldPath, newPath)
+	}
+	if _, err := installer.Repair(ctx); err != nil {
+		t.Fatalf("Repair() after cancellation during atomic publication = %v", err)
+	}
+	if err := installer.Verify(); err != nil {
+		t.Fatalf("Verify() after canceled publication = %v", err)
+	}
+}
+
+func TestRepairRefusesUnknownFilesInManagedDirectory(t *testing.T) {
+	t.Parallel()
+	archive, selected := fixtureRelease(t, []archiveEntry{{name: "cua-driver", mode: 0o755, content: []byte("pinned driver")}})
+	client := &fakeHTTP{body: archive}
+	root := filepath.Join(t.TempDir(), "cua", selected.version)
+	installer, err := newInstallerForRelease(root, "linux", "amd64", client, selected, fixtureNotices)
+	if err != nil {
+		t.Fatal("create fixture installer")
+	}
+	if _, err := installer.Install(context.Background()); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	extra := filepath.Join(root, "user-data")
+	if err := os.WriteFile(extra, []byte("preserve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.Repair(context.Background()); !errors.Is(err, ErrForeignInstall) {
+		t.Fatalf("Repair() error = %v, want foreign install", err)
+	}
+	content, err := os.ReadFile(extra)
+	if err != nil || string(content) != "preserve" || client.calls != 1 {
+		t.Fatalf("unknown file=%q err=%v download calls=%d", content, err, client.calls)
+	}
+}
+
 func TestInstallerAcceptsPinnedArchiveRootDirectory(t *testing.T) {
 	t.Parallel()
 	archive, selected := fixtureReleaseWithPrefix(t, []archiveEntry{{name: "cua-driver", mode: 0o755, content: []byte("driver")}}, "fixture-root/")

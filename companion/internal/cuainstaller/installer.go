@@ -171,40 +171,11 @@ func (i *Installer) Install(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	stage, err := i.makeStage(ctx)
+	stage, err := i.buildStage(ctx, archive)
 	if err != nil {
 		return "", err
 	}
 	defer os.RemoveAll(stage)
-	if err := extractVerified(ctx, archive, stage, i.release); err != nil {
-		return "", err
-	}
-	for _, notice := range i.notices {
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-		path := filepath.Join(stage, filepath.FromSlash(notice.name))
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return "", err
-		}
-		if err := writePrivateFile(ctx, path, notice.content, 0o600); err != nil {
-			return "", err
-		}
-	}
-	marker, err := json.Marshal(managedMarker{Version: i.release.version, ArchiveSHA256: i.release.archiveSHA256})
-	if err != nil {
-		return "", fmt.Errorf("encode Cua ownership marker: %w", err)
-	}
-	marker = append(marker, '\n')
-	if err := writePrivateFile(ctx, filepath.Join(stage, ".personastack-cua.json"), marker, 0o600); err != nil {
-		return "", err
-	}
-	if err := verifyTree(ctx, stage, i.release, i.notices); err != nil {
-		return "", err
-	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -220,6 +191,200 @@ func (i *Installer) Install(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return filepath.Join(i.root, "cua-driver"), nil
+}
+
+// Repair replaces only an existing PersonaStack-owned tree whose complete
+// shape is known. Unknown files, links, or special files make the path foreign.
+func (i *Installer) Repair(ctx context.Context) (string, error) {
+	if i == nil || ctx == nil {
+		return "", ErrUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := verifyTree(ctx, i.root, i.release, i.notices); err == nil {
+		return filepath.Join(i.root, "cua-driver"), nil
+	} else if errors.Is(err, os.ErrNotExist) {
+		return i.Install(ctx)
+	}
+	if err := verifyTreeMode(ctx, i.root, i.release, i.notices, false, true); err != nil {
+		return "", err
+	}
+	archive, err := i.download(ctx)
+	if err != nil {
+		return "", err
+	}
+	stage, err := i.buildStage(ctx, archive)
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(stage)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := verifyTreeMode(ctx, i.root, i.release, i.notices, false, true); err != nil {
+		return "", err
+	}
+	backup, err := i.makeRepairBackupPath()
+	if err != nil {
+		return "", err
+	}
+	if err := i.rename(i.root, backup); err != nil {
+		return "", fmt.Errorf("preserve owned Cua files for repair: %w", err)
+	}
+	if err := verifyTreeMode(ctx, backup, i.release, i.notices, false, true); err != nil {
+		restoreErr := i.rename(backup, i.root)
+		return "", errors.Join(fmt.Errorf("owned Cua files changed during repair: %w", err), restoreErr)
+	}
+	if err := i.rename(stage, i.root); err != nil {
+		restoreErr := i.rename(backup, i.root)
+		return "", errors.Join(fmt.Errorf("publish repaired Cua release: %w", err), restoreErr)
+	}
+	if err := verifyTree(context.Background(), i.root, i.release, i.notices); err != nil {
+		return "", fmt.Errorf("verify repaired Cua release: %w", err)
+	}
+	if err := removeOwnedTree(backup, i.release, i.notices); err != nil {
+		return "", fmt.Errorf("remove replaced Cua release: %w", err)
+	}
+	return filepath.Join(i.root, "cua-driver"), nil
+}
+
+func (i *Installer) makeRepairBackupPath() (string, error) {
+	parent := filepath.Dir(i.root)
+	path, err := os.MkdirTemp(parent, ".cua-driver-repair-")
+	if err != nil {
+		return "", fmt.Errorf("reserve Cua repair backup path: %w", err)
+	}
+	if err := os.Remove(path); err != nil {
+		return "", fmt.Errorf("release Cua repair backup path: %w", err)
+	}
+	return path, nil
+}
+
+func removeOwnedTree(root string, selected release, notices []noticeFile) error {
+	if err := verifyTreeMode(context.Background(), root, selected, notices, false, true); err != nil {
+		return err
+	}
+	files := make(map[string]struct{}, len(selected.assetHashes)+len(notices)+1)
+	directories := make(map[string]struct{}, len(selected.directories)+len(notices)+1)
+	for name := range selected.assetHashes {
+		files[name] = struct{}{}
+	}
+	for _, notice := range notices {
+		files[notice.name] = struct{}{}
+	}
+	files[".personastack-cua.json"] = struct{}{}
+	for name := range files {
+		for parent := filepath.ToSlash(filepath.Dir(filepath.FromSlash(name))); parent != "."; parent = filepath.ToSlash(filepath.Dir(filepath.FromSlash(parent))) {
+			directories[parent] = struct{}{}
+		}
+	}
+	for directory := range selected.directories {
+		directories[directory] = struct{}{}
+	}
+	for directory := range directories {
+		path := filepath.Join(root, filepath.FromSlash(directory))
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !currentUserOwnsDirectory(info) {
+			return ErrForeignInstall
+		}
+		if err := os.Chmod(path, 0o700); err != nil {
+			return err
+		}
+	}
+	rootInfo, err := os.Lstat(root)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || !currentUserOwnsDirectory(rootInfo) {
+		return ErrForeignInstall
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		return err
+	}
+	for name := range files {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !currentUserOwnsFile(info) {
+			return ErrForeignInstall
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	for len(directories) > 0 {
+		deepest := ""
+		for directory := range directories {
+			if len(directory) > len(deepest) {
+				deepest = directory
+			}
+		}
+		path := filepath.Join(root, filepath.FromSlash(deepest))
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			delete(directories, deepest)
+			continue
+		}
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !currentUserOwnsDirectory(info) {
+			return ErrForeignInstall
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		delete(directories, deepest)
+	}
+	rootInfo, err = os.Lstat(root)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || !currentUserOwnsDirectory(rootInfo) {
+		return ErrForeignInstall
+	}
+	return os.Remove(root)
+}
+
+func (i *Installer) buildStage(ctx context.Context, archive []byte) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	stage, err := i.makeStage(ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := extractVerified(ctx, archive, stage, i.release); err != nil {
+		_ = os.RemoveAll(stage)
+		return "", err
+	}
+	for _, notice := range i.notices {
+		if err := ctx.Err(); err != nil {
+			_ = os.RemoveAll(stage)
+			return "", err
+		}
+		path := filepath.Join(stage, filepath.FromSlash(notice.name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			_ = os.RemoveAll(stage)
+			return "", err
+		}
+		if err := writePrivateFile(ctx, path, notice.content, 0o600); err != nil {
+			_ = os.RemoveAll(stage)
+			return "", err
+		}
+	}
+	marker, err := json.Marshal(managedMarker{Version: i.release.version, ArchiveSHA256: i.release.archiveSHA256})
+	if err != nil {
+		_ = os.RemoveAll(stage)
+		return "", fmt.Errorf("encode Cua ownership marker: %w", err)
+	}
+	marker = append(marker, '\n')
+	if err := writePrivateFile(ctx, filepath.Join(stage, ".personastack-cua.json"), marker, 0o600); err != nil {
+		_ = os.RemoveAll(stage)
+		return "", err
+	}
+	if err := verifyTree(ctx, stage, i.release, i.notices); err != nil {
+		_ = os.RemoveAll(stage)
+		return "", err
+	}
+	return stage, nil
 }
 
 func (i *Installer) Verify() error {
@@ -384,6 +549,10 @@ func extractVerified(ctx context.Context, archive []byte, root string, selected 
 }
 
 func verifyTree(ctx context.Context, root string, selected release, notices []noticeFile) error {
+	return verifyTreeMode(ctx, root, selected, notices, true, false)
+}
+
+func verifyTreeMode(ctx context.Context, root string, selected release, notices []noticeFile, verifyContents, allowMissing bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -394,7 +563,7 @@ func verifyTree(ctx context.Context, root string, selected release, notices []no
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || !currentUserOwnsDirectory(info) {
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !safeInstallDirectoryMode(info.Mode(), verifyContents) || !currentUserOwnsDirectory(info) {
 		return ErrForeignInstall
 	}
 	markerPath := filepath.Join(root, ".personastack-cua.json")
@@ -448,7 +617,7 @@ func verifyTree(ctx context.Context, root string, selected release, notices []no
 	children := expectedChildren(allowedFiles, allowedDirectories)
 	verifiedFiles := make(map[string]struct{}, len(allowedFiles))
 	verifiedDirectories := make(map[string]struct{}, len(allowedDirectories))
-	if err := verifyDirectory(ctx, root, ".", children, allowedFiles, allowedDirectories, verifiedFiles, verifiedDirectories); err != nil {
+	if err := verifyDirectory(ctx, root, ".", children, allowedFiles, allowedDirectories, verifiedFiles, verifiedDirectories, verifyContents, allowMissing); err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
 			return contextErr
 		}
@@ -457,7 +626,7 @@ func verifyTree(ctx context.Context, root string, selected release, notices []no
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if len(verifiedFiles) != len(allowedFiles) || len(verifiedDirectories) != len(allowedDirectories) {
+	if !allowMissing && (len(verifiedFiles) != len(allowedFiles) || len(verifiedDirectories) != len(allowedDirectories)) {
 		return ErrForeignInstall
 	}
 	return nil
@@ -482,7 +651,7 @@ func expectedChildren(files map[string]string, directories map[string]struct{}) 
 	return children
 }
 
-func verifyDirectory(ctx context.Context, root, relative string, children map[string]map[string]struct{}, files map[string]string, directories map[string]struct{}, verifiedFiles, verifiedDirectories map[string]struct{}) error {
+func verifyDirectory(ctx context.Context, root, relative string, children map[string]map[string]struct{}, files map[string]string, directories map[string]struct{}, verifiedFiles, verifiedDirectories map[string]struct{}, verifyContents, allowMissing bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -491,7 +660,10 @@ func verifyDirectory(ctx context.Context, root, relative string, children map[st
 		path = filepath.Join(root, filepath.FromSlash(relative))
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || !currentUserOwnsDirectory(info) {
+	if allowMissing && errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !safeInstallDirectoryMode(info.Mode(), verifyContents) || !currentUserOwnsDirectory(info) {
 		return ErrForeignInstall
 	}
 	if relative != "." {
@@ -509,7 +681,7 @@ func verifyDirectory(ctx context.Context, root, relative string, children map[st
 	}
 	entries, readErr := directory.ReadDir(len(expected) + 1)
 	closeErr := directory.Close()
-	if closeErr != nil || (readErr != nil && !errors.Is(readErr, io.EOF)) || len(entries) != len(expected) {
+	if closeErr != nil || (readErr != nil && !errors.Is(readErr, io.EOF)) || (!allowMissing && len(entries) != len(expected)) || len(entries) > len(expected) {
 		return ErrForeignInstall
 	}
 	for _, entry := range entries {
@@ -524,7 +696,7 @@ func verifyDirectory(ctx context.Context, root, relative string, children map[st
 			child = relative + "/" + child
 		}
 		if _, ok := directories[child]; ok {
-			if err := verifyDirectory(ctx, root, child, children, files, directories, verifiedFiles, verifiedDirectories); err != nil {
+			if err := verifyDirectory(ctx, root, child, children, files, directories, verifiedFiles, verifiedDirectories, verifyContents, allowMissing); err != nil {
 				return err
 			}
 			continue
@@ -533,7 +705,10 @@ func verifyDirectory(ctx context.Context, root, relative string, children map[st
 		if !ok {
 			return ErrForeignInstall
 		}
-		if err := verifyFile(ctx, filepath.Join(root, filepath.FromSlash(child)), child, digest); err != nil {
+		if !verifyContents {
+			digest = ""
+		}
+		if err := verifyFile(ctx, filepath.Join(root, filepath.FromSlash(child)), child, digest, verifyContents); err != nil {
 			return err
 		}
 		verifiedFiles[child] = struct{}{}
@@ -541,15 +716,22 @@ func verifyDirectory(ctx context.Context, root, relative string, children map[st
 	return nil
 }
 
-func verifyFile(ctx context.Context, path, relative, digest string) error {
+func safeInstallDirectoryMode(mode os.FileMode, verifyContents bool) bool {
+	if verifyContents {
+		return mode.Perm()&0o077 == 0
+	}
+	return mode.Perm()&0o022 == 0
+}
+
+func verifyFile(ctx context.Context, path, relative, digest string, verifyMode bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maximumFileBytes || info.Mode().Perm() != expectedFileMode(relative).Perm() {
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maximumFileBytes || !currentUserOwnsFile(info) || (verifyMode && info.Mode().Perm() != expectedFileMode(relative).Perm()) {
 		return ErrForeignInstall
 	}
-	if digest == "" {
+	if !verifyMode {
 		return nil
 	}
 	fileFD, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
@@ -568,7 +750,7 @@ func verifyFile(ctx context.Context, path, relative, digest string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) || openedInfo.Size() > maximumFileBytes || copied > maximumFileBytes || copied != openedInfo.Size() || copyErr != nil || closeErr != nil || hex.EncodeToString(hash.Sum(nil)) != digest {
+	if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) || openedInfo.Size() > maximumFileBytes || copied > maximumFileBytes || copied != openedInfo.Size() || copyErr != nil || closeErr != nil || (digest != "" && hex.EncodeToString(hash.Sum(nil)) != digest) {
 		return ErrForeignInstall
 	}
 	return nil

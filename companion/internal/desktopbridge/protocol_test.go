@@ -27,6 +27,7 @@ func TestParseAcceptsHostedDesktopControlCommands(t *testing.T) {
 		{name: "empty state scope", raw: `{"id":2,"version":"1","action":"state","scope":""}`, want: Request{ID: 2, Version: "1", Action: ActionState}},
 		{name: "tray pause", raw: `{"id":3,"version":"1","action":"pause","scope":"` + LifecycleScope + `"}`, want: Request{ID: 3, Version: "1", Action: ActionPause, Scope: LifecycleScope}},
 		{name: "tray resume", raw: `{"id":4,"version":"1","action":"resume","scope":"` + LifecycleScope + `"}`, want: Request{ID: 4, Version: "1", Action: ActionResume, Scope: LifecycleScope}},
+		{name: "tray repair", raw: `{"id":8,"version":"1","action":"repair","scope":"` + LifecycleScope + `"}`, want: Request{ID: 8, Version: "1", Action: ActionRepair, Scope: LifecycleScope}},
 		{name: "tray disconnect", raw: `{"id":6,"version":"1","action":"disconnect","scope":"` + LifecycleScope + `"}`, want: Request{ID: 6, Version: "1", Action: ActionDisconnect, Scope: LifecycleScope}},
 		{name: "tray state without workspace sync", raw: `{"id":5,"version":"1","action":"state","scope":"` + LifecycleScope + `"}`, want: Request{ID: 5, Version: "1", Action: ActionState, Scope: LifecycleScope}},
 		{name: "prepare", raw: `{"id":7,"version":"1","action":"prepare","scope":"workspace:request","enrollment_ticket":"` + ticket + `"}`, want: Request{ID: 7, Version: "1", Action: ActionPrepare, Scope: "workspace:request", EnrollmentTicket: ticket}},
@@ -254,14 +255,14 @@ func TestProcessorRoutesPauseResumeAndDisconnectToIntegratedRuntime(t *testing.T
 		t.Fatal(err)
 	}
 	processor.Handle(context.Background(), Request{ID: 1, Version: "1", Action: ActionSync, Scope: "workspace:a"})
-	for _, action := range []Action{ActionPause, ActionResume, ActionDisconnect} {
+	for _, action := range []Action{ActionPause, ActionResume, ActionRepair, ActionDisconnect} {
 		result := processor.Handle(context.Background(), Request{ID: uint64(lifecycle.stateCalls + 2), Version: "1", Action: action, Scope: LifecycleScope})
 		if !result.OK || result.Result == nil || !result.Result.RelayPaused {
 			t.Fatalf("%s = %#v", action, result)
 		}
 	}
-	if lifecycle.stateCalls != 3 || lifecycle.disconnectCalls != 1 {
-		t.Fatalf("lifecycle calls = %d, disconnect calls=%d, want three actions with one disconnect", lifecycle.stateCalls, lifecycle.disconnectCalls)
+	if lifecycle.stateCalls != 4 || lifecycle.repairCalls != 1 || lifecycle.disconnectCalls != 1 {
+		t.Fatalf("lifecycle calls = %d, repair calls=%d, disconnect calls=%d", lifecycle.stateCalls, lifecycle.repairCalls, lifecycle.disconnectCalls)
 	}
 	wrongScope := processor.Handle(context.Background(), Request{ID: 5, Version: "1", Action: ActionDisconnect, Scope: "workspace:a"})
 	if wrongScope.Error != ErrorInvalidRequest || lifecycle.disconnectCalls != 1 {
@@ -404,6 +405,7 @@ type controlRuntimeStub struct {
 	lastTicket          string
 	prepareErr          error
 	disconnectCalls     int
+	repairCalls         int
 	pauseStarted        chan struct{}
 	pauseRelease        chan struct{}
 }
@@ -441,6 +443,12 @@ func (runtime *controlRuntimeStub) Pause(ctx context.Context) (installation.Loca
 
 func (runtime *controlRuntimeStub) Resume(context.Context) (installation.LocalState, error) {
 	runtime.stateCalls++
+	return runtime.state, nil
+}
+
+func (runtime *controlRuntimeStub) Repair(context.Context) (installation.LocalState, error) {
+	runtime.stateCalls++
+	runtime.repairCalls++
 	return runtime.state, nil
 }
 

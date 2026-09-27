@@ -60,6 +60,7 @@ import {
   sameTrayControlSnapshot,
   trayControlAction,
   trayControlCanDisconnect,
+  trayControlCanRepair,
   trayControlCanSetUp,
   trayControlStatus,
   type TrayControlSnapshot,
@@ -596,6 +597,13 @@ function updateTrayMenu(): void {
     } else if (trayControlCanSetUp(trayControlSnapshot)) {
       items.push({ label: "Set Up Desktop Control", click: () => openMainWindow(true, "/user/desktop-control") });
     }
+    if (trayControlCanRepair(trayControlSnapshot)) {
+      items.push({
+        label: "Repair Cua Service",
+        enabled: !trayControlActionPending,
+        click: () => { void runTrayLifecycleAction("repair"); },
+      });
+    }
     if (trayControlCanDisconnect(trayControlSnapshot)) {
       items.push({
         label: "Disconnect this computer…",
@@ -667,10 +675,10 @@ async function confirmTrayDisconnect(): Promise<void> {
   if (result.response === 0) await runTrayLifecycleAction("disconnect");
 }
 
-async function runTrayLifecycleAction(action: "pause" | "resume" | "disconnect"): Promise<void> {
+async function runTrayLifecycleAction(action: "pause" | "resume" | "repair" | "disconnect"): Promise<void> {
   if (trayControlActionPending || !tray) return;
-  const current = action === "disconnect"
-    ? trayControlCanDisconnect(trayControlSnapshot)
+  const current = action === "disconnect" || action === "repair"
+    ? action === "disconnect" ? trayControlCanDisconnect(trayControlSnapshot) : trayControlCanRepair(trayControlSnapshot)
     : isCurrentTrayControlAction(trayControlSnapshot, action);
   if (!current) {
     trayControlSnapshot = { ...trayControlSnapshot, actionError: "unavailable" };

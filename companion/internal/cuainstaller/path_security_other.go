@@ -33,3 +33,5 @@ func ensurePrivateDirectoryPath(path string, create bool) error {
 func safeDirectoryOwner(os.FileInfo) bool { return true }
 
 func currentUserOwnsDirectory(os.FileInfo) bool { return true }
+
+func currentUserOwnsFile(os.FileInfo) bool { return true }

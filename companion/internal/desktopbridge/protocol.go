@@ -36,6 +36,7 @@ const (
 	ActionPrepare      Action = "prepare"
 	ActionPause        Action = "pause"
 	ActionResume       Action = "resume"
+	ActionRepair       Action = "repair"
 	ActionDisconnect   Action = "disconnect"
 	ActionLocalSession Action = "local_session"
 )
@@ -119,6 +120,7 @@ type ControlRuntime interface {
 	Prepare(context.Context, string, string) (installation.LocalState, error)
 	Pause(context.Context) (installation.LocalState, error)
 	Resume(context.Context) (installation.LocalState, error)
+	Repair(context.Context) (installation.LocalState, error)
 	Disconnect(context.Context) (installation.LocalState, error)
 }
 
@@ -179,11 +181,11 @@ func Parse(raw []byte) (Request, error) {
 		if len(fields) != 4 || hasField(fields, "enrollment_ticket") || request.Scope == LifecycleScope {
 			return Request{}, ErrInvalidRequest
 		}
-	case ActionState, ActionPause, ActionResume, ActionDisconnect:
+	case ActionState, ActionPause, ActionResume, ActionRepair, ActionDisconnect:
 		if len(fields) != 4 || hasField(fields, "enrollment_ticket") {
 			return Request{}, ErrInvalidRequest
 		}
-		if (request.Action == ActionPause || request.Action == ActionResume || request.Action == ActionDisconnect) && request.Scope != LifecycleScope {
+		if request.Action != ActionState && request.Scope != LifecycleScope {
 			return Request{}, ErrInvalidRequest
 		}
 	case ActionPrepare:
@@ -219,7 +221,7 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 		return response
 	}
 	lifecycleAction := request.Scope == LifecycleScope &&
-		(request.Action == ActionState || request.Action == ActionPause || request.Action == ActionResume || request.Action == ActionDisconnect)
+		(request.Action == ActionState || request.Action == ActionPause || request.Action == ActionResume || request.Action == ActionRepair || request.Action == ActionDisconnect)
 	var commandCtx context.Context
 	var commandID, generation uint64
 	var ok bool
@@ -261,7 +263,7 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 		response.LocalSession = result
 		return response
 	}
-	if request.Action != ActionState && request.Action != ActionPrepare && request.Action != ActionPause && request.Action != ActionResume && request.Action != ActionDisconnect {
+	if request.Action != ActionState && request.Action != ActionPrepare && request.Action != ActionPause && request.Action != ActionResume && request.Action != ActionRepair && request.Action != ActionDisconnect {
 		response.Error = ErrorInvalidRequest
 		return response
 	}
@@ -278,9 +280,11 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 		state, err = p.controlRuntime.Pause(commandCtx)
 	case lifecycleAction && request.Action == ActionResume && p.controlRuntime != nil:
 		state, err = p.controlRuntime.Resume(commandCtx)
+	case lifecycleAction && request.Action == ActionRepair && p.controlRuntime != nil:
+		state, err = p.controlRuntime.Repair(commandCtx)
 	case lifecycleAction && request.Action == ActionDisconnect && p.controlRuntime != nil:
 		state, err = p.controlRuntime.Disconnect(commandCtx)
-	case request.Action == ActionPause || request.Action == ActionResume || request.Action == ActionDisconnect:
+	case request.Action == ActionPause || request.Action == ActionResume || request.Action == ActionRepair || request.Action == ActionDisconnect:
 		err = ErrInvalidRequest
 	case request.Action == ActionPrepare && p.controlRuntime != nil:
 		state, err = p.controlRuntime.Prepare(commandCtx, p.origin, request.EnrollmentTicket)

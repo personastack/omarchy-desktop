@@ -30,6 +30,11 @@ export function trayControlCanDisconnect(snapshot: TrayControlSnapshot): boolean
   return !!state?.installation_id && !!state.runtime_available;
 }
 
+export function trayControlCanRepair(snapshot: TrayControlSnapshot): boolean {
+  const state = snapshot.state;
+  return !!state?.installation_id && !!state.runtime_available;
+}
+
 export function trayControlStatus(snapshot: TrayControlSnapshot): string {
   const state = snapshot.state;
   if (snapshot.actionError || snapshot.refreshError) return "Desktop Control: Needs attention";

@@ -20,6 +20,7 @@ var (
 
 type Installer interface {
 	Install(context.Context) (string, error)
+	Repair(context.Context) (string, error)
 }
 
 type Client interface {
@@ -77,6 +78,16 @@ func NewDefault() (*Runtime, error) {
 // Prepare installs the pinned driver if needed, starts one MCP child, and
 // accepts it only when its versioned Linux health report passes.
 func (r *Runtime) Prepare(ctx context.Context) (State, error) {
+	return r.prepare(ctx, false)
+}
+
+// Repair restarts the owned MCP process and repairs only a verified
+// PersonaStack-owned driver tree when its pinned files are damaged.
+func (r *Runtime) Repair(ctx context.Context) (State, error) {
+	return r.prepare(ctx, true)
+}
+
+func (r *Runtime) prepare(ctx context.Context, repair bool) (State, error) {
 	if ctx == nil {
 		return State{}, ErrUnavailable
 	}
@@ -94,7 +105,7 @@ func (r *Runtime) Prepare(ctx context.Context) (State, error) {
 		r.mu.Unlock()
 		return State{}, ErrUnavailable
 	}
-	if r.state.Ready && r.client != nil && r.client.Alive() {
+	if !repair && r.state.Ready && r.client != nil && r.client.Alive() {
 		state := r.state
 		r.mu.Unlock()
 		return state, nil
@@ -121,8 +132,17 @@ func (r *Runtime) Prepare(ctx context.Context) (State, error) {
 		r.mu.Unlock()
 	}()
 
-	executable, err := r.installer.Install(setupCtx)
+	var executable string
+	var err error
+	if repair {
+		executable, err = r.installer.Repair(setupCtx)
+	} else {
+		executable, err = r.installer.Install(setupCtx)
+	}
 	if err != nil {
+		if repair {
+			return State{}, fmt.Errorf("repair pinned Cua driver: %w", err)
+		}
 		return State{}, fmt.Errorf("install pinned Cua driver: %w", err)
 	}
 	if err := setupCtx.Err(); err != nil {

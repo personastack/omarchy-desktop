@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { DesktopControlState } from "./companion-client.js";
-import { applyTrayActionResult, applyTrayStateRead, beginTrayControlAction, beginTrayStateRead, isCurrentTrayControlAction, sameTrayControlSnapshot, trayControlAction, trayControlCanDisconnect, trayControlCanSetUp, trayControlStatus } from "./tray-control.js";
+import { applyTrayActionResult, applyTrayStateRead, beginTrayControlAction, beginTrayStateRead, isCurrentTrayControlAction, sameTrayControlSnapshot, trayControlAction, trayControlCanDisconnect, trayControlCanRepair, trayControlCanSetUp, trayControlStatus } from "./tray-control.js";
 
 const baseState: DesktopControlState = {
   installation_id: "install_01",
@@ -26,6 +26,8 @@ test("tray actions distinguish user pause and allow pausing a degraded active re
   assert.equal(trayControlCanSetUp({ state: { ...baseState, installation_id: null } }), true);
   assert.equal(trayControlCanSetUp({ state: { ...baseState, installation_id: null, runtime_available: false } }), false);
   assert.equal(trayControlCanDisconnect({ state: baseState }), true);
+  assert.equal(trayControlCanRepair({ state: baseState }), true);
+  assert.equal(trayControlCanRepair({ state: { ...baseState, installation_id: null } }), false);
   assert.equal(trayControlCanDisconnect({ state: { ...baseState, installation_id: null } }), false);
   assert.equal(trayControlCanDisconnect({ state: { ...baseState, runtime_available: false } }), false);
   assert.equal(trayControlAction({ state: { ...baseState, cua_ready: false } }), "pause");

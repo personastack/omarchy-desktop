@@ -10,6 +10,7 @@ const DESKTOP_CONTROL_PREPARE_TIMEOUT_MS = 4 * 60_000;
 // The Go resume operation is bounded to eleven minutes; allow two minutes for
 // the typed response and companion shutdown to finish before closing the pipe.
 const DESKTOP_CONTROL_RESUME_TIMEOUT_MS = 13 * 60_000;
+const DESKTOP_CONTROL_REPAIR_TIMEOUT_MS = 9 * 60_000;
 const LOCAL_SESSION_TIMEOUT_MS = 4 * 60_000;
 const MAX_REQUEST_ID = Number.MAX_SAFE_INTEGER;
 
@@ -25,7 +26,7 @@ export type DesktopControlState = Readonly<{
   user_paused: boolean;
 }>;
 
-export type LifecycleAction = "state" | "pause" | "resume" | "disconnect";
+export type LifecycleAction = "state" | "pause" | "resume" | "repair" | "disconnect";
 
 type DesktopControlPrepared = DesktopControlState;
 
@@ -129,6 +130,7 @@ export class CompanionClient {
       const timeoutMs = action === "prepare"
         ? DESKTOP_CONTROL_PREPARE_TIMEOUT_MS
         : action === "resume" ? DESKTOP_CONTROL_RESUME_TIMEOUT_MS
+          : action === "repair" ? DESKTOP_CONTROL_REPAIR_TIMEOUT_MS
           : localAction === "prepare" || localAction === "configure" ? LOCAL_SESSION_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
       const timeout = setTimeout(() => this.failAll(), timeoutMs);
       this.pending.set(id, { action, localAction, resolve, timeout });
