@@ -20,6 +20,10 @@ The client must not create a second login, authorization service, integration st
 
 No environment is currently supported. The first candidate is Omarchy Edge on x86_64 with an exact Omarchy, Hyprland, Electron, Cua Driver, Cua Hyprland input plugin and Secret Service profile recorded by the feasibility gate. ARM64, other Linux distributions, other compositors, stable-channel Omarchy and unsupported Cua applications are outside the initial claim until separately proven.
 
+## Native window controls
+
+Native window control is not implemented or certified. The current chat bridge calls Electron for move, resize, minimize and always-on-top behavior. [Electron documents](https://www.electronjs.org/docs/latest/api/base-window) that Wayland does not support programmatic move or always-on-top, and may restrict resize. [Hyprland documents](https://wiki.hypr.land/0.46.0/Configuring/Dispatchers/) its `pin` dispatcher as showing a floating window on every workspace. That does not implement the required current-workspace pin behavior. XWayland is a candidate backend for Electron window controls, but must be tested with the pinned Electron and Hyprland profile for transparency, collapse/expand, drag, monitor clamping, minimize/restore and above-normal placement without focus theft. Do not report the chat window's pin action as working until native state readback confirms it.
+
 ## Security boundary
 
 Remote content receives only finite presentation messages from registered top-level windows at the configured PersonaStack app origin. Machine credentials stay in protected OS storage and native process memory. The API authorizes each workspace, persona and Desktop Control operation. Native execution accepts only reviewed typed operations under the current lease and scope. A failed or uncertain mutation is not replayed automatically.
