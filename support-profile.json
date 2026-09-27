@@ -22,6 +22,7 @@
     "hyprland_plugin_release_url": "https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.29.1",
     "hyprland_plugin_source_revision": "7a8f66ad04e62fccb18cca9965f2964fcaee124e",
     "hyprland_plugin_asset": "cua-hyprland-plugin-0.29.1-7a8f66ad04e62fccb18cca9965f2964fcaee124e.tar.gz",
+    "hyprland_plugin_asset_type": "source_archive",
     "hyprland_plugin_sha256": "30d3639fd08b2f08a15ebfff43138535713f4d76efbbdcbec7a83aea044069c5",
     "hyprland_plugin_license": "MIT",
     "hyprland_plugin_upstream_build": {
@@ -37,6 +38,7 @@
       ]
     },
     "build_kit_asset": "cua-hyprland-plugin-0.29.1-7a8f66ad04e62fccb18cca9965f2964fcaee124e-build-kit.tar.gz",
+    "build_kit_asset_type": "Arch build kit",
     "build_kit_sha256": "4f689cac36b48e9c60e03ddfbb1c5a45665f744f3dbce82c91728031d46e17a9",
     "target_input_plugin_mode": null,
     "verified_apps": []
