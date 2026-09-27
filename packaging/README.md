@@ -25,7 +25,7 @@ Review the new app and API source revisions. Update the two commit pins in `PKGB
 The app has no automatic updater or package rollback hook. Keep a previously built package if you may need to revert. Restore it with:
 
 ```sh
-sudo pacman -U /path/to/previously-built-personastack.pkg.tar.zst
+sudo pacman -U ./personastack-0.1.0-6-x86_64.pkg.tar.zst
 ```
 
 The package owns files under `/usr`. It does not own or remove the user's Electron browser session, Linux Secret Service credential, or Codex and Claude configuration. The current app has no user-data migration to reverse. Package upgrade and rollback have not been acceptance-tested. Future user-data migrations need an explicit downgrade compatibility policy.
@@ -52,6 +52,6 @@ Pacman removes the package-owned runtime, launcher, desktop entry, and icon. The
 
 ## Validation status
 
-The current recipe pins app commit `488ad3e6a7acbf2194140abca0d45aa25b2eab56`, API client commit `fdf742c884168c4d6f2531b9cc65b966d018e7b3`, and package version `0.1.0-6`. On `eric-pc`, the Arch package build compiled the Electron app and companion. All 76 Node tests passed. The companion Go suite did not pass: Cua installer tests reported that the install path was not owned by PersonaStack, and related fixtures were missing under the `/build/tmp` host bind mount. `makepkg` therefore stopped before package creation. This run does not validate package installation or the complete Go suite.
+On `eric-pc`, `makepkg --cleanbuild --noconfirm` built package `personastack 0.1.0-6` from app commit `488ad3e6a7acbf2194140abca0d45aa25b2eab56` and API client commit `fdf742c884168c4d6f2531b9cc65b966d018e7b3`. Node `26.10.0`, the pinned npm CLI `11.19.0`, and Go `1.27.1` compiled the app and companion. All 76 Node tests and the full companion Go test suite passed. `pacman -Qp --info` confirms `xorg-xwayland`. The package SHA-256 is `2c7aa3d9da93943fc64058fa5033bf5b7766e1150b22df33515bf51aaabe923d`. The artifact is at `/tmp/personastack-0.1.0-6-x86_64.pkg.tar.zst` on `eric-pc`.
 
-The previous validated package `0.1.0-5` remains at `/tmp/personastack-0.1.0-5-x86_64.pkg.tar.zst` on `eric-pc`. It used app commit `3fec3310937ebb5b65852f5cd3632daba3486c8a`, passed all 67 Node tests and the full companion Go suite, and has SHA-256 `1f9f096fc0bf42f94a082282677e58bf8c29d2773619c7f2d011c2a136832467`. Its build used a local archive of the exact private API client revision, without forwarding SSH credentials. Package installation, keyring behavior, and Omarchy acceptance remain open. This recipe does not claim Omarchy support. Keep platform, installed-package, and full parity acceptance open.
+An earlier attempt set `TMPDIR` to the bind-mounted build directory. Cua installer ownership tests failed there because the container's user-namespace ownership differed on the mount. The successful run kept Go temporary files in the container filesystem. The build used a local archive of the exact private API client revision, without forwarding SSH credentials. Package installation, keyring behavior, and Omarchy acceptance remain open. This recipe does not claim Omarchy support. Keep platform, installed-package, and full parity acceptance open.
