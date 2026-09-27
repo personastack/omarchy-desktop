@@ -130,6 +130,51 @@ func TestClientRunsBoundedMCPCallsInOneOwnedProcess(t *testing.T) {
 	}
 }
 
+func TestClientDoesNotRetryUncertainToolOutcome(t *testing.T) {
+	t.Parallel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal("resolve test executable")
+	}
+	client, err := New(executable)
+	if err != nil {
+		t.Fatalf("create Cua client: %v", err)
+	}
+	client.command = func(ctx context.Context, path string) *exec.Cmd {
+		return exec.CommandContext(ctx, path, "-test.run=^TestCUAHelperProcess$", "--", "mcp")
+	}
+	requestLog := filepath.Join(t.TempDir(), "tool-requests")
+	dispatched := filepath.Join(t.TempDir(), "tool-dispatched")
+	client.environment = append(client.environment,
+		"CUA_HELPER_UNCERTAIN_OUTCOME=1",
+		"CUA_HELPER_UNCERTAIN_REQUESTS="+requestLog,
+		"CUA_HELPER_UNCERTAIN_DISPATCHED="+dispatched,
+	)
+	if _, err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start Cua client: %v", err)
+	}
+	t.Cleanup(client.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	callResult := make(chan error, 1)
+	go func() {
+		_, callErr := client.Call(ctx, agentgatewayruntime.DesktopControlOperationObserve, "get_desktop_state", json.RawMessage(`{}`))
+		callResult <- callErr
+	}()
+	waitForFile(t, dispatched)
+	cancel()
+	if err := <-callResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("uncertain tool result error = %v, want caller cancellation", err)
+	}
+	requests, err := os.ReadFile(requestLog)
+	if err != nil {
+		t.Fatalf("read fake Cua request log: %v", err)
+	}
+	if string(requests) != "get_desktop_state\n" {
+		t.Fatalf("uncertain operation requests = %q, want one request", requests)
+	}
+}
+
 func TestClientLifetimeOutlivesStartupContext(t *testing.T) {
 	t.Parallel()
 	executable, err := os.Executable()
@@ -536,6 +581,23 @@ func TestCUAHelperProcess(t *testing.T) {
 				}
 			}
 		case "tools/call":
+			if os.Getenv("CUA_HELPER_UNCERTAIN_OUTCOME") == "1" {
+				requestLog, err := os.OpenFile(os.Getenv("CUA_HELPER_UNCERTAIN_REQUESTS"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+				if err != nil {
+					os.Exit(12)
+				}
+				if _, err := fmt.Fprintln(requestLog, request.Params.Name); err != nil {
+					_ = requestLog.Close()
+					os.Exit(13)
+				}
+				if err := requestLog.Close(); err != nil {
+					os.Exit(14)
+				}
+				if err := os.WriteFile(os.Getenv("CUA_HELPER_UNCERTAIN_DISPATCHED"), []byte("dispatched"), 0o600); err != nil {
+					os.Exit(15)
+				}
+				continue
+			}
 			if os.Getenv("CUA_HELPER_HOLD_OUTPUT_CHILD") == "1" {
 				return
 			}
