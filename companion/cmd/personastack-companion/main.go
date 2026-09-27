@@ -208,6 +208,7 @@ func serve(input io.Reader, output io.Writer, processor *desktopbridge.Processor
 			}
 			continue
 		}
+		request = processor.Register(processContext, request)
 		requests.Add(1)
 		go func(request desktopbridge.Request) {
 			defer requests.Done()

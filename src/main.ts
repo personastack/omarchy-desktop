@@ -20,6 +20,7 @@ import {
 } from "electron";
 
 import { getAutostartStatus, setAutostartEnabled, type AutostartStatus } from "./autostart.js";
+import { createAfterReady } from "./ready-session.js";
 import { beginDesktopAuthHandoff, consumeDesktopAuthHandoff, exchangeDesktopAuthHandoff, type PendingDesktopAuthHandoff } from "./desktop-auth-handoff.js";
 import {
   beginExternalOAuthReturn,
@@ -31,6 +32,7 @@ import {
 import { delegateChatWindowClose } from "./chat-window-close.js";
 import { applyChatWindowCommand as dispatchChatWindowCommand } from "./chat-window-command.js";
 import { closePopoutWindows, synchronizePopoutScope } from "./popout-scope.js";
+import { documentNavigationEffects, type DocumentNavigationEvent } from "./document-navigation.js";
 import { loadAndShowWindow } from "./window-load.js";
 import {
   beginNavigationGeneration,
@@ -97,7 +99,7 @@ interface RegisteredWindow {
 
 const appURL = resolveAppURL(process.argv, process.env.PERSONASTACK_DEFAULT_URL);
 const sessionPartition = `persist:personastack:${encodeURIComponent(appURL.origin)}`;
-const browserSession = session.fromPartition(sessionPartition);
+const browserSession = createAfterReady(app.whenReady(), () => session.fromPartition(sessionPartition));
 const windows = new Map<number, RegisteredWindow>();
 const chats = new Map<string, BrowserWindow>();
 const stackWindows = new Map<string, BrowserWindow>();
@@ -156,11 +158,12 @@ if (!app.requestSingleInstanceLock()) {
     isQuitting = true;
   });
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     const callbackURL = process.argv.find(isDesktopAuthHandoffURL);
     if (callbackURL) void completeDesktopAuthHandoff(callbackURL);
-    configureBrowserPermissions();
-    configureDownloads();
+    const hostedSession = await browserSession;
+    configureBrowserPermissions(hostedSession);
+    configureDownloads(hostedSession);
     createTray();
     openMainWindow(!launchInBackground);
   });
@@ -187,7 +190,8 @@ async function completeDesktopAuthHandoff(callbackURL: string): Promise<void> {
   if (!callback) return;
 
   try {
-    await exchangeDesktopAuthHandoff((input, init) => browserSession.fetch(input, init), appOriginURL(), callback);
+    const hostedSession = await browserSession;
+    await exchangeDesktopAuthHandoff((input, init) => hostedSession.fetch(input, init), appOriginURL(), callback);
     openMainWindow(true, "/user/personas");
   } catch {
     openMainWindow(true, "/login");
@@ -199,12 +203,12 @@ function appOriginURL(): URL {
   return new URL(appURL.href);
 }
 
-function configureBrowserPermissions(): void {
-  browserSession.setPermissionRequestHandler((contents, _permission, callback, details) => {
+function configureBrowserPermissions(hostedSession: Electron.Session): void {
+  hostedSession.setPermissionRequestHandler((contents, _permission, callback, details) => {
     const entry = windows.get(contents.id);
     callback(isTrustedPermissionRequest(entry?.role, details.isMainFrame, details.requestingUrl, undefined, appOriginURL()));
   });
-  browserSession.setPermissionCheckHandler((contents, _permission, requestingOrigin, details) => {
+  hostedSession.setPermissionCheckHandler((contents, _permission, requestingOrigin, details) => {
     const entry = contents ? windows.get(contents.id) : undefined;
     const requestingURL = details.requestingUrl ?? details.securityOrigin ?? requestingOrigin;
     return isTrustedPermissionRequest(entry?.role, details.isMainFrame, requestingURL, details.embeddingOrigin, appOriginURL());
@@ -216,7 +220,7 @@ function createWindow(role: BridgeRole, options: Electron.BrowserWindowConstruct
     ...options,
     webPreferences: {
       partition: sessionPartition,
-      preload: join(import.meta.dirname, "preload.js"),
+      preload: join(import.meta.dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -293,29 +297,38 @@ function configureWebContents(entry: RegisteredWindow): void {
   contents.on("did-start-navigation", (_event, _rawURL, isInPlace, isMainFrame) => {
     if (!isMainFrame || isInPlace) return;
     entry.navigationGeneration = beginNavigationGeneration(entry.navigationGeneration);
+    applyDocumentNavigationEffects(entry, "navigation-started");
   });
-  contents.on("did-navigate", (_event, rawURL) => {
+  contents.on("did-navigate", (_event, rawURL, httpResponseCode) => {
     entry.navigationGeneration = commitNavigationGeneration(entry.navigationGeneration);
     const navigatedURL = new URL(rawURL);
-    if (entry.pendingExternalOAuth && rawURL !== entry.pendingExternalOAuth.returnURL) {
+    if (entry.pendingExternalOAuth && (rawURL !== entry.pendingExternalOAuth.returnURL || httpResponseCode >= 400)) {
       entry.pendingExternalOAuth = undefined;
     }
-    const path = navigatedURL.pathname;
-    if (entry.role === "main" && (path === "/login" || path === "/logout")) invalidatePopouts();
+    applyDocumentNavigationEffects(entry, "response-received", rawURL, httpResponseCode);
   });
   contents.on("did-fail-load", (_event, _code, _description, _url, isMainFrame) => {
     if (!isMainFrame) return;
     entry.navigationGeneration = rollbackNavigationGeneration(entry.navigationGeneration);
-    if (entry.role === "main") {
-      invalidatePopouts();
-    } else closeWindow(entry.window);
+    applyDocumentNavigationEffects(entry, "load-failed");
   });
   contents.on("render-process-gone", () => {
-    if (entry.role === "main") {
-      invalidatePopouts();
-    }
-    else closeWindow(entry.window);
+    applyDocumentNavigationEffects(entry, "renderer-gone");
   });
+}
+
+function applyDocumentNavigationEffects(
+  entry: RegisteredWindow,
+  event: DocumentNavigationEvent,
+  url = "",
+  responseCode = 0,
+): void {
+  const effects = documentNavigationEffects(entry.role, event, url, responseCode);
+  if (effects.cancelPageRequests && process.platform === "linux" && companionClient?.isOpen) {
+    void companionClient.invalidatePageRequests();
+  }
+  if (effects.invalidatePopouts) invalidatePopouts();
+  if (effects.closeWindow) closeWindow(entry.window);
 }
 
 function authorizeFrameNavigation(
@@ -345,7 +358,10 @@ function authorizeFrameNavigation(
     appOrigin,
     invalidatePopouts,
   );
-  if (!allowed && isMainFrame) restoreNavigationGeneration(entry);
+  if (!allowed && isMainFrame) {
+    if (entry.role === "main") restoreNavigationGeneration(entry);
+    else applyDocumentNavigationEffects(entry, "navigation-denied", targetURL);
+  }
 }
 
 function openGoogleServicesOAuth(entry: RegisteredWindow, authorizationURL: string): void {
@@ -850,8 +866,8 @@ async function toggleLaunchAtLogin(): Promise<void> {
   }
 }
 
-function configureDownloads(): void {
-  browserSession.on("will-download", (_event, item: DownloadItem) => {
+function configureDownloads(hostedSession: Electron.Session): void {
+  hostedSession.on("will-download", (_event, item: DownloadItem) => {
     const fileName = basename(item.getFilename().trim()) || "download";
     const extension = fileName.includes(".") ? fileName.slice(fileName.lastIndexOf(".")) : "";
     const stem = extension ? fileName.slice(0, -extension.length) : fileName;

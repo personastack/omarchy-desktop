@@ -79,6 +79,11 @@ export class CompanionClient {
   private nextRequestID = 1;
   private closed = false;
   private closePromise?: Promise<void>;
+  private scopeQueue: Promise<void> = Promise.resolve();
+  private desiredScope: string | undefined;
+  private synchronizedScope: string | undefined;
+  private scopeRevision = 0;
+  private pageRevision = 0;
   private readonly child: ChildProcess;
 
   constructor(child: ChildProcess) {
@@ -95,7 +100,10 @@ export class CompanionClient {
   }
 
   request(command: DesktopControlCommand): Promise<DesktopControlResult> {
-    return this.send(command.action, command) as Promise<DesktopControlResult>;
+    if (command.action === "sync") {
+      return this.synchronizeScope(command.scope).then(({ result }) => result);
+    }
+    return this.sendInScope(command.scope, command.action, command) as Promise<DesktopControlResult>;
   }
 
   requestLifecycle(action: LifecycleAction): Promise<DesktopControlResult> {
@@ -103,16 +111,75 @@ export class CompanionClient {
   }
 
   requestLocalSession(command: LocalSessionCommand): Promise<LocalSessionResult> {
-    return this.send("local_session", {
+    return this.sendInScope(command.scope, "local_session", {
       version: "1",
       action: "local_session",
       scope: command.scope,
       local_session: command,
-    }, command.action) as Promise<LocalSessionResult>;
+    }, command.action).then((result) => {
+      if (!result.ok && !isLocalSessionError(result.error)) return { ok: false, error: "unavailable" };
+      return result as LocalSessionResult;
+    });
   }
 
-  private send(action: CompanionAction, payload: object, localAction?: LocalSessionCommand["action"]): Promise<CompanionResult> {
-    if (this.closed || this.pending.size >= MAX_PENDING_REQUESTS || this.nextRequestID > MAX_REQUEST_ID) {
+  invalidatePageRequests(): Promise<void> {
+    this.pageRevision++;
+    this.synchronizedScope = undefined;
+    return this.synchronizeScope("", true).then(() => undefined);
+  }
+
+  private async sendInScope(scope: string, action: CompanionAction, payload: object, localAction?: LocalSessionCommand["action"]): Promise<CompanionResult> {
+    const pageRevision = this.pageRevision;
+    const synchronization = await this.synchronizeScope(scope);
+    if (!synchronization.result.ok) return synchronization.result;
+    if (pageRevision !== this.pageRevision || synchronization.revision !== this.scopeRevision) {
+      return { ok: false, error: "stale_request" };
+    }
+    return this.send(action, payload, localAction);
+  }
+
+  private synchronizeScope(scope: string, force = false): Promise<Readonly<{
+    result: DesktopControlResult;
+    revision: number;
+  }>> {
+    if (this.desiredScope !== scope) {
+      this.desiredScope = scope;
+      this.scopeRevision++;
+    }
+    const revision = this.scopeRevision;
+    const pageRevision = this.pageRevision;
+    const operation = this.scopeQueue.then(async (): Promise<DesktopControlResult> => {
+      if (this.closed) return { ok: false, error: "unavailable" };
+      if (!force && (revision !== this.scopeRevision || pageRevision !== this.pageRevision)) {
+        return { ok: false, error: "stale_request" };
+      }
+      if (!force && this.synchronizedScope === scope) return { ok: true };
+      this.synchronizedScope = undefined;
+      const result = await this.send("sync", { version: "1", action: "sync", scope }, undefined, force);
+      if (!result.ok) {
+        if (result.error === "invalid_bundle" || result.error === "missing_harness" ||
+            result.error === "outdated_harness" || result.error === "unsafe_files") {
+          return { ok: false, error: "unavailable" };
+        }
+        return { ok: false, error: result.error };
+      }
+      this.synchronizedScope = scope;
+      if (revision !== this.scopeRevision || pageRevision !== this.pageRevision) {
+        return { ok: false, error: "stale_request" };
+      }
+      return result;
+    });
+    this.scopeQueue = operation.then(() => undefined, () => undefined);
+    return operation.then((result) => ({ result, revision }));
+  }
+
+  private send(
+    action: CompanionAction,
+    payload: object,
+    localAction?: LocalSessionCommand["action"],
+    allowAtCapacity = false,
+  ): Promise<CompanionResult> {
+    if (this.closed || (this.pending.size >= MAX_PENDING_REQUESTS && !allowAtCapacity) || this.nextRequestID > MAX_REQUEST_ID) {
       return Promise.resolve({ ok: false, error: "unavailable" });
     }
 
@@ -280,9 +347,9 @@ function hasLocalState(value: CompanionResult): value is Readonly<{ ok: true }> 
   return value.ok && "installation_id" in value;
 }
 
-function isError(value: unknown): value is Exclude<DesktopControlError, "unsupported_platform" | "stale_request"> {
+function isError(value: unknown): value is Exclude<DesktopControlError, "unsupported_platform"> {
   return value === "invalid_request" || value === "not_enrolled" || value === "keyring_unavailable" ||
-    value === "rejected" || value === "session_locked" || value === "session_state_unknown" || value === "unavailable";
+    value === "rejected" || value === "session_locked" || value === "session_state_unknown" || value === "stale_request" || value === "unavailable";
 }
 
 function isLocalSessionError(value: unknown): value is LocalSessionError {

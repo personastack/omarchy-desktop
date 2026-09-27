@@ -48,6 +48,15 @@ type Request struct {
 	Scope            string          `json:"scope"`
 	EnrollmentTicket string          `json:"enrollment_ticket,omitempty"`
 	LocalSession     json.RawMessage `json:"local_session,omitempty"`
+	dispatch         *commandDispatch
+}
+
+type commandDispatch struct {
+	ctx        context.Context
+	commandID  uint64
+	generation uint64
+	lifecycle  bool
+	accepted   bool
 }
 
 type ErrorCode string
@@ -221,22 +230,51 @@ func (p *Processor) Handle(ctx context.Context, request Request) Response {
 		response.OK = true
 		return response
 	}
-	lifecycleAction := request.Scope == LifecycleScope &&
-		(request.Action == ActionState || request.Action == ActionPause || request.Action == ActionResume || request.Action == ActionRepair || request.Action == ActionDisconnect)
-	var commandCtx context.Context
-	var commandID, generation uint64
-	var ok bool
-	if lifecycleAction {
-		commandCtx, commandID, generation = p.beginLifecycleCommand(ctx)
-		ok = true
-	} else {
-		commandCtx, commandID, generation, ok = p.beginCommand(ctx, request.Scope)
+	if request.dispatch == nil {
+		request = p.Register(ctx, request)
 	}
-	if !ok {
+	dispatch := request.dispatch
+	if !dispatch.accepted {
 		response.Error = ErrorInvalidRequest
 		return response
 	}
-	defer p.finishCommand(commandID)
+	defer p.finishCommand(dispatch.commandID)
+	if dispatch.ctx.Err() != nil {
+		response.Error = ErrorStaleRequest
+		return response
+	}
+	return p.handleDispatched(request, response, dispatch)
+}
+
+// Register captures the command's scope generation before concurrent execution.
+func (p *Processor) Register(ctx context.Context, request Request) Request {
+	if request.Action == ActionSync {
+		return request
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lifecycleAction := request.Scope == LifecycleScope &&
+		(request.Action == ActionState || request.Action == ActionPause || request.Action == ActionResume || request.Action == ActionRepair || request.Action == ActionDisconnect)
+	dispatch := &commandDispatch{lifecycle: lifecycleAction}
+	if lifecycleAction {
+		dispatch.ctx, dispatch.commandID, dispatch.generation = p.beginLifecycleCommand(ctx)
+		dispatch.accepted = true
+	} else {
+		dispatch.ctx, dispatch.commandID, dispatch.generation, dispatch.accepted = p.beginCommand(ctx, request.Scope)
+	}
+	request.dispatch = dispatch
+	return request
+}
+
+func (p *Processor) handleDispatched(
+	request Request,
+	response Response,
+	dispatch *commandDispatch,
+) Response {
+	commandCtx := dispatch.ctx
+	lifecycleAction := dispatch.lifecycle
+	generation := dispatch.generation
 	if request.Action == ActionLocalSession {
 		if p.localSessions == nil {
 			response.Error = ErrorUnavailable

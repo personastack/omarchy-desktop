@@ -88,6 +88,29 @@ func TestWorkspaceScopeChangeDoesNotCancelTrayLifecycleAction(t *testing.T) {
 	}
 }
 
+func TestRegisteredPageCommandStaysFencedAcrossSameScopeResync(t *testing.T) {
+	t.Parallel()
+	service := &serviceStub{}
+	processor, err := New(service, "https://my.personastack.ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	processor.Handle(ctx, Request{ID: 1, Version: "1", Action: ActionSync, Scope: "workspace:a"})
+
+	registered := processor.Register(ctx, Request{ID: 2, Version: "1", Action: ActionState, Scope: "workspace:a"})
+	processor.Handle(ctx, Request{ID: 3, Version: "1", Action: ActionSync, Scope: ""})
+	processor.Handle(ctx, Request{ID: 4, Version: "1", Action: ActionSync, Scope: "workspace:a"})
+
+	response := processor.Handle(ctx, registered)
+	if response.Error != ErrorStaleRequest {
+		t.Fatalf("registered stale state response = %#v", response)
+	}
+	if service.calls != 0 {
+		t.Fatalf("stale registered command reached service %d times", service.calls)
+	}
+}
+
 func TestParseAcceptsOnlyScopedLocalSessionCommands(t *testing.T) {
 	t.Parallel()
 	raw := `{"id":4,"version":"1","action":"local_session","scope":"workspace:a","local_session":{"version":"1","action":"state","scope":"workspace:a"}}`
