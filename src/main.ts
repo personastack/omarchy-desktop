@@ -21,9 +21,9 @@ import {
 
 import { getAutostartStatus, setAutostartEnabled, type AutostartStatus } from "./autostart.js";
 import { delegateChatWindowClose } from "./chat-window-close.js";
+import { applyChatWindowCommand as dispatchChatWindowCommand } from "./chat-window-command.js";
 import { closePopoutWindows, synchronizePopoutScope } from "./popout-scope.js";
 import { loadAndShowWindow } from "./window-load.js";
-import { applyChatWindowSizeAction, clampChatPosition } from "./chat-window-state.js";
 import {
   authorizeBridgeFrame,
   canFollowEnterpriseOIDCLinks,
@@ -529,32 +529,12 @@ function createChatWindow(personaID: string): BrowserWindow {
 }
 
 function applyChatWindowCommand(command: ChatWindowCommand, window: BrowserWindow): void {
-  switch (command.action) {
-    case "minimize":
-      window.minimize();
-      return;
-    case "close":
-      closeWindow(window);
-      return;
-    case "collapse": {
-      const restoreSize = applyChatWindowSizeAction("collapse", window, expandedChatSizes.get(window));
-      if (restoreSize) expandedChatSizes.set(window, restoreSize);
-      return;
-    }
-    case "expand":
-      applyChatWindowSizeAction("expand", window, expandedChatSizes.get(window));
-      return;
-    case "pin":
-      window.setAlwaysOnTop(!window.isAlwaysOnTop(), "floating");
-      return;
-    case "drag": {
-      const [x = 0, y = 0] = window.getPosition();
-      const [width = 440, height = 640] = window.getSize();
-      const targetX = x + command.dx;
-      const targetY = y + command.dy;
-      const display = screen.getDisplayMatching({ x: targetX, y: targetY, width, height });
-      window.setPosition(...clampChatPosition([targetX, targetY], [width, height], display.workArea));
-    }
+  const restoreSize = dispatchChatWindowCommand(command, window, expandedChatSizes.get(window), {
+    close: () => closeWindow(window),
+    workAreaFor: (bounds) => screen.getDisplayMatching(bounds).workArea,
+  });
+  if (command.action === "collapse" && restoreSize) {
+    expandedChatSizes.set(window, restoreSize);
   }
 }
 
