@@ -6,12 +6,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/personastack/omarchy-desktop/companion/internal/testfixture"
 )
 
 func TestStartStreamsOutputBeforeExitAndKeepsStreamsSeparate(t *testing.T) {
@@ -71,12 +75,16 @@ func TestValidateShellAllowsSupportedPOSIXShellsOnly(t *testing.T) {
 
 func TestWriteAndCloseStdin(t *testing.T) {
 	t.Parallel()
-	manager := New("/bin/bash")
-	started, err := manager.Start(context.Background(), "read answer; printf 'received:%s' \"$answer\"", t.TempDir(), 10*time.Second)
+	fixture, err := testfixture.LoadDesktopParity()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Write(context.Background(), started.ExecutionID, []byte("hello\n")); err != nil {
+	manager := New("/bin/bash")
+	started, err := manager.Start(context.Background(), fixture.Process.BlockedInputCommand, t.TempDir(), 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Write(context.Background(), started.ExecutionID, []byte(fixture.Process.StdinText)); err != nil {
 		t.Fatal(err)
 	}
 	result, err := manager.Read(context.Background(), started.ExecutionID, 0, 3*time.Second)
@@ -129,8 +137,12 @@ func TestCloseStdinDeliversEOFAndRejectsFurtherWrites(t *testing.T) {
 
 func TestCancelStopsManagedProcessGroup(t *testing.T) {
 	t.Parallel()
+	fixture, err := testfixture.LoadDesktopParity()
+	if err != nil {
+		t.Fatal(err)
+	}
 	manager := New("/bin/bash")
-	started, err := manager.Start(context.Background(), "sleep 20 & printf job-started; wait", t.TempDir(), 20*time.Second)
+	started, err := manager.Start(context.Background(), fmt.Sprintf("%s & printf job-started; wait", fixture.Process.CancellationCommand), t.TempDir(), 20*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,8 +160,15 @@ func TestCancelStopsManagedProcessGroup(t *testing.T) {
 
 func TestManagedProcessLimit(t *testing.T) {
 	t.Parallel()
+	fixture, err := testfixture.LoadDesktopParity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixture.Process.MaxProcesses != MaxProcesses || fixture.Process.LimitCode != "desktop_process_limit" {
+		t.Fatalf("shared process-limit fixture=%#v, local limit=%d", fixture.Process, MaxProcesses)
+	}
 	manager := New("/bin/bash")
-	for range MaxProcesses {
+	for range fixture.Process.MaxProcesses {
 		if _, err := manager.Start(context.Background(), "printf ready; read answer", t.TempDir(), 20*time.Second); err != nil {
 			t.Fatalf("start within process limit: %v", err)
 		}
@@ -164,15 +183,19 @@ func TestManagedProcessLimit(t *testing.T) {
 
 func TestCancellationUnblocksStdinWriter(t *testing.T) {
 	t.Parallel()
+	fixture, err := testfixture.LoadDesktopParity()
+	if err != nil {
+		t.Fatal(err)
+	}
 	manager := New("/bin/bash")
-	started, err := manager.Start(context.Background(), "sleep 20", t.TempDir(), 20*time.Second)
+	started, err := manager.Start(context.Background(), fixture.Process.CancellationCommand, t.TempDir(), 20*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	writerDone := make(chan error, 1)
 	go func() {
-		for range 4 {
-			if writeErr := manager.Write(context.Background(), started.ExecutionID, make([]byte, MaxInputBytes)); writeErr != nil {
+		for range fixture.Process.BlockedStdinWrites {
+			if writeErr := manager.Write(context.Background(), started.ExecutionID, make([]byte, fixture.Process.BlockedStdinWriteBytes)); writeErr != nil {
 				writerDone <- writeErr
 				return
 			}
@@ -306,10 +329,55 @@ func TestUnpinnedExitDrainsInheritedOutputPipes(t *testing.T) {
 	}
 }
 
+func TestLeaderExitCleansDisownedChildFromManagedGroup(t *testing.T) {
+	t.Parallel()
+	fixture, err := testfixture.LoadDesktopParity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	marker := filepath.Join(directory, fixture.Process.LeaderChildMarker)
+	manager := New("/bin/bash")
+	t.Cleanup(func() { manager.CloseAll(context.Background()) })
+	command := fmt.Sprintf("(sleep %d; touch %s) & disown; exit 0", fixture.Process.LeaderChildDelaySeconds, shellQuote(marker))
+	started, err := manager.Start(context.Background(), command, directory, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		status, statusErr := manager.Status(started.ExecutionID)
+		if statusErr != nil {
+			t.Fatal(statusErr)
+		}
+		if status.State != StateRunning {
+			if status.State != StateExited {
+				t.Fatalf("leader terminal status = %#v", status)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shell leader did not exit before deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(time.Duration(fixture.Process.LeaderChildDelaySeconds)*time.Second + 200*time.Millisecond)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("disowned child survived managed leader exit: %v", err)
+	}
+	if !manager.CloseAll(context.Background()) {
+		t.Fatal("CloseAll did not confirm cleanup")
+	}
+}
+
 func TestTimeoutAndOutputGap(t *testing.T) {
 	t.Parallel()
+	fixture, err := testfixture.LoadDesktopParity()
+	if err != nil {
+		t.Fatal(err)
+	}
 	manager := New("/bin/bash")
-	started, err := manager.Start(context.Background(), "head -c 5000000 /dev/zero", t.TempDir(), time.Second)
+	started, err := manager.Start(context.Background(), fmt.Sprintf("head -c %d /dev/zero", fixture.Process.OutputGapBytes), t.TempDir(), time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

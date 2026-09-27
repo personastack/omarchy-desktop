@@ -493,7 +493,7 @@ func mapError(operation agentgatewayruntime.DesktopControlOperation, fields map[
 
 func isPartialWrite(fields map[string]json.RawMessage, err error) bool {
 	action, _ := stringField(fields, "action")
-	if action != "write" || errors.Is(err, desktopfiles.ErrPermissionDenied) || errors.Is(err, desktopfiles.ErrInvalidRange) || errors.Is(err, desktopfiles.ErrContentTooLarge) {
+	if action != "write" || !errors.Is(err, desktopfiles.ErrWriteOutcomeUnknown) {
 		return false
 	}
 	mode, _ := stringField(fields, "mode")

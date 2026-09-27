@@ -34,6 +34,7 @@ var (
 	ErrTooManyOpenFiles    = errors.New("too many open file handles")
 	ErrDestinationExists   = errors.New("destination already exists")
 	ErrPatchMismatch       = errors.New("patch did not match exactly once")
+	ErrWriteOutcomeUnknown = errors.New("file write outcome is unknown")
 	ErrPermissionDenied    = errors.New("file permission denied")
 	ErrMetadataTooLarge    = errors.New("file metadata exceeds limit")
 	ErrMetadataUnsupported = errors.New("file metadata cannot be preserved safely")
@@ -409,7 +410,7 @@ func Write(path string, content []byte, mode WriteMode, offset *int64) (Entry, e
 		}
 		if _, err = file.WriteAt(content, *offset); err != nil {
 			_ = file.Close()
-			return Entry{}, operationError(err, ErrInvalidPath)
+			return Entry{}, operationError(err, ErrWriteOutcomeUnknown)
 		}
 		_ = file.Close()
 	} else {
@@ -424,10 +425,10 @@ func Write(path string, content []byte, mode WriteMode, offset *int64) (Entry, e
 			}
 			closeErr := file.Close()
 			if err != nil {
-				return Entry{}, operationError(err, ErrInvalidPath)
+				return Entry{}, operationError(err, ErrWriteOutcomeUnknown)
 			}
 			if closeErr != nil {
-				return Entry{}, operationError(closeErr, ErrInvalidPath)
+				return Entry{}, operationError(closeErr, ErrWriteOutcomeUnknown)
 			}
 		case WriteAppend:
 			file, appendErr := os.OpenFile(clean, os.O_WRONLY|os.O_APPEND|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
@@ -442,10 +443,10 @@ func Write(path string, content []byte, mode WriteMode, offset *int64) (Entry, e
 			_, err = file.Write(content)
 			closeErr := file.Close()
 			if err != nil {
-				return Entry{}, operationError(err, ErrInvalidPath)
+				return Entry{}, operationError(err, ErrWriteOutcomeUnknown)
 			}
 			if closeErr != nil {
-				return Entry{}, operationError(closeErr, ErrInvalidPath)
+				return Entry{}, operationError(closeErr, ErrWriteOutcomeUnknown)
 			}
 		case WriteReplace:
 			info, statErr := os.Lstat(clean)

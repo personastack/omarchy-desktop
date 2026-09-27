@@ -3,6 +3,7 @@ package desktopfiles
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -12,7 +13,151 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/personastack/omarchy-desktop/companion/internal/testfixture"
 )
+
+func TestSharedDesktopParityFileFixtures(t *testing.T) {
+	t.Parallel()
+	fixture, err := testfixture.LoadDesktopParity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+
+	boundary := fixture.Files.UTF8Boundary
+	boundaryPath := filepath.Join(root, "boundary.txt")
+	trailing, err := hex.DecodeString(boundary.TrailingBytesHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundaryData := append(bytes.Repeat([]byte{'a'}, boundary.ASCIIPrefixBytes), trailing...)
+	if err := os.WriteFile(boundaryPath, boundaryData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := New()
+	opened, err := files.Open(boundaryPath)
+	if err != nil || opened.ByteLength != boundary.FirstPageBytes || opened.NextOffset != int64(boundary.NextOffset) {
+		t.Fatalf("UTF-8 boundary first page = %#v, %v", opened.Read, err)
+	}
+	tail, err := files.Read(opened.Handle, int64(boundary.NextOffset), MaxReadBytes)
+	if err != nil || tail.ContentText != boundary.TailText {
+		t.Fatalf("UTF-8 boundary tail = %#v, %v", tail, err)
+	}
+	_ = files.Close(opened.Handle)
+
+	binaryCase := fixture.Files.Binary
+	binaryData, err := hex.DecodeString(binaryCase.BytesHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryPath := filepath.Join(root, "binary.bin")
+	if err := os.WriteFile(binaryPath, binaryData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binaryOpened, err := files.Open(binaryPath)
+	if err != nil || binaryOpened.Encoding != binaryCase.Encoding || binaryOpened.ContentBase64 != binaryCase.Base64 {
+		t.Fatalf("binary fixture result = %#v, %v", binaryOpened.Read, err)
+	}
+	_ = files.Close(binaryOpened.Handle)
+
+	searchCase := fixture.Files.Search
+	searchRoot := filepath.Join(root, "search")
+	if err := os.Mkdir(searchRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range searchCase.Files {
+		if err := os.WriteFile(filepath.Join(searchRoot, item.Name), []byte(item.Content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var continuation *string
+	for pageIndex, expected := range searchCase.Pages {
+		page, err := files.Search(searchRoot, nil, &searchCase.NameGlob, nil, searchCase.Limit, continuation)
+		if err != nil {
+			t.Fatalf("search page %d: %v", pageIndex, err)
+		}
+		got := make([]string, len(page.Matches))
+		for index, match := range page.Matches {
+			got[index] = match.Entry.Name
+		}
+		if !equalStrings(got, expected) {
+			t.Fatalf("search page %d = %v, want %v", pageIndex, got, expected)
+		}
+		if pageIndex < len(searchCase.Pages)-1 && page.Continuation == "" {
+			t.Fatalf("search page %d omitted continuation", pageIndex)
+		}
+		if pageIndex == len(searchCase.Pages)-1 && page.Continuation != "" {
+			t.Fatalf("final search fixture page retained continuation %q", page.Continuation)
+		}
+		continuation = nil
+		if page.Continuation != "" {
+			next := page.Continuation
+			continuation = &next
+		}
+	}
+	contentFilter := searchCase.ContentContains
+	contentPage, err := files.Search(searchRoot, nil, nil, &contentFilter, len(searchCase.Files), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentNames := make([]string, len(contentPage.Matches))
+	for index, match := range contentPage.Matches {
+		contentNames[index] = match.Entry.Name
+	}
+	wantContentNames := []string{"a.txt", "b.txt", "c.md"}
+	if !equalStrings(contentNames, wantContentNames) {
+		t.Fatalf("content search fixture = %v, want %v", contentNames, wantContentNames)
+	}
+
+	changedCase := fixture.Files.Changed
+	changedPath := filepath.Join(root, "changed.txt")
+	if err := os.WriteFile(changedPath, []byte(changedCase.Before), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changedOpen, err := files.Open(changedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(changedPath, []byte(changedCase.After), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changedRead, err := files.Read(changedOpen.Handle, 0, MaxReadBytes)
+	if err != nil || !changedRead.ChangedSinceOpen || changedRead.ContentText != changedCase.After {
+		t.Fatalf("changed-file fixture = %#v, %v", changedRead, err)
+	}
+	_ = files.Close(changedOpen.Handle)
+
+	symlinkCase := fixture.Files.Symlink
+	targetPath := filepath.Join(root, symlinkCase.TargetName)
+	linkPath := filepath.Join(root, symlinkCase.LinkName)
+	if err := os.WriteFile(targetPath, []byte(symlinkCase.TargetContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	wantTarget, err := filepath.EvalSymlinks(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, err := Metadata(linkPath)
+	if err != nil || link.Kind != symlinkCase.Kind || link.SymlinkTarget != wantTarget {
+		t.Fatalf("symlink fixture = %#v, %v; want %q", link, err, wantTarget)
+	}
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
 
 func TestListPagesAndReportsSymlinks(t *testing.T) {
 	t.Parallel()
@@ -217,6 +362,16 @@ func TestReplaceRejectsConcurrentInPlaceChange(t *testing.T) {
 	}
 	if got, err := os.ReadFile(path); err != nil || string(got) != "newer" {
 		t.Fatalf("concurrent contents = %q, %v", got, err)
+	}
+}
+
+func TestPostOpenWriteErrorPreservesUncertainOutcomeUnlessPermissionDenied(t *testing.T) {
+	t.Parallel()
+	if got := operationError(syscall.ENOSPC, ErrWriteOutcomeUnknown); !errors.Is(got, ErrWriteOutcomeUnknown) {
+		t.Fatalf("post-open storage error = %v, want uncertain outcome", got)
+	}
+	if got := operationError(syscall.EACCES, ErrWriteOutcomeUnknown); !errors.Is(got, ErrPermissionDenied) {
+		t.Fatalf("post-open permission error = %v, want permission denied", got)
 	}
 }
 

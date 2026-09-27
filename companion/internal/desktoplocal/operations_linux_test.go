@@ -5,15 +5,90 @@ package desktoplocal
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/personastack/omarchy-desktop/companion/internal/desktopfiles"
+	"github.com/personastack/omarchy-desktop/companion/internal/testfixture"
 	"github.com/personastack/personastack-api/pkg/client/agentgatewayruntime"
 )
+
+func TestSharedDesktopParityImageAndUncertainWriteFixtures(t *testing.T) {
+	t.Parallel()
+	fixture, err := testfixture.LoadDesktopParity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := New("/bin/bash")
+	t.Cleanup(func() { operations.CloseAll(context.Background()) })
+
+	imageBytes, err := hex.DecodeString(fixture.Files.Image.BytesHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imagePath := filepath.Join(t.TempDir(), fixture.Files.Image.Name)
+	if err := os.WriteFile(imagePath, imageBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	openArguments, err := json.Marshal(map[string]string{"action": "open", "path": imagePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened := callObject(t, operations, agentgatewayruntime.DesktopControlOperationFile, string(openArguments))
+	blocks, ok := opened["content"].([]any)
+	if !ok || len(blocks) != 1 {
+		t.Fatalf("image fixture content = %#v", opened["content"])
+	}
+	block, ok := blocks[0].(map[string]any)
+	if !ok || block["type"] != "image" || block["mimeType"] != fixture.Files.Image.MIMEType || block["data"] != base64.StdEncoding.EncodeToString(imageBytes) {
+		t.Fatalf("image fixture block = %#v", blocks[0])
+	}
+
+	missingPath := filepath.Join(t.TempDir(), "missing", "uncertain.txt")
+	writeArguments, err := json.Marshal(map[string]string{"action": "write", "path": missingPath, "mode": "append", "content_base64": ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = operations.Call(context.Background(), agentgatewayruntime.DesktopControlOperationFile, writeArguments, time.Minute)
+	var failure *Failure
+	if !errors.As(err, &failure) || failure.Code != fixture.Files.UncertainWrite.KnownFailureCode {
+		t.Fatalf("known failed write fixture=%#v, want %q", err, fixture.Files.UncertainWrite.KnownFailureCode)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(writeArguments, &fields); err != nil {
+		t.Fatal(err)
+	}
+	uncertain, ok := mapError(agentgatewayruntime.DesktopControlOperationFile, fields, desktopfiles.ErrWriteOutcomeUnknown).(*Failure)
+	if !ok || uncertain.Code != fixture.Files.UncertainWrite.Code || uncertain.Message != fixture.Files.UncertainWrite.Message {
+		t.Fatalf("uncertain-write mapping=%#v, want %q", uncertain, fixture.Files.UncertainWrite.Code)
+	}
+
+	if os.Geteuid() != 0 {
+		permissionPath := filepath.Join(t.TempDir(), "restricted")
+		if err := os.Mkdir(permissionPath, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(permissionPath, os.FileMode(fixture.Files.Permission.Mode)); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(permissionPath, 0o700)
+		statArguments, err := json.Marshal(map[string]string{"action": "list", "path": permissionPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = operations.Call(context.Background(), agentgatewayruntime.DesktopControlOperationFile, statArguments, time.Minute)
+		var permissionFailure *Failure
+		if !errors.As(err, &permissionFailure) || permissionFailure.Code != fixture.Files.Permission.Code {
+			t.Fatalf("permission fixture failure=%#v, want %q", err, fixture.Files.Permission.Code)
+		}
+	}
+}
 
 func TestFileOperationDTOsMatchDesktopContract(t *testing.T) {
 	t.Parallel()

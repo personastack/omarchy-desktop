@@ -1,0 +1,57 @@
+{
+  "files": {
+    "utf8Boundary": {
+      "asciiPrefixBytes": 262143,
+      "trailingBytesHex": "c3a95a",
+      "firstPageBytes": 262143,
+      "nextOffset": 262143,
+      "tailText": "éZ"
+    },
+    "binary": {
+      "bytesHex": "0001ff",
+      "encoding": "base64",
+      "base64": "AAH/"
+    },
+    "image": {
+      "name": "tiny.png",
+      "bytesHex": "89504e470d0a1a0a",
+      "mimeType": "image/png"
+    },
+    "search": {
+      "nameGlob": "*.txt",
+      "contentContains": "needle",
+      "limit": 1,
+      "files": [
+        {"name": "a.txt", "content": "needle first"},
+        {"name": "b.txt", "content": "needle second"},
+        {"name": "c.md", "content": "needle third"}
+      ],
+      "pages": [["a.txt"], ["b.txt"], []]
+    },
+    "changed": {"before": "before", "after": "changed"},
+    "symlink": {
+      "targetName": "target.txt",
+      "targetContents": "target data",
+      "linkName": "link.txt",
+      "kind": "symlink"
+    },
+    "permission": {"mode": 0, "code": "desktop_file_permission_denied"},
+    "uncertainWrite": {
+      "code": "desktop_file_write_outcome_unknown",
+      "message": "The file may have changed before the write stopped. Read it again before retrying.",
+      "knownFailureCode": "desktop_file_operation_failed"
+    }
+  },
+  "process": {
+    "outputGapBytes": 5000000,
+    "stdinText": "hello\n",
+    "blockedStdinWriteBytes": 32768,
+    "blockedStdinWrites": 4,
+    "maxProcesses": 4,
+    "limitCode": "desktop_process_limit",
+    "blockedInputCommand": "read answer; printf 'received:%s' \"$answer\"",
+    "cancellationCommand": "sleep 20",
+    "leaderChildDelaySeconds": 2,
+    "leaderChildMarker": "child-survived.txt"
+  }
+}
