@@ -19,6 +19,7 @@ import (
 	"github.com/personastack/omarchy-desktop/companion/internal/desktoplocal"
 	"github.com/personastack/omarchy-desktop/companion/internal/hyprlandlock"
 	"github.com/personastack/omarchy-desktop/companion/internal/installation"
+	"github.com/personastack/omarchy-desktop/companion/internal/supportprofile"
 	"github.com/personastack/omarchy-desktop/companion/localsession"
 	"github.com/personastack/personastack-api/pkg/client/desktopcontrol"
 )
@@ -26,6 +27,15 @@ import (
 const maxConcurrentBridgeRequests = 31
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--support-report" {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		err := writeSupportReport(ctx, os.Stdout)
+		cancel()
+		if err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) != 2 {
 		os.Exit(2)
 	}
@@ -94,6 +104,26 @@ func main() {
 	if serveErr != nil {
 		os.Exit(1)
 	}
+}
+
+func writeSupportReport(ctx context.Context, output io.Writer) error {
+	report, err := supportprofile.Collect(ctx)
+	if err != nil {
+		return err
+	}
+	encoded, err := supportprofile.Encode(report)
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	written, err := output.Write(encoded)
+	if err != nil {
+		return err
+	}
+	if written != len(encoded) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func closeControlRuntime(ctx context.Context, runtime *desktoplifecycle.Controller) {

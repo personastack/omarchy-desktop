@@ -47,6 +47,19 @@ func TestServeProcessesBoundedRequestResponseLines(t *testing.T) {
 	}
 }
 
+func TestWriteSupportReportPropagatesCancellationBeforeWriting(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var output bytes.Buffer
+	if err := writeSupportReport(ctx, &output); !errors.Is(err, context.Canceled) {
+		t.Fatalf("writeSupportReport() error = %v", err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("canceled support report wrote %q", output.String())
+	}
+}
+
 func TestServeStopsOnMalformedOrOversizedRequest(t *testing.T) {
 	t.Parallel()
 	processor, err := desktopbridge.New(&serviceFake{}, "https://my.personastack.ai")

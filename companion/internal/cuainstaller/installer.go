@@ -104,16 +104,23 @@ func New() (*Installer, error) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		return nil, ErrUnavailable
 	}
+	root, err := managedRoot()
+	if err != nil {
+		return nil, err
+	}
+	return newInstaller(root, runtime.GOOS, runtime.GOARCH, http.DefaultClient)
+}
+
+func managedRoot() (string, error) {
 	dataRoot := os.Getenv("XDG_DATA_HOME")
 	if dataRoot == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return nil, ErrUnavailable
+			return "", ErrUnavailable
 		}
 		dataRoot = filepath.Join(home, ".local", "share")
 	}
-	root := filepath.Join(dataRoot, "personastack", "omarchy-desktop", "cua-driver", version)
-	return newInstaller(root, runtime.GOOS, runtime.GOARCH, http.DefaultClient)
+	return filepath.Join(dataRoot, "personastack", "omarchy-desktop", "cua-driver", version), nil
 }
 
 func newInstaller(root, operatingSystem, architecture string, client HTTPDoer) (*Installer, error) {
@@ -392,6 +399,16 @@ func (i *Installer) Verify() error {
 		return ErrUnavailable
 	}
 	return verifyTree(context.Background(), i.root, i.release, i.notices)
+}
+
+func (i *Installer) VerifiedExecutable(ctx context.Context) (string, error) {
+	if i == nil || ctx == nil {
+		return "", ErrUnavailable
+	}
+	if err := verifyTree(ctx, i.root, i.release, i.notices); err != nil {
+		return "", err
+	}
+	return filepath.Join(i.root, "cua-driver"), nil
 }
 
 func (i *Installer) download(ctx context.Context) ([]byte, error) {

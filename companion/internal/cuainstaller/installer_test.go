@@ -43,6 +43,10 @@ func TestInstallerVerifiesAndReusesPinnedRuntime(t *testing.T) {
 	if executable != filepath.Join(root, "cua-driver") || client.calls != 1 {
 		t.Fatalf("installed executable/call count = %q/%d", executable, client.calls)
 	}
+	verifiedExecutable, err := installer.VerifiedExecutable(context.Background())
+	if err != nil || verifiedExecutable != executable {
+		t.Fatalf("VerifiedExecutable() = %q, %v", verifiedExecutable, err)
+	}
 	if err := installer.Verify(); err != nil {
 		t.Fatalf("verify installed runtime: %v", err)
 	}
@@ -435,6 +439,9 @@ func TestInstallerDetectsModifiedRuntimeFiles(t *testing.T) {
 	}
 	if err := installer.Verify(); !errors.Is(err, ErrForeignInstall) {
 		t.Fatalf("changed executable mode verification = %v", err)
+	}
+	if _, err := installer.VerifiedExecutable(context.Background()); !errors.Is(err, ErrForeignInstall) {
+		t.Fatalf("changed executable mode was eligible for probing: %v", err)
 	}
 	if err := os.Chmod(executable, 0o700); err != nil {
 		t.Fatal("restore executable mode")
