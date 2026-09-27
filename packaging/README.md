@@ -20,6 +20,16 @@ The package metadata says `unknown` for the application license because this rep
 
 Review the new app and API source revisions. Update the two commit pins in `PKGBUILD`, increment `pkgrel` when only the recipe changes, then rebuild and install with `makepkg -si`.
 
+## Roll back
+
+The app has no automatic updater or package rollback hook. Keep a previously built package if you may need to revert. Restore it with:
+
+```sh
+sudo pacman -U /path/to/previously-built-personastack.pkg.tar.zst
+```
+
+The package owns files under `/usr`. It does not own or remove the user's Electron browser session, Linux Secret Service credential, or Codex and Claude configuration. The current app has no user-data migration to reverse. Package upgrade and rollback have not been acceptance-tested. Future user-data migrations need an explicit downgrade compatibility policy.
+
 ## Repair
 
 To reinstall a package file built from the reviewed source, run:
