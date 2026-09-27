@@ -108,6 +108,11 @@ const launchInBackground = shouldStartInBackground(process.argv);
 
 app.setName(APP_NAME);
 
+if (process.platform === "linux") {
+  // Chat windows need Electron's programmatic move, resize and always-on-top support.
+  app.commandLine.appendSwitch("ozone-platform", "x11");
+}
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
