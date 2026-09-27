@@ -35,7 +35,7 @@ The package owns files under `/usr`. It does not own or remove the user's Electr
 To reinstall a package file built from the reviewed source, run:
 
 ```sh
-sudo pacman -U ./personastack-0.1.0-5-x86_64.pkg.tar.zst
+sudo pacman -U /path/to/previously-built-personastack.pkg.tar.zst
 ```
 
 This repairs package-owned files. The tray's **Repair Cua Service** action repairs only the pinned PersonaStack-managed Cua payload and leaves unrelated files untouched. It keeps remote control paused if repair fails.
@@ -52,4 +52,6 @@ Pacman removes the package-owned runtime, launcher, desktop entry, and icon. The
 
 ## Validation status
 
-`makepkg` built package `personastack 0.1.0-5` in a disposable Arch `base-devel` container on `eric-pc`. The recipe pins app commit `3fec3310937ebb5b65852f5cd3632daba3486c8a` and API client commit `fdf742c884168c4d6f2531b9cc65b966d018e7b3`. The run used Node `26.10.0`, npm `11.19.0`, and Go `1.27.1`. All 67 Node tests and the full companion Go test suite passed in the package build. `pacman -Qp --info` confirms `xorg-xwayland`; package readback confirms it contains the Google Services OAuth navigation code. The package SHA-256 is `1f9f096fc0bf42f94a082282677e58bf8c29d2773619c7f2d011c2a136832467`. The artifact is retained on `eric-pc` at `/tmp/personastack-0.1.0-5-x86_64.pkg.tar.zst`. The temporary build used a local archive of the exact API client commit instead of fetching the private SSH source, so no credentials were forwarded. Package installation and Omarchy testing remain open. This recipe does not claim Omarchy support. Keep platform, installed-package, and full parity acceptance open.
+The current recipe pins app commit `488ad3e6a7acbf2194140abca0d45aa25b2eab56`, API client commit `fdf742c884168c4d6f2531b9cc65b966d018e7b3`, and package version `0.1.0-6`. On `eric-pc`, the Arch package build compiled the Electron app and companion. All 76 Node tests passed. The companion Go suite did not pass: Cua installer tests reported that the install path was not owned by PersonaStack, and related fixtures were missing under the `/build/tmp` host bind mount. `makepkg` therefore stopped before package creation. This run does not validate package installation or the complete Go suite.
+
+The previous validated package `0.1.0-5` remains at `/tmp/personastack-0.1.0-5-x86_64.pkg.tar.zst` on `eric-pc`. It used app commit `3fec3310937ebb5b65852f5cd3632daba3486c8a`, passed all 67 Node tests and the full companion Go suite, and has SHA-256 `1f9f096fc0bf42f94a082282677e58bf8c29d2773619c7f2d011c2a136832467`. Its build used a local archive of the exact private API client revision, without forwarding SSH credentials. Package installation, keyring behavior, and Omarchy acceptance remain open. This recipe does not claim Omarchy support. Keep platform, installed-package, and full parity acceptance open.
