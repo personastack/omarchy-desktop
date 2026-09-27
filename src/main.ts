@@ -21,20 +21,29 @@ import {
 
 import { getAutostartStatus, setAutostartEnabled, type AutostartStatus } from "./autostart.js";
 import { beginDesktopAuthHandoff, consumeDesktopAuthHandoff, exchangeDesktopAuthHandoff, type PendingDesktopAuthHandoff } from "./desktop-auth-handoff.js";
+import {
+  beginExternalOAuthReturn,
+  isCurrentExternalOAuthAttempt,
+  markExternalOAuthBlurred,
+  refreshExternalOAuthOnFocus,
+  type PendingExternalOAuthReturn,
+} from "./external-oauth-return.js";
 import { delegateChatWindowClose } from "./chat-window-close.js";
 import { applyChatWindowCommand as dispatchChatWindowCommand } from "./chat-window-command.js";
 import { closePopoutWindows, synchronizePopoutScope } from "./popout-scope.js";
 import { loadAndShowWindow } from "./window-load.js";
 import {
+  beginNavigationGeneration,
+  commitNavigationGeneration,
+  rollbackNavigationGeneration,
+  type NavigationGeneration,
+} from "./navigation-generation.js";
+import {
   authorizeBridgeFrame,
-  canFollowEnterpriseOIDCLinks,
   handleFrameNavigation,
   googleIntegrationOAuthStartState,
-  isAllowedGoogleIntegrationOAuthNavigation,
   shouldStartInBackground,
   isNewConcernEvent,
-  OIDC_NAVIGATION_WINDOW_MS,
-  GOOGLE_OAUTH_NAVIGATION_WINDOW_MS,
   isEnterpriseOIDCStartURL,
   isTrustedPermissionRequest,
   isAllowedUserExternalLink,
@@ -82,10 +91,8 @@ const APP_ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5v
 interface RegisteredWindow {
   readonly role: BridgeRole;
   readonly window: BrowserWindow;
-  generation: number;
-  oidcNavigationExpiresAt?: number;
-  googleOAuthState?: string;
-  googleOAuthNavigationExpiresAt?: number;
+  navigationGeneration: NavigationGeneration;
+  pendingExternalOAuth?: PendingExternalOAuthReturn;
 }
 
 const appURL = resolveAppURL(process.argv, process.env.PERSONASTACK_DEFAULT_URL);
@@ -111,6 +118,7 @@ let trayControlRevision = 0;
 let trayControlRefreshTimer: NodeJS.Timeout | undefined;
 const launchInBackground = shouldStartInBackground(process.argv);
 let pendingDesktopAuthHandoff: PendingDesktopAuthHandoff | undefined;
+let externalOAuthAttemptId = 0;
 
 app.setName(APP_NAME);
 
@@ -163,6 +171,7 @@ function isDesktopAuthHandoffURL(value: string): boolean {
 }
 
 function beginSystemBrowserSignIn(): void {
+  invalidatePopouts();
   const launch = beginDesktopAuthHandoff(appOriginURL(), Date.now());
   pendingDesktopAuthHandoff = launch.attempt;
   void shell.openExternal(launch.url).catch(() => {
@@ -215,8 +224,19 @@ function createWindow(role: BridgeRole, options: Electron.BrowserWindowConstruct
       allowRunningInsecureContent: false,
     },
   });
-  const entry: RegisteredWindow = { role, window, generation: 0 };
+  const entry: RegisteredWindow = { role, window, navigationGeneration: { current: 0 } };
   windows.set(window.webContents.id, entry);
+  window.on("focus", () => {
+    if (entry.role !== "main") return;
+    const refresh = refreshExternalOAuthOnFocus(entry.pendingExternalOAuth, window.webContents.getURL(), Date.now());
+    entry.pendingExternalOAuth = refresh.pending;
+    if (!refresh.returnURL || !isTrustedAppURL(refresh.returnURL, appOriginURL())) return;
+    void window.loadURL(refresh.returnURL);
+  });
+  window.on("blur", () => {
+    const pending = entry.pendingExternalOAuth;
+    if (entry.role === "main" && pending) entry.pendingExternalOAuth = markExternalOAuthBlurred(pending);
+  });
   configureWebContents(entry);
   window.on("closed", () => windows.delete(window.webContents.id));
   return window;
@@ -255,21 +275,8 @@ function configureWebContents(entry: RegisteredWindow): void {
   contents.setWindowOpenHandler(({ url }) => {
     if (isGoogleOAuthURL(url)) {
       const appOrigin = appOriginURL();
-      const now = Date.now();
-      const integrationOAuthNavigation = entry.role === "main" && (
-        googleIntegrationOAuthStartState(url, appOrigin) !== undefined ||
-        isAllowedGoogleIntegrationOAuthNavigation(
-          url,
-          true,
-          contents.mainFrame.url,
-          entry.googleOAuthState,
-          entry.googleOAuthNavigationExpiresAt,
-          now,
-          appOrigin,
-        )
-      );
-      if (integrationOAuthNavigation) {
-        void entry.window.loadURL(url);
+      if (entry.role === "main" && googleIntegrationOAuthStartState(url, appOrigin)) {
+        openGoogleServicesOAuth(entry, url);
       } else {
         beginSystemBrowserSignIn();
       }
@@ -283,37 +290,28 @@ function configureWebContents(entry: RegisteredWindow): void {
   contents.on("will-redirect", (event, targetURL, _isInPlace, isMainFrame) => {
     authorizeFrameNavigation(entry, event, targetURL, isMainFrame);
   });
-  contents.on("did-start-navigation", (_event, rawURL, isInPlace, isMainFrame) => {
+  contents.on("did-start-navigation", (_event, _rawURL, isInPlace, isMainFrame) => {
     if (!isMainFrame || isInPlace) return;
-    if (entry.role === "main" && isEnterpriseOIDCStartURL(rawURL, appOriginURL())) {
-      entry.oidcNavigationExpiresAt = Date.now() + OIDC_NAVIGATION_WINDOW_MS;
-    }
-    entry.generation += 1;
+    entry.navigationGeneration = beginNavigationGeneration(entry.navigationGeneration);
   });
   contents.on("did-navigate", (_event, rawURL) => {
+    entry.navigationGeneration = commitNavigationGeneration(entry.navigationGeneration);
     const navigatedURL = new URL(rawURL);
-    if (entry.role === "main" && isTrustedAppURL(rawURL, appOriginURL())) {
-      entry.oidcNavigationExpiresAt = undefined;
-      entry.googleOAuthState = undefined;
-      entry.googleOAuthNavigationExpiresAt = undefined;
+    if (entry.pendingExternalOAuth && rawURL !== entry.pendingExternalOAuth.returnURL) {
+      entry.pendingExternalOAuth = undefined;
     }
     const path = navigatedURL.pathname;
     if (entry.role === "main" && (path === "/login" || path === "/logout")) invalidatePopouts();
   });
   contents.on("did-fail-load", (_event, _code, _description, _url, isMainFrame) => {
     if (!isMainFrame) return;
+    entry.navigationGeneration = rollbackNavigationGeneration(entry.navigationGeneration);
     if (entry.role === "main") {
-      entry.oidcNavigationExpiresAt = undefined;
-      entry.googleOAuthState = undefined;
-      entry.googleOAuthNavigationExpiresAt = undefined;
       invalidatePopouts();
     } else closeWindow(entry.window);
   });
   contents.on("render-process-gone", () => {
     if (entry.role === "main") {
-      entry.oidcNavigationExpiresAt = undefined;
-      entry.googleOAuthState = undefined;
-      entry.googleOAuthNavigationExpiresAt = undefined;
       invalidatePopouts();
     }
     else closeWindow(entry.window);
@@ -326,30 +324,55 @@ function authorizeFrameNavigation(
   targetURL: string,
   isMainFrame: boolean,
 ): void {
-  const contents = entry.window.webContents;
-  const now = Date.now();
   const appOrigin = appOriginURL();
-  if (entry.role === "main" && isMainFrame && isTrustedAppURL(contents.mainFrame.url, appOrigin)) {
-    const state = googleIntegrationOAuthStartState(targetURL, appOrigin);
-    if (state) {
-      entry.googleOAuthState = state;
-      entry.googleOAuthNavigationExpiresAt = now + GOOGLE_OAUTH_NAVIGATION_WINDOW_MS;
+  if (isMainFrame) {
+    if (entry.role === "main" && googleIntegrationOAuthStartState(targetURL, appOrigin)) {
+      cancelMainFrameNavigation(entry, event);
+      openGoogleServicesOAuth(entry, targetURL);
+      return;
+    }
+    if (isGoogleOAuthURL(targetURL) || isEnterpriseOIDCStartURL(targetURL, appOrigin)) {
+      cancelMainFrameNavigation(entry, event);
+      beginSystemBrowserSignIn();
+      return;
     }
   }
-  handleFrameNavigation(
+  const allowed = handleFrameNavigation(
     event,
     targetURL,
     entry.role,
     isMainFrame,
-    contents.mainFrame.url,
-    entry.oidcNavigationExpiresAt,
-    now,
     appOrigin,
     invalidatePopouts,
-    entry.googleOAuthState,
-    entry.googleOAuthNavigationExpiresAt,
   );
+  if (!allowed && isMainFrame) restoreNavigationGeneration(entry);
 }
+
+function openGoogleServicesOAuth(entry: RegisteredWindow, authorizationURL: string): void {
+  const returnURL = entry.window.webContents.getURL();
+  if (!isTrustedAppURL(returnURL, appOriginURL())) return;
+
+  const attemptId = ++externalOAuthAttemptId;
+  entry.pendingExternalOAuth = beginExternalOAuthReturn(attemptId, returnURL, Date.now() + 10 * 60_000);
+  void shell.openExternal(authorizationURL).catch(() => {
+    if (!isCurrentExternalOAuthAttempt(entry.pendingExternalOAuth, attemptId, entry.window.webContents.getURL())) return;
+    entry.pendingExternalOAuth = undefined;
+    dialog.showErrorBox("Google sign-in", "PersonaStack could not open the system browser. Try again.");
+  });
+}
+
+function cancelMainFrameNavigation(
+  entry: RegisteredWindow,
+  event: Readonly<{ preventDefault: () => void }>,
+): void {
+  event.preventDefault();
+  restoreNavigationGeneration(entry);
+}
+
+function restoreNavigationGeneration(entry: RegisteredWindow): void {
+  entry.navigationGeneration = rollbackNavigationGeneration(entry.navigationGeneration);
+}
+
 
 function authorizeSender(event: IpcMainEvent | IpcMainInvokeEvent, roles?: readonly BridgeRole[]): RegisteredWindow | undefined {
   const entry = windows.get(event.sender.id);
@@ -375,7 +398,7 @@ function bridgeGeneration(event: IpcMainEvent | IpcMainInvokeEvent, rawGeneratio
     isMainFrame: event.senderFrame === event.sender.mainFrame,
     frameURL: event.senderFrame?.url ?? "",
     topFrameURL: event.sender.mainFrame.url,
-    currentGeneration: isCurrentBridgeGeneration(rawGeneration, entry.generation),
+    currentGeneration: isCurrentBridgeGeneration(rawGeneration, entry.navigationGeneration.current),
   } as const;
   return authorizeBridgeFrame(identity, appOriginURL()) ? entry : undefined;
 }
@@ -383,26 +406,13 @@ function bridgeGeneration(event: IpcMainEvent | IpcMainInvokeEvent, rawGeneratio
 function registerBridgeHandlers(): void {
   ipcMain.on("personastack:bridge:init", (event) => {
     const entry = authorizeSender(event);
-    event.returnValue = entry ? entry.generation : -1;
+    event.returnValue = entry ? entry.navigationGeneration.current : -1;
   });
 
   ipcMain.on("personastack:bridge:app-origin", (event) => {
     const entry = windows.get(event.sender.id);
     event.returnValue = entry?.window.webContents === event.sender &&
       event.senderFrame === event.sender.mainFrame ? appOriginURL().origin : "";
-  });
-
-  ipcMain.on("personastack:bridge:oidc-navigation", (event) => {
-    const entry = windows.get(event.sender.id);
-    event.returnValue = canFollowEnterpriseOIDCLinks(
-      entry?.role,
-      entry !== undefined && entry.window.webContents === event.sender,
-      event.senderFrame === event.sender.mainFrame,
-      event.senderFrame?.url ?? "",
-      entry?.oidcNavigationExpiresAt,
-      Date.now(),
-      appOriginURL(),
-    );
   });
 
   ipcMain.on("personastack:concern", (event, payload: unknown) => {

@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 
-import { shouldFollowOIDCLinkInApp, shouldKeepPersonaStackLinkInApp } from "./security.js";
+import { shouldKeepPersonaStackLinkInApp } from "./security.js";
 
 type NativeHandler = Readonly<{ postMessage(message: unknown): Promise<unknown> }>;
 
@@ -34,8 +34,6 @@ document.addEventListener("click", (event) => {
   const anchor = event.composedPath().find((target): target is HTMLAnchorElement => target instanceof HTMLAnchorElement);
   if (!anchor || anchor.href === "" || shouldKeepPersonaStackLinkInApp(anchor.href, configuredAppURL)) return;
   if (anchor.protocol !== "http:" && anchor.protocol !== "https:") return;
-  const canFollowOIDCLinks = ipcRenderer.sendSync("personastack:bridge:oidc-navigation") === true;
-  if (shouldFollowOIDCLinkInApp(canFollowOIDCLinks, window.top === window, anchor.href)) return;
   event.preventDefault();
   const channel = generation >= 0 ? "personastack:open-external" : "personastack:open-user-external";
   const payload = generation >= 0 ? { generation, payload: anchor.href } : anchor.href;

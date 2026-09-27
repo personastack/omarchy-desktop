@@ -4,20 +4,16 @@ import test from "node:test";
 import {
   APP_URL_SWITCH,
   BACKGROUND_SWITCH,
-  OIDC_NAVIGATION_WINDOW_MS,
   authorizeBridgeFrame,
-  canFollowEnterpriseOIDCLinks,
   handleFrameNavigation,
-  isAllowedOIDCNavigation,
   isAllowedUserExternalLink,
   isEnterpriseOIDCStartURL,
   isTrustedPermissionRequest,
-  shouldFollowOIDCLinkInApp,
   shouldKeepPersonaStackLinkInApp,
   isAllowedMainNavigation,
   isGoogleOAuthURL,
+  isGoogleOAuthAuthorizationURL,
   googleIntegrationOAuthStartState,
-  isAllowedGoogleIntegrationOAuthNavigation,
   isNewConcernEvent,
   isInternalPersonaStackURL,
   isTrustedAppURL,
@@ -40,7 +36,7 @@ test("URL resolution preserves packaged defaults and rejects invalid overrides",
   assert.equal(resolveAppURL([APP_URL_SWITCH, "https://user:pass@example.test"], "https://example.test").origin, "https://example.test");
 });
 
-test("Google Services OAuth stays in the hosted session only for its bound callback", () => {
+test("Google Services OAuth external URL requires the API-issued state and hosted callback", () => {
   const appURL = new URL("https://my.personastack.ai/user/google-services");
   const state = "a".repeat(64);
   const authorizationURL = new URL("https://accounts.google.com/o/oauth2/v2/auth");
@@ -51,39 +47,21 @@ test("Google Services OAuth stays in the hosted session only for its bound callb
   authorizationURL.searchParams.set("state", state);
 
   assert.equal(googleIntegrationOAuthStartState(authorizationURL.href, appURL), state);
-  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
-    authorizationURL.href, true, appURL.href, state, 20_000, 10_000, appURL,
-  ), true);
+  assert.equal(isGoogleOAuthAuthorizationURL(authorizationURL.href), true);
+  assert.equal(isGoogleOAuthAuthorizationURL("https://accounts.google.com/gsi/select"), false);
+  assert.equal(googleIntegrationOAuthStartState(
+    authorizationURL.href.replace(encodeURIComponent("https://my.personastack.ai/callbacks/integrations/google/oauth/callback"), encodeURIComponent("https://attacker.example/callback")), appURL,
+  ), undefined);
+  assert.equal(googleIntegrationOAuthStartState(
+    authorizationURL.href.replace("state=" + state, "state=" + state + "&state=" + state), appURL,
+  ), undefined);
+  assert.equal(googleIntegrationOAuthStartState("https://accounts.example.com/o/oauth2/v2/auth", appURL), undefined);
   let prevented = false;
   assert.equal(handleFrameNavigation(
-    { preventDefault: () => { prevented = true; } }, authorizationURL.href, "main", true, appURL.href,
-    undefined, 10_000, appURL, () => {}, state, 20_000,
-  ), true);
-  assert.equal(prevented, false);
-  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
-    "https://accounts.google.com/signin/v2/identifier", true, "https://accounts.google.com/o/oauth2/v2/auth", state, 20_000, 10_000, appURL,
-  ), true);
-  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
-    `https://my.personastack.ai/callbacks/integrations/google/oauth/callback?code=oauth-code&state=${state}`,
-    true, "https://accounts.google.com/consent", state, 20_000, 10_000, appURL,
-  ), true);
-  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
-    `https://my.personastack.ai/callbacks/integrations/google/oauth/callback?code=oauth-code&state=${"b".repeat(64)}`,
-    true, "https://accounts.google.com/consent", state, 20_000, 10_000, appURL,
+    { preventDefault: () => { prevented = true; } }, authorizationURL.href, "main", false,
+    appURL, () => {},
   ), false);
-  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
-    "https://accounts.google.com/signin/v2/identifier", true, appURL.href, undefined, undefined, 10_000, appURL,
-  ), false);
-  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
-    "https://accounts.google.com/signin/v2/identifier", true, "https://accounts.google.com/consent", state, 10_000, 10_000, appURL,
-  ), false);
-  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
-    authorizationURL.href.replace(encodeURIComponent("https://my.personastack.ai/callbacks/integrations/google/oauth/callback"), encodeURIComponent("https://attacker.example/callback")),
-    true, appURL.href, state, 20_000, 10_000, appURL,
-  ), false);
-  assert.equal(isAllowedGoogleIntegrationOAuthNavigation(
-    "https://accounts.google.com/signin/v2/identifier", false, "https://accounts.google.com/consent", state, 20_000, 10_000, appURL,
-  ), false);
+  assert.equal(prevented, true);
 });
 
 test("background launch is explicit and leaves ordinary launches visible", () => {
@@ -124,15 +102,6 @@ test("bridge admits only registered current main frames at the exact configured 
   assert.equal(isEnterpriseOIDCStartURL("https://my.personastack.ai/auth/oidc/start", appURL), true);
   assert.equal(isEnterpriseOIDCStartURL("https://my.personastack.ai/auth/oidc/start/extra", appURL), false);
   assert.equal(isEnterpriseOIDCStartURL("https://attacker.example/auth/oidc/start", appURL), false);
-  const attemptExpiresAt = 1_000 + OIDC_NAVIGATION_WINDOW_MS;
-  assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "main", true, attemptExpiresAt, 1_000), true);
-  assert.equal(isAllowedOIDCNavigation("http://sso.example.com/authorize", "main", true, attemptExpiresAt, 1_000), false);
-  assert.equal(isAllowedOIDCNavigation("javascript:alert(1)", "main", true, attemptExpiresAt, 1_000), false);
-  assert.equal(isAllowedOIDCNavigation("https://user:pass@sso.example.com/", "main", true, attemptExpiresAt, 1_000), false);
-  assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "main", true, attemptExpiresAt, attemptExpiresAt), false);
-  assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "main", true, undefined, 1_000), false);
-  assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "chat", true, attemptExpiresAt, 1_000), false);
-  assert.equal(isAllowedOIDCNavigation("https://sso.example.com/authorize", "main", false, attemptExpiresAt, 1_000), false);
   assert.equal(isAllowedMainNavigation("https://sso.example.com/authorize", appURL), false);
   const handoffAttempt = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
   const handoffCode = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
@@ -148,14 +117,6 @@ test("bridge admits only registered current main frames at the exact configured 
   assert.equal(isTrustedPermissionRequest("chat", true, "https://my.personastack.ai/login", undefined, appURL), false);
   assert.equal(isTrustedPermissionRequest("main", true, "https://sso.example.com/login", undefined, appURL), false);
   assert.equal(isTrustedPermissionRequest("main", true, "https://my.personastack.ai/login", "https://sso.example.com", appURL), false);
-  assert.equal(canFollowEnterpriseOIDCLinks("main", true, true, "https://sso.example.com/login", attemptExpiresAt, 1_000, appURL), true);
-  assert.equal(canFollowEnterpriseOIDCLinks("main", true, true, "https://sso.example.com/login", attemptExpiresAt, attemptExpiresAt, appURL), false);
-  assert.equal(canFollowEnterpriseOIDCLinks("chat", true, true, "https://sso.example.com/login", attemptExpiresAt, 1_000, appURL), false);
-  assert.equal(canFollowEnterpriseOIDCLinks("main", false, true, "https://sso.example.com/login", attemptExpiresAt, 1_000, appURL), false);
-  assert.equal(shouldFollowOIDCLinkInApp(true, true, "https://sso.example.com/continue"), true);
-  assert.equal(shouldFollowOIDCLinkInApp(true, false, "https://sso.example.com/continue"), false);
-  assert.equal(shouldFollowOIDCLinkInApp(false, true, "https://sso.example.com/continue"), false);
-  assert.equal(shouldFollowOIDCLinkInApp(true, true, "http://sso.example.com/continue"), false);
   assert.equal(shouldKeepPersonaStackLinkInApp("https://sso.example.com/continue", appURL), false);
   assert.equal(shouldKeepPersonaStackLinkInApp("https://my.personastack.ai/login", appURL), true);
   assert.equal(shouldKeepPersonaStackLinkInApp("https://my.personastack.ai/user/personas", appURL), true);
@@ -175,9 +136,6 @@ test("bridge admits only registered current main frames at the exact configured 
     "https://attacker.example/frame",
     "main",
     false,
-    "https://my.personastack.ai/login",
-    attemptExpiresAt,
-    1_000,
     appURL,
     () => { popoutsInvalidated = true; },
   );
@@ -190,59 +148,35 @@ test("bridge admits only registered current main frames at the exact configured 
     "https://accounts.google.com/gsi/iframe/select?client_id=example",
     "main",
     false,
-    "https://my.personastack.ai/login",
-    undefined,
-    1_000,
     appURL,
     () => { popoutsInvalidated = true; },
   );
   assert.equal(googleSignInFrameAllowed, true);
   assert.equal(prevented, false);
-  const idpSameOriginFrameAllowed = handleFrameNavigation(
+  const idpFrameBlocked = handleFrameNavigation(
     navigationEvent,
     "https://sso.example.com/frame/login",
     "main",
     false,
-    "https://sso.example.com/login",
-    attemptExpiresAt,
-    1_000,
     appURL,
     () => { popoutsInvalidated = true; },
   );
-  assert.equal(idpSameOriginFrameAllowed, true);
+  assert.equal(idpFrameBlocked, false);
   const idpCrossOriginFrameBlocked = handleFrameNavigation(
     navigationEvent,
     "https://frames.attacker.example/frame",
     "main",
     false,
-    "https://sso.example.com/login",
-    attemptExpiresAt,
-    1_000,
     appURL,
     () => { popoutsInvalidated = true; },
   );
   assert.equal(idpCrossOriginFrameBlocked, false);
-  const expiredIdpFrameBlocked = handleFrameNavigation(
-    navigationEvent,
-    "https://sso.example.com/frame/login",
-    "main",
-    false,
-    "https://sso.example.com/login",
-    attemptExpiresAt,
-    attemptExpiresAt,
-    appURL,
-    () => { popoutsInvalidated = true; },
-  );
-  assert.equal(expiredIdpFrameBlocked, false);
   prevented = false;
   const topLevelExternalAllowed = handleFrameNavigation(
     navigationEvent,
     "https://accounts.google.com/o/oauth2/auth",
     "main",
     true,
-    "https://my.personastack.ai/login",
-    undefined,
-    1_000,
     appURL,
     () => { popoutsInvalidated = true; },
   );

@@ -1,8 +1,6 @@
 export const DEFAULT_APP_URL = "https://my.personastack.ai/user/personas";
 export const APP_URL_SWITCH = "--personastack-url";
 export const BACKGROUND_SWITCH = "--background";
-export const OIDC_NAVIGATION_WINDOW_MS = 10 * 60_000;
-export const GOOGLE_OAUTH_NAVIGATION_WINDOW_MS = 10 * 60_000;
 
 export type BridgeRole = "main" | "chat" | "stack" | "activity";
 
@@ -182,6 +180,12 @@ export function isGoogleOAuthURL(value: unknown): value is string {
   return url !== undefined && url.protocol === "https:" && url.hostname.toLowerCase() === "accounts.google.com";
 }
 
+export function isGoogleOAuthAuthorizationURL(value: unknown): value is string {
+  const url = parseHTTPURL(value);
+  return url !== undefined && url.protocol === "https:" && url.hostname.toLowerCase() === "accounts.google.com" &&
+    ["/o/oauth2/auth", "/o/oauth2/v2/auth"].includes(url.pathname);
+}
+
 export function isAllowedMainNavigation(value: string, appURL: URL): boolean {
   return isInternalPersonaStackURL(value, appURL);
 }
@@ -199,29 +203,6 @@ export function googleIntegrationOAuthStartState(value: string, appURL: URL): st
       redirect.search !== "" || redirect.hash !== "") return undefined;
   const state = url.searchParams.get("state");
   return state && /^[a-f0-9]{64}$/.test(state) ? state : undefined;
-}
-
-export function isAllowedGoogleIntegrationOAuthNavigation(
-  value: string,
-  isMainFrame: boolean,
-  topFrameURL: string,
-  expectedState: string | undefined,
-  expiresAt: number | undefined,
-  now: number,
-  appURL: URL,
-): boolean {
-  if (!isMainFrame || !expectedState || expiresAt === undefined || expiresAt <= now) return false;
-  const target = parseHTTPURL(value);
-  const topFrame = parseHTTPURL(topFrameURL);
-  if (!target || !topFrame) return false;
-  if (target.protocol === "https:" && target.hostname.toLowerCase() === "accounts.google.com") {
-    if (topFrame.origin === appURL.origin) return googleIntegrationOAuthStartState(value, appURL) === expectedState;
-    return topFrame.protocol === "https:" && topFrame.hostname.toLowerCase() === "accounts.google.com";
-  }
-  return topFrame.protocol === "https:" && topFrame.hostname.toLowerCase() === "accounts.google.com" &&
-    target.origin === appURL.origin && target.pathname === "/callbacks/integrations/google/oauth/callback" &&
-    target.searchParams.getAll("state").length === 1 && target.searchParams.get("state") === expectedState &&
-    target.username === "" && target.password === "" && target.hash === "";
 }
 
 export interface DesktopAuthHandoffCallback {
@@ -256,45 +237,15 @@ export function handleFrameNavigation(
   value: string,
   role: BridgeRole,
   isMainFrame: boolean,
-  topFrameURL: string,
-  expiresAt: number | undefined,
-  now: number,
   appURL: URL,
   invalidatePopouts: () => void,
-  googleOAuthState?: string,
-  googleOAuthExpiresAt?: number,
 ): boolean {
   const allowed = isMainFrame
-    ? isAllowedMainNavigation(value, appURL) || isAllowedOIDCNavigation(value, role, true, expiresAt, now) ||
-      (role === "main" && isAllowedGoogleIntegrationOAuthNavigation(value, true, topFrameURL, googleOAuthState, googleOAuthExpiresAt, now, appURL))
-    : isInternalPersonaStackURL(value, appURL) || isGoogleOAuthURL(value) ||
-      isSameOriginOIDCSubframe(value, topFrameURL, expiresAt, now, appURL);
+    ? isAllowedMainNavigation(value, appURL)
+    : isInternalPersonaStackURL(value, appURL) || (isGoogleOAuthURL(value) && !isGoogleOAuthAuthorizationURL(value));
   if (role === "main" && isMainFrame && !isTrustedAppURL(value, appURL)) invalidatePopouts();
   if (!allowed) event.preventDefault();
   return allowed;
-}
-
-function isSameOriginOIDCSubframe(
-  value: string,
-  topFrameURL: string,
-  expiresAt: number | undefined,
-  now: number,
-  appURL: URL,
-): boolean {
-  const target = parseHTTPURL(value);
-  const topFrame = parseHTTPURL(topFrameURL);
-  return target !== undefined && topFrame !== undefined && target.protocol === "https:" &&
-    topFrame.origin !== appURL.origin && topFrame.origin === target.origin &&
-    typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > now;
-}
-
-export function shouldFollowOIDCLinkInApp(
-  canFollowOIDCLinks: boolean,
-  isTopLevel: boolean,
-  href: string,
-): boolean {
-  const target = parseHTTPURL(href);
-  return canFollowOIDCLinks && isTopLevel && target?.protocol === "https:";
 }
 
 export function shouldKeepPersonaStackLinkInApp(
@@ -317,36 +268,9 @@ export function isAllowedUserExternalLink(
     current.origin !== appURL.origin && isSafeExternalURL(targetURL);
 }
 
-export function canFollowEnterpriseOIDCLinks(
-  role: BridgeRole | undefined,
-  registered: boolean,
-  isMainFrame: boolean,
-  currentURL: string,
-  expiresAt: number | undefined,
-  now: number,
-  appURL: URL,
-): boolean {
-  const current = parseHTTPURL(currentURL);
-  return registered && role === "main" && isMainFrame && current !== undefined &&
-    current.origin !== appURL.origin && typeof expiresAt === "number" &&
-    Number.isFinite(expiresAt) && expiresAt > now;
-}
-
 export function isEnterpriseOIDCStartURL(value: string, appURL: URL): boolean {
   const url = parseHTTPURL(value);
   return url !== undefined && url.origin === appURL.origin && url.pathname === "/auth/oidc/start";
-}
-
-export function isAllowedOIDCNavigation(
-  value: string,
-  role: BridgeRole,
-  isMainFrame: boolean,
-  expiresAt: number | undefined,
-  now: number,
-): boolean {
-  const url = parseHTTPURL(value);
-  return role === "main" && isMainFrame && url !== undefined &&
-    typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > now && url.protocol === "https:";
 }
 
 export function isTrustedPermissionRequest(
