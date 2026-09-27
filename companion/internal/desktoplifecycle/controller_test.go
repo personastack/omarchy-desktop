@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,7 @@ type runtimeFake struct {
 	mu               sync.Mutex
 	state            cuaruntime.State
 	prepareCalls     int
+	callCalls        int
 	repairCalls      int
 	stopCalls        int
 	closed           bool
@@ -62,8 +64,17 @@ func (runtime *runtimeFake) Prepare(context.Context) (cuaruntime.State, error) {
 	return cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}, nil
 }
 
-func (*runtimeFake) Call(context.Context, agentgatewayruntime.DesktopControlOperation, string, json.RawMessage) (json.RawMessage, error) {
+func (runtime *runtimeFake) Call(context.Context, agentgatewayruntime.DesktopControlOperation, string, json.RawMessage) (json.RawMessage, error) {
+	runtime.mu.Lock()
+	runtime.callCalls++
+	runtime.mu.Unlock()
 	return json.RawMessage(`{}`), nil
+}
+
+func (runtime *runtimeFake) callCount() int {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.callCalls
 }
 
 func (runtime *runtimeFake) State() cuaruntime.State {
@@ -305,6 +316,27 @@ func (localOperationsFake) Call(context.Context, agentgatewayruntime.DesktopCont
 }
 func (localOperationsFake) ActiveProcesses() int          { return 0 }
 func (localOperationsFake) CloseAll(context.Context) bool { return true }
+
+type recordingLocalOperations struct {
+	mu       sync.Mutex
+	closeAll int
+}
+
+func (*recordingLocalOperations) Call(context.Context, agentgatewayruntime.DesktopControlOperation, json.RawMessage, time.Duration) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (*recordingLocalOperations) ActiveProcesses() int { return 0 }
+func (local *recordingLocalOperations) CloseAll(context.Context) bool {
+	local.mu.Lock()
+	local.closeAll++
+	local.mu.Unlock()
+	return true
+}
+func (local *recordingLocalOperations) closeCount() int {
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	return local.closeAll
+}
 
 type blockingLocalOperations struct {
 	started chan struct{}
@@ -1769,6 +1801,131 @@ func TestPrepareConnectsThroughGatewayOwnedSessionLifecycle(t *testing.T) {
 	}
 }
 
+func TestGatewayHandlerScopesRevocationAndDeniesUnleasedCallsWithoutEffects(t *testing.T) {
+	t.Parallel()
+	runtime := &runtimeFake{}
+	local := &recordingLocalOperations{}
+	service := &installServiceFake{active: true, installation: desktopcontrol.Installation{
+		InstallationID: "install_01", MachineCredential: "secret", EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
+	}}
+	connection := &gatewayFake{closed: make(chan struct{})}
+	var handler desktopgateway.CommandHandler
+	controller := newTestControllerWithLocal(t, runtime, service, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, func(_ desktopcontrol.Installation, _ string, commandHandler desktopgateway.CommandHandler, _ desktopgateway.DiagnosticsProvider) (gateway, error) {
+		handler = commandHandler
+		return connection, nil
+	}, local)
+	if _, err := controller.Prepare(context.Background(), testOrigin, "ticket"); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	target := func(workspace, config string) *agentgatewayruntime.DesktopControlTarget {
+		return &agentgatewayruntime.DesktopControlTarget{
+			InstallationID: service.installation.InstallationID,
+			WorkspaceID:    workspace, ConfigID: config, PersonaID: "persona_1", RunID: "run_1",
+			Generation: 1, ConfigVersion: 1,
+		}
+	}
+	requestID := 0
+	command := func(target *agentgatewayruntime.DesktopControlTarget, operation agentgatewayruntime.DesktopControlOperation, arguments string) agentgatewayruntime.DesktopControlFrame {
+		requestID++
+		return agentgatewayruntime.DesktopControlFrame{
+			Version: agentgatewayruntime.DesktopControlProtocolVersion, Type: agentgatewayruntime.DesktopControlFrameCommand,
+			RequestID: fmt.Sprintf("request-%d", requestID), Target: target, Operation: operation,
+			Arguments: json.RawMessage(arguments), DeadlineAt: time.Now().Add(time.Minute),
+		}
+	}
+	dispatch := func(frame agentgatewayruntime.DesktopControlFrame) agentgatewayruntime.DesktopControlFrame {
+		if err := agentgatewayruntime.ValidateDesktopControlFrame(frame); err != nil {
+			t.Fatalf("test command frame %s/%s is invalid: %v", frame.RequestID, frame.Operation, err)
+		}
+		return handler(context.Background(), frame, func(agentgatewayruntime.DesktopControlFrame) error { return nil })
+	}
+	const missingToken = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	observe := func(token string) string {
+		return `{"control_token":"` + token + `","tool":"get_desktop_state","arguments":{}}`
+	}
+	firstTarget := target("workspace_a", "config_a")
+	denied := dispatch(command(firstTarget, agentgatewayruntime.DesktopControlOperationObserve, observe(missingToken)))
+	if denied.Type != agentgatewayruntime.DesktopControlFrameFailure || denied.ErrorCode != "desktop_control_required" || runtime.callCount() != 0 || local.closeCount() != 0 {
+		t.Fatalf("unleased Gateway command = %#v, Cua calls = %d, local cleanups = %d", denied, runtime.callCount(), local.closeCount())
+	}
+	firstLease := dispatch(command(firstTarget, agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
+	if firstLease.Type != agentgatewayruntime.DesktopControlFrameResult {
+		t.Fatalf("workspace A lease = %#v", firstLease)
+	}
+	var firstPayload struct {
+		ControlToken string `json:"control_token"`
+	}
+	if err := json.Unmarshal(firstLease.Result, &firstPayload); err != nil || firstPayload.ControlToken == "" {
+		t.Fatalf("workspace A lease payload = %s, error = %v", firstLease.Result, err)
+	}
+	firstCall := dispatch(command(firstTarget, agentgatewayruntime.DesktopControlOperationObserve, observe(firstPayload.ControlToken)))
+	if firstCall.Type != agentgatewayruntime.DesktopControlFrameResult || runtime.callCount() != 1 || local.closeCount() != 0 {
+		t.Fatalf("workspace A Cua call = %#v, Cua calls = %d, local cleanups = %d", firstCall, runtime.callCount(), local.closeCount())
+	}
+	revokedTarget := &agentgatewayruntime.DesktopControlTarget{
+		InstallationID: firstTarget.InstallationID, WorkspaceID: firstTarget.WorkspaceID,
+		ConfigID: firstTarget.ConfigID, ConfigVersion: 2,
+	}
+	revoke := dispatch(command(revokedTarget, agentgatewayruntime.DesktopControlOperationRevokeConfig, `{}`))
+	if revoke.Type != agentgatewayruntime.DesktopControlFrameResult || string(revoke.Result) != `{"revoked":true}` || local.closeCount() != 1 {
+		t.Fatalf("workspace A revoke = %#v, local cleanups = %d", revoke, local.closeCount())
+	}
+	denied = dispatch(command(firstTarget, agentgatewayruntime.DesktopControlOperationObserve, observe(firstPayload.ControlToken)))
+	if denied.Type != agentgatewayruntime.DesktopControlFrameFailure || runtime.callCount() != 1 || local.closeCount() != 1 {
+		t.Fatalf("revoked workspace A call = %#v, Cua calls = %d, local cleanups = %d", denied, runtime.callCount(), local.closeCount())
+	}
+	siblingTarget := target("workspace_a", "config_b")
+	siblingLease := dispatch(command(siblingTarget, agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
+	if siblingLease.Type != agentgatewayruntime.DesktopControlFrameResult {
+		t.Fatalf("sibling config lease after config A revoke = %#v", siblingLease)
+	}
+	var siblingPayload struct {
+		ControlToken string `json:"control_token"`
+	}
+	if err := json.Unmarshal(siblingLease.Result, &siblingPayload); err != nil || siblingPayload.ControlToken == "" {
+		t.Fatalf("sibling config lease payload = %s, error = %v", siblingLease.Result, err)
+	}
+	siblingCall := dispatch(command(siblingTarget, agentgatewayruntime.DesktopControlOperationObserve, observe(siblingPayload.ControlToken)))
+	if siblingCall.Type != agentgatewayruntime.DesktopControlFrameResult || runtime.callCount() != 2 {
+		t.Fatalf("sibling config Cua call = %#v, Cua calls = %d", siblingCall, runtime.callCount())
+	}
+	lateRevoke := dispatch(command(revokedTarget, agentgatewayruntime.DesktopControlOperationRevokeConfig, `{}`))
+	if lateRevoke.Type != agentgatewayruntime.DesktopControlFrameResult || local.closeCount() != 1 {
+		t.Fatalf("delayed config A revoke with sibling lease active = %#v, local cleanups = %d", lateRevoke, local.closeCount())
+	}
+	siblingAfterRevoke := dispatch(command(siblingTarget, agentgatewayruntime.DesktopControlOperationObserve, observe(siblingPayload.ControlToken)))
+	if siblingAfterRevoke.Type != agentgatewayruntime.DesktopControlFrameResult || runtime.callCount() != 3 || local.closeCount() != 1 {
+		t.Fatalf("sibling config call after config A revoke = %#v, Cua calls = %d, local cleanups = %d", siblingAfterRevoke, runtime.callCount(), local.closeCount())
+	}
+	siblingRelease := dispatch(command(siblingTarget, agentgatewayruntime.DesktopControlOperationRelease, `{"control_token":"`+siblingPayload.ControlToken+`"}`))
+	if siblingRelease.Type != agentgatewayruntime.DesktopControlFrameResult {
+		t.Fatalf("sibling config lease release = %#v", siblingRelease)
+	}
+	if local.closeCount() != 2 {
+		t.Fatalf("sibling config release local cleanups = %d, want 2", local.closeCount())
+	}
+	otherWorkspaceTarget := target("workspace_b", "config_a")
+	otherWorkspaceLease := dispatch(command(otherWorkspaceTarget, agentgatewayruntime.DesktopControlOperationAcquire, `{}`))
+	if otherWorkspaceLease.Type != agentgatewayruntime.DesktopControlFrameResult {
+		t.Fatalf("same config ID in another workspace lease = %#v", otherWorkspaceLease)
+	}
+	var otherWorkspacePayload struct {
+		ControlToken string `json:"control_token"`
+	}
+	if err := json.Unmarshal(otherWorkspaceLease.Result, &otherWorkspacePayload); err != nil || otherWorkspacePayload.ControlToken == "" {
+		t.Fatalf("other workspace lease payload = %s, error = %v", otherWorkspaceLease.Result, err)
+	}
+	lateRevoke = dispatch(command(revokedTarget, agentgatewayruntime.DesktopControlOperationRevokeConfig, `{}`))
+	if lateRevoke.Type != agentgatewayruntime.DesktopControlFrameResult || local.closeCount() != 2 {
+		t.Fatalf("delayed workspace A revoke = %#v, local cleanups = %d", lateRevoke, local.closeCount())
+	}
+	otherWorkspaceCall := dispatch(command(otherWorkspaceTarget, agentgatewayruntime.DesktopControlOperationObserve, observe(otherWorkspacePayload.ControlToken)))
+	if otherWorkspaceCall.Type != agentgatewayruntime.DesktopControlFrameResult || runtime.callCount() != 4 || local.closeCount() != 2 {
+		t.Fatalf("same config ID in another workspace after delayed revoke = %#v, Cua calls = %d, local cleanups = %d", otherWorkspaceCall, runtime.callCount(), local.closeCount())
+	}
+}
+
 func TestPrepareWaitsForGatewayHeartbeatAcknowledgement(t *testing.T) {
 	t.Parallel()
 	runtime := &runtimeFake{}
@@ -2142,8 +2299,12 @@ func TestLockCleanupFailureStillReportsObservedLockState(t *testing.T) {
 const testOrigin = "https://my.personastack.ai"
 
 func newTestController(t *testing.T, runtime cuaRuntime, service *installServiceFake, probe lockProbe, newGateway gatewayFactory) *Controller {
+	return newTestControllerWithLocal(t, runtime, service, probe, newGateway, localOperationsFake{})
+}
+
+func newTestControllerWithLocal(t *testing.T, runtime cuaRuntime, service *installServiceFake, probe lockProbe, newGateway gatewayFactory, local desktopexecutor.LocalOperations) *Controller {
 	t.Helper()
-	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: probe, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}}
+	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: probe, Local: local, PausePreference: &pausePreferenceFake{}}
 	options.NewLockMonitor = func(sink LockStateSink, _ time.Duration) (LockMonitor, error) {
 		return lockMonitorFake{sink: sink}, nil
 	}
