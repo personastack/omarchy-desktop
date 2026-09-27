@@ -25,7 +25,7 @@ Review the new app and API source revisions. Update the two commit pins in `PKGB
 The app has no automatic updater or package rollback hook. Keep a previously built package if you may need to revert. Restore it with:
 
 ```sh
-sudo pacman -U ./personastack-0.1.0-9-x86_64.pkg.tar.zst
+sudo pacman -U ./personastack-0.1.0-10-x86_64.pkg.tar.zst
 ```
 
 The package owns files under `/usr`. It does not own or remove the user's Electron browser session, Linux Secret Service credential, or Codex and Claude configuration. The current app has no user-data migration to reverse. Package upgrade and rollback have not been acceptance-tested. Future user-data migrations need an explicit downgrade compatibility policy.
@@ -59,3 +59,5 @@ Follow-up build on `eric-pc`: package `personastack 0.1.0-7` uses app commit `f5
 An earlier attempt set `TMPDIR` to the bind-mounted build directory. Cua installer ownership tests failed there because the container's user-namespace ownership differed on the mount. The successful run kept Go temporary files in the container filesystem. The build used a local archive of the exact private API client revision, without forwarding SSH credentials. Package installation, keyring behavior, and Omarchy acceptance remain open. This recipe does not claim Omarchy support. Keep platform, installed-package, and full parity acceptance open.
 
 Latest source build on `eric-pc`: package `personastack 0.1.0-10` pins app commit `a06c6495960931cea83fb1164847d51e4645afcb` and API client commit `fdf742c884168c4d6f2531b9cc65b966d018e7b3`. `makepkg --cleanbuild --force --noconfirm --nodeps` passed in an Arch `base-devel` container with Node `26.10.0`, npm CLI `11.19.0`, and Go `1.27.1`. Its check stage passed all 92 Node tests and every companion Go package. Package metadata confirms `xorg-xwayland`; archive readback confirms the launcher, desktop entry, icon, Hyprland pin adapter and its compiled test, and companion executable. This run skipped makepkg dependency checks. It did not install the package. SHA-256: `3aa1aa0107f677317aef0805be47f50bd0506d1806d18a1f16a6b6ac817de16b`. Artifact: `/tmp/omarchy-pin-build-20260927/output/personastack-0.1.0-10-x86_64.pkg.tar.zst` on `eric-pc`. The build used local source archives pinned to those exact commits, without forwarding SSH credentials. Package installation and Omarchy acceptance remain open.
+
+Current recipe pin (2026-09-27): `PKGBUILD` now sets `personastack 0.1.0-11` to app commit `9a083962bf52bb5c42f0d3ce17b9b936214346af` and API client commit `fdf742c884168c4d6f2531b9cc65b966d018e7b3`. On `eric-pc`, the exact pinned app source passed all 95 Node tests; Go 1.27.1 passed the full companion suite, vet, race coverage for the changed packages, and a trimmed build. The package itself has not yet been rebuilt or installed. Keep package and Omarchy acceptance open.
