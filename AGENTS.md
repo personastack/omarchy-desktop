@@ -1,6 +1,6 @@
 # Omarchy Desktop repository instructions
 
-Read `SPEC.md` and the active workspace implementation plan before changing the desktop contract. The macOS desktop app, API clients, hosted UI and MCP catalog remain the behavioral and contract authorities.
+Read `SPEC.md` and `.plans/personastack/omarchy-desktop/in-progress/full-macos-parity.md` before changing the desktop contract. The macOS desktop app, API clients, hosted UI and MCP catalog remain the behavioral and contract authorities.
 
 ## Current milestone
 
