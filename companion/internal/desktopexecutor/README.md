@@ -17,7 +17,8 @@ active lease, closes local handles and processes, and fences late results.
 `Close` stops lease monitoring, cancels active commands, closes resources, and
 can retry unconfirmed shutdown cleanup. The executor expires idle leases every
 five seconds, renews the idle window while a managed process runs, and caps
-process timeouts at the lease hard deadline. The companion does not construct
-this executor or connect it to Gateway startup yet. Tests prove the dispatch and
+process timeouts at the lease hard deadline. The desktop lifecycle controller
+constructs the executor after it confirms an unlocked session, sets the initial
+lock fence, and exposes it to the Gateway command path. Tests prove dispatch and
 lock-fence contracts with fakes. They do not prove real Cua calls or Omarchy
 desktop behavior.
