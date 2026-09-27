@@ -31,6 +31,7 @@ import {
 } from "./external-oauth-return.js";
 import { delegateChatWindowClose } from "./chat-window-close.js";
 import { applyChatWindowCommand as dispatchChatWindowCommand } from "./chat-window-command.js";
+import { HyprlandPinAdapter } from "./hyprland-pin.js";
 import { closePopoutWindows, synchronizePopoutScope } from "./popout-scope.js";
 import { documentNavigationEffects, type DocumentNavigationEvent } from "./document-navigation.js";
 import { loadAndShowWindow } from "./window-load.js";
@@ -105,6 +106,7 @@ const windows = new Map<number, RegisteredWindow>();
 const chats = new Map<string, BrowserWindow>();
 const stackWindows = new Map<string, BrowserWindow>();
 const expandedChatSizes = new Map<BrowserWindow, readonly [number, number]>();
+const hyprlandPin = new HyprlandPinAdapter();
 const programmaticChatClose = new WeakSet<BrowserWindow>();
 const closingWindows = new WeakSet<BrowserWindow>();
 let mainWindow: BrowserWindow | undefined;
@@ -157,6 +159,7 @@ if (!app.requestSingleInstanceLock()) {
       return;
     }
     isQuitting = true;
+    hyprlandPin.close();
   });
 
   app.whenReady().then(async () => {
@@ -451,12 +454,15 @@ function registerBridgeHandlers(): void {
     return { ok: true };
   });
 
-  ipcMain.handle("personastack:chat-window", (event, payload: unknown) => {
+  ipcMain.handle("personastack:chat-window", async (event, payload: unknown) => {
     const envelope = unwrapBridgePayload(payload);
     const entry = envelope && bridgeGeneration(event, envelope.generation, ["chat"]);
     const command = envelope && parseChatWindowCommand(envelope.payload);
     if (!entry || !command) return { ok: false };
     applyChatWindowCommand(command, entry.window);
+    if (command.action === "pin" && process.platform === "linux") {
+      await hyprlandPin.setPinned(entry.window, entry.window.isAlwaysOnTop());
+    }
     return { ok: true, collapsed: command.action === "collapse", pinned: entry.window.isAlwaysOnTop() };
   });
 
@@ -598,6 +604,7 @@ function createChatWindow(personaID: string): BrowserWindow {
     icon: nativeImage.createFromDataURL(APP_ICON),
   });
   window.on("closed", () => {
+    void hyprlandPin.setPinned(window, false);
     expandedChatSizes.delete(window);
     if (chats.get(personaID) === window) chats.delete(personaID);
   });
