@@ -20,6 +20,7 @@ import {
 } from "electron";
 
 import { getAutostartStatus, setAutostartEnabled, type AutostartStatus } from "./autostart.js";
+import { delegateChatWindowClose } from "./chat-window-close.js";
 import { closePopoutWindows, synchronizePopoutScope } from "./popout-scope.js";
 import { loadAndShowWindow } from "./window-load.js";
 import { applyChatWindowSizeAction, clampChatPosition } from "./chat-window-state.js";
@@ -515,11 +516,7 @@ function createChatWindow(personaID: string): BrowserWindow {
       closeWindow(window);
       return;
     }
-    void window.webContents.executeJavaScript(
-      "typeof window.personastackDesktopClose === 'function' ? (window.personastackDesktopClose(), true) : false",
-    ).then((requested) => {
-      if (requested !== true) closeWindow(window);
-    }).catch(() => closeWindow(window));
+    void delegateChatWindowClose(window.webContents, () => closeWindow(window));
   });
   const url = routeURL(appOriginURL().href, "/user/personas/chat/desktop-popout", { persona_id: personaID });
   showAfterPopoutLoad(window, url);
