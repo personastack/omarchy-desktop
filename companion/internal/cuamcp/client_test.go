@@ -19,6 +19,8 @@ import (
 	"github.com/personastack/personastack-api/pkg/client/agentgatewayruntime"
 )
 
+const pinnedCUAProtocolVersion = "2025-06-18"
+
 func TestClientRunsBoundedMCPCallsInOneOwnedProcess(t *testing.T) {
 	t.Parallel()
 	executable, err := os.Executable()
@@ -530,8 +532,9 @@ func TestCUAHelperProcess(t *testing.T) {
 			ID     *uint64 `json:"id"`
 			Method string  `json:"method"`
 			Params struct {
-				Name      string          `json:"name"`
-				Arguments json.RawMessage `json:"arguments"`
+				Name            string          `json:"name"`
+				Arguments       json.RawMessage `json:"arguments"`
+				ProtocolVersion string          `json:"protocolVersion"`
 			} `json:"params"`
 		}
 		if err := json.Unmarshal(input.Bytes(), &request); err != nil {
@@ -542,8 +545,11 @@ func TestCUAHelperProcess(t *testing.T) {
 		}
 		switch request.Method {
 		case "initialize":
+			if request.Params.ProtocolVersion != pinnedCUAProtocolVersion {
+				os.Exit(20)
+			}
 			fmt.Println(`{"jsonrpc":"2.0","method":"notifications/progress","params":{}}`)
-			fmt.Printf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"protocolVersion\":%q,\"capabilities\":{},\"serverInfo\":{\"name\":\"fake-cua\",\"version\":\"test\"}}}\n", *request.ID, protocolVersion)
+			fmt.Printf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"protocolVersion\":%q,\"capabilities\":{},\"serverInfo\":{\"name\":\"fake-cua\",\"version\":\"test\"}}}\n", *request.ID, pinnedCUAProtocolVersion)
 		case "tools/list":
 			fmt.Printf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"tools\":[", *request.ID)
 			names := make([]string, 0, len(exposedTools))
