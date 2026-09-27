@@ -948,6 +948,7 @@ func childEnvironment(environment []string) []string {
 	}
 	values["CUA_DRIVER_RS_TELEMETRY_ENABLED"] = "0"
 	values["CUA_DRIVER_RS_UPDATE_CHECK"] = "false"
+	values["CUA_DRIVER_PERMISSION_MODE"] = "standard"
 	result := make([]string, 0, len(values))
 	for key, value := range values {
 		result = append(result, key+"="+value)
