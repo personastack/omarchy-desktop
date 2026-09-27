@@ -211,6 +211,21 @@ test("chat and stack bridges accept only their finite exact payloads", () => {
   assert.equal(parseStackCommand({ version: "1", action: "open_stack_view", stack_id: "../etc", view: "graph" }), undefined);
 });
 
+test("chat window bridge accepts each finite native action and rejects extra fields", () => {
+  for (const action of ["minimize", "close", "collapse", "expand", "pin"] as const) {
+    assert.deepEqual(parseChatWindowCommand({ version: "1", action }), { version: "1", action });
+    assert.equal(parseChatWindowCommand({ version: "1", action, extra: true }), undefined);
+  }
+  assert.deepEqual(parseChatWindowCommand({ version: "1", action: "drag", dx: -8, dy: 4 }), {
+    version: "1", action: "drag", dx: -8, dy: 4,
+  });
+  assert.deepEqual(parseChatWindowCommand({ version: "1", action: "drag", dx: 0.5, dy: -0.25 }), {
+    version: "1", action: "drag", dx: 0.5, dy: -0.25,
+  });
+  assert.equal(parseChatWindowCommand({ version: "1", action: "drag", dx: 1, dy: 2, extra: true }), undefined);
+  assert.equal(parseChatWindowCommand({ version: "1", action: "toggle_pin" }), undefined);
+});
+
 test("Desktop Control bridge accepts only hosted lifecycle commands", () => {
   const ticket = "A".repeat(43);
   assert.deepEqual(parseDesktopControlCommand({ version: "1", action: "sync", scope: "" }), { version: "1", action: "sync", scope: "" });

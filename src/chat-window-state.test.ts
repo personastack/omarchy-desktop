@@ -86,6 +86,13 @@ test("drag clamps each edge to the matching display work area", () => {
   );
 });
 
+test("fractional native drag coordinates are rounded before position clamping", () => {
+  assert.deepEqual(
+    clampChatPosition([100.5, 80.5], [440, 640], { x: 100, y: 80, width: 800, height: 700 }),
+    [101, 81],
+  );
+});
+
 test("drag keeps an oversized window anchored inside the work area", () => {
   assert.deepEqual(
     clampChatPosition([900, 700], [1200, 900], { x: 100, y: 80, width: 800, height: 700 }),

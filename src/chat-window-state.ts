@@ -62,8 +62,10 @@ export function clampChatPosition(
 ): WindowPosition {
   const maxX = Math.max(workArea.x, workArea.x + workArea.width - size[0]);
   const maxY = Math.max(workArea.y, workArea.y + workArea.height - size[1]);
+  const x = Math.round(target[0]);
+  const y = Math.round(target[1]);
   return [
-    Math.min(Math.max(target[0], workArea.x), maxX),
-    Math.min(Math.max(target[1], workArea.y), maxY),
+    Math.min(Math.max(x, workArea.x), maxX),
+    Math.min(Math.max(y, workArea.y), maxY),
   ];
 }
