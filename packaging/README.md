@@ -25,7 +25,7 @@ Review the new app and API source revisions. Update the two commit pins in `PKGB
 To reinstall a package file built from the reviewed source, run:
 
 ```sh
-sudo pacman -U ./personastack-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./personastack-0.1.0-2-x86_64.pkg.tar.zst
 ```
 
 This repairs package-owned files. The tray's **Repair Cua Service** action repairs only the pinned PersonaStack-managed Cua payload and leaves unrelated files untouched. It keeps remote control paused if repair fails.
@@ -42,4 +42,4 @@ Pacman removes the package-owned runtime, launcher, desktop entry, and icon. The
 
 ## Validation status
 
-`makepkg` built the package in a disposable Arch `base-devel` container on `eric-pc`. That run used the pinned public app commit and an exact API client source snapshot in place of the private SSH source fetch. It passed the 33 Node tests, the full Go suite, packaging, and Arch package metadata checks. Package installation and Omarchy testing remain open. This recipe does not claim Omarchy support. Keep the platform, installed-package, and full parity acceptance checks open.
+`makepkg` built package `personastack 0.1.0-2` in a disposable Arch `base-devel` container on `eric-pc`. The recipe pins app commit `1e4e9232664b2e6c65dd43d4965fe1467510c4bd` and API client commit `fdf742c884168c4d6f2531b9cc65b966d018e7b3`. The run used Node `26.10.0`, npm `11.19.0`, and Go `1.27.1`. All 39 Node tests and the full companion Go test suite passed. Arch package metadata validation passed. The temporary build copy used a local archive of the exact API client commit instead of fetching the private SSH source, so no credentials were forwarded. Package installation and Omarchy testing remain open. This recipe does not claim Omarchy support. Keep platform, installed-package, and full parity acceptance open.
