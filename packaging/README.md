@@ -25,7 +25,7 @@ Review the new app and API source revisions. Update the two commit pins in `PKGB
 To reinstall a package file built from the reviewed source, run:
 
 ```sh
-sudo pacman -U ./personastack-0.1.0-3-x86_64.pkg.tar.zst
+sudo pacman -U ./personastack-0.1.0-4-x86_64.pkg.tar.zst
 ```
 
 This repairs package-owned files. The tray's **Repair Cua Service** action repairs only the pinned PersonaStack-managed Cua payload and leaves unrelated files untouched. It keeps remote control paused if repair fails.
@@ -42,4 +42,4 @@ Pacman removes the package-owned runtime, launcher, desktop entry, and icon. The
 
 ## Validation status
 
-`makepkg` built package `personastack 0.1.0-3` in a disposable Arch `base-devel` container on `eric-pc`. The recipe pins app commit `7104b269a5fe1477a5b87e9196813ff45a480aab` and API client commit `fdf742c884168c4d6f2531b9cc65b966d018e7b3`. The run used Node `26.10.0`, npm `11.19.0`, and Go `1.27.1`. All 54 Node tests and the full companion Go test suite passed. `pacman -Qp --info` confirmed the package metadata includes `xorg-xwayland`; the extracted app source reads back at the pinned commit. The temporary build copy used a local archive of the exact API client commit instead of fetching the private SSH source, so no credentials were forwarded. Package installation and Omarchy testing remain open. This recipe does not claim Omarchy support. Keep platform, installed-package, and full parity acceptance open.
+`makepkg` built package `personastack 0.1.0-4` in a disposable Arch `base-devel` container on `eric-pc`. The recipe pins app commit `11113adb7fdb1576a026bf7c3c1a65185a4feaaa` and API client commit `fdf742c884168c4d6f2531b9cc65b966d018e7b3`. The run used Node `26.10.0`, npm `11.19.0`, and Go `1.27.1`. All 56 Node tests and the full companion Go test suite passed. `pacman -Qp --info` confirmed the package metadata includes `xorg-xwayland`; the extracted app source reads back at the pinned commit. The temporary build copy used a local archive of the exact API client commit instead of fetching the private SSH source, so no credentials were forwarded. Package installation and Omarchy testing remain open. This recipe does not claim Omarchy support. Keep platform, installed-package, and full parity acceptance open.

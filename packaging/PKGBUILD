@@ -1,6 +1,6 @@
 pkgname=personastack
 pkgver=0.1.0
-pkgrel=3
+pkgrel=4
 pkgdesc='PersonaStack desktop client for Linux'
 arch=('x86_64')
 url='https://github.com/personastack/omarchy-desktop'
@@ -49,7 +49,7 @@ optdepends=(
   'kwallet: Secret Service provider for stored installation credentials'
 )
 source=(
-  "omarchy-desktop::git+https://github.com/personastack/omarchy-desktop.git#commit=7104b269a5fe1477a5b87e9196813ff45a480aab"
+  "omarchy-desktop::git+https://github.com/personastack/omarchy-desktop.git#commit=11113adb7fdb1576a026bf7c3c1a65185a4feaaa"
   "personastack-api::git+ssh://git@github.com/personastack/personastack-api.git#commit=fdf742c884168c4d6f2531b9cc65b966d018e7b3"
   "https://registry.npmjs.org/npm/-/npm-11.19.0.tgz"
 )
