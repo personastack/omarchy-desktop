@@ -545,6 +545,65 @@ func TestBindingRevocationDoesNotFenceOtherPersonas(t *testing.T) {
 	}
 }
 
+func TestDelayedBindingRevocationPreservesLaterRebindGeneration(t *testing.T) {
+	t.Parallel()
+	runner := &runnerStub{response: json.RawMessage(`{"content":[{"type":"text","text":"ok"}]}`)}
+	executor, err := New(runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlockExecutorForTest(t, executor)
+
+	oldBinding := commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`)
+	oldBinding.Target = cloneTarget(oldBinding.Target)
+	oldBinding.Target.Generation = 2
+	oldBinding.Target.RunID = "unbound-run"
+	oldToken := acquire(t, executor, oldBinding)
+	releaseOld := oldBinding
+	releaseOld.Operation = agentgatewayruntime.DesktopControlOperationRelease
+	releaseOld.Arguments = json.RawMessage(`{"control_token":"` + oldToken + `"}`)
+	if got := executor.Handle(context.Background(), releaseOld, nil); got.Type != agentgatewayruntime.DesktopControlFrameResult {
+		t.Fatalf("release old binding lease = %#v", got)
+	}
+
+	newBinding := commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`)
+	newBinding.Target = cloneTarget(newBinding.Target)
+	newBinding.Target.Generation = 4
+	newBinding.Target.RunID = "rebound-run"
+	newToken := acquire(t, executor, newBinding)
+
+	// Unbinding generation 2 advances the binding version to 3. This queued
+	// cutoff arrives after a later rebind at generation 4 has acquired a lease.
+	delayedRevoke := commandFrame(agentgatewayruntime.DesktopControlOperationRevokeBinding, `{}`)
+	delayedRevoke.Target = cloneTarget(delayedRevoke.Target)
+	delayedRevoke.Target.Generation = 2
+	delayedRevoke.Target.RunID = ""
+	if got := executor.Handle(context.Background(), delayedRevoke, nil); got.Type != agentgatewayruntime.DesktopControlFrameResult {
+		t.Fatalf("delayed generation-2 revoke = %#v", got)
+	}
+
+	observeNewBinding := newBinding
+	observeNewBinding.Operation = agentgatewayruntime.DesktopControlOperationObserve
+	observeNewBinding.Arguments = json.RawMessage(`{"control_token":"` + newToken + `","tool":"get_desktop_state","arguments":{}}`)
+	if got := executor.Handle(context.Background(), observeNewBinding, nil); got.Type != agentgatewayruntime.DesktopControlFrameResult || runner.calls != 1 {
+		t.Fatalf("generation-4 lease after delayed revoke = %#v, calls=%d", got, runner.calls)
+	}
+
+	staleBinding := commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`)
+	staleBinding.Target = cloneTarget(staleBinding.Target)
+	staleBinding.Target.Generation = 2
+	if got := executor.Handle(context.Background(), staleBinding, nil); got.ErrorCode != "desktop_control_binding_revoked" || runner.calls != 1 {
+		t.Fatalf("generation-2 acquire after revoke = %#v, calls=%d", got, runner.calls)
+	}
+
+	olderBinding := commandFrame(agentgatewayruntime.DesktopControlOperationAcquire, `{}`)
+	olderBinding.Target = cloneTarget(olderBinding.Target)
+	olderBinding.Target.Generation = 1
+	if got := executor.Handle(context.Background(), olderBinding, nil); got.ErrorCode != "desktop_control_binding_revoked" || runner.calls != 1 {
+		t.Fatalf("generation-1 acquire below cutoff = %#v, calls=%d", got, runner.calls)
+	}
+}
+
 func TestRevocationWaitsForActiveCommandBeforeAllowingAnotherLease(t *testing.T) {
 	t.Parallel()
 	runner := &stubbornRunner{entered: make(chan struct{}), release: make(chan struct{}), response: json.RawMessage(`{"content":[{"type":"text","text":"done"}]}`)}
