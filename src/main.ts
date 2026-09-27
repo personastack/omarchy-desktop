@@ -22,6 +22,7 @@ import {
 import { getAutostartStatus, setAutostartEnabled, type AutostartStatus } from "./autostart.js";
 import { closePopoutWindows, synchronizePopoutScope } from "./popout-scope.js";
 import { loadAndShowWindow } from "./window-load.js";
+import { applyChatWindowSizeAction, clampChatPosition } from "./chat-window-state.js";
 import {
   authorizeBridgeFrame,
   canFollowEnterpriseOIDCLinks,
@@ -533,20 +534,13 @@ function applyChatWindowCommand(command: ChatWindowCommand, window: BrowserWindo
     case "close":
       closeWindow(window);
       return;
-    case "collapse":
-      if (!window.isDestroyed()) {
-        const [width = 440, height = 640] = window.getSize();
-        if (width > 72 || height > 72) expandedChatSizes.set(window, [width, height]);
-        window.setSize(72, 72);
-        window.setMinimumSize(72, 72);
-      }
+    case "collapse": {
+      const restoreSize = applyChatWindowSizeAction("collapse", window, expandedChatSizes.get(window));
+      if (restoreSize) expandedChatSizes.set(window, restoreSize);
       return;
+    }
     case "expand":
-      if (!window.isDestroyed()) {
-        window.setMinimumSize(340, 360);
-        const [width = 440, height = 640] = expandedChatSizes.get(window) ?? [440, 640];
-        window.setSize(width, height);
-      }
+      applyChatWindowSizeAction("expand", window, expandedChatSizes.get(window));
       return;
     case "pin":
       window.setAlwaysOnTop(!window.isAlwaysOnTop(), "floating");
@@ -557,13 +551,7 @@ function applyChatWindowCommand(command: ChatWindowCommand, window: BrowserWindo
       const targetX = x + command.dx;
       const targetY = y + command.dy;
       const display = screen.getDisplayMatching({ x: targetX, y: targetY, width, height });
-      const area = display.workArea;
-      const maxX = Math.max(area.x, area.x + area.width - width);
-      const maxY = Math.max(area.y, area.y + area.height - height);
-      window.setPosition(
-        Math.min(Math.max(targetX, area.x), maxX),
-        Math.min(Math.max(targetY, area.y), maxY),
-      );
+      window.setPosition(...clampChatPosition([targetX, targetY], [width, height], display.workArea));
     }
   }
 }
