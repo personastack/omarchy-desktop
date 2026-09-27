@@ -162,7 +162,7 @@ func TestClientRunsBoundedMCPCallsInOneOwnedProcess(t *testing.T) {
 		t.Fatalf("later call after errors/cancellation = %s, %v", result, err)
 	}
 	health, err := client.HealthReport(context.Background())
-	if err != nil || !health.ReadyFor("0.29.1") {
+	if err != nil || !health.ReadyFor("0.30.1") {
 		t.Fatalf("Linux setup health report: %v", err)
 	}
 	if _, err := client.CheckPermissions(context.Background()); err != nil {
@@ -767,7 +767,7 @@ func TestCUAHelperProcess(t *testing.T) {
 				if string(request.Params.Arguments) != `{"include":["binary_version","platform_supported","session_active","ax_capability","screen_capture_capability"]}` {
 					os.Exit(8)
 				}
-				fmt.Printf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ready\"}],\"structuredContent\":{\"schema_version\":\"1\",\"platform\":\"linux\",\"driver_version\":\"0.29.1\",\"overall\":\"ok\",\"checks\":[{\"name\":\"binary_version\",\"status\":\"pass\",\"message\":\"ready\"},{\"name\":\"platform_supported\",\"status\":\"pass\",\"message\":\"ready\"},{\"name\":\"session_active\",\"status\":\"pass\",\"message\":\"ready\"},{\"name\":\"ax_capability\",\"status\":\"pass\",\"message\":\"ready\"},{\"name\":\"screen_capture_capability\",\"status\":\"pass\",\"message\":\"ready\"}]},\"isError\":false}}\n", *request.ID)
+				fmt.Printf("{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ready\"}],\"structuredContent\":{\"schema_version\":\"1\",\"platform\":\"linux\",\"driver_version\":\"0.30.1\",\"overall\":\"ok\",\"checks\":[{\"name\":\"binary_version\",\"status\":\"pass\",\"message\":\"ready\"},{\"name\":\"platform_supported\",\"status\":\"pass\",\"message\":\"ready\"},{\"name\":\"session_active\",\"status\":\"pass\",\"message\":\"ready\"},{\"name\":\"ax_capability\",\"status\":\"pass\",\"message\":\"ready\"},{\"name\":\"screen_capture_capability\",\"status\":\"pass\",\"message\":\"ready\"}]},\"isError\":false}}\n", *request.ID)
 				continue
 			}
 			if request.Params.Name == "clipboard_read" {

@@ -595,7 +595,7 @@ func TestInstallerRejectsUnsafeAncestors(t *testing.T) {
 			if err := test.make(parent); err != nil {
 				t.Fatal("create unsafe ancestor")
 			}
-			root := filepath.Join(parent, "cua", "0.29.1")
+			root := filepath.Join(parent, "cua", "0.30.1")
 			installer, err := newInstallerForRelease(root, "linux", "amd64", &fakeHTTP{}, pinnedRelease, fixtureNotices)
 			if err != nil {
 				t.Fatal("create fixture installer")

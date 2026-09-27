@@ -407,8 +407,11 @@ func TestExecutorBoundsOversizedCuaImageBeforeGatewayFrameEncoding(t *testing.T)
 		t.Fatalf("fixture size=%d, need image larger than %d", len(encodedImage), maxCuaImageBytes)
 	}
 	response, err := json.Marshal(map[string]any{
-		"content":           []any{map[string]any{"type": "image", "data": encodedImage, "mimeType": "image/png"}},
-		"structuredContent": map[string]any{"screenshot_width": 1600, "screenshot_height": 1600, "screenshot_mime_type": "image/png", "scale_factor": 1.0},
+		"content": []any{map[string]any{"type": "image", "data": encodedImage, "mimeType": "image/png"}},
+		"structuredContent": map[string]any{
+			"screenshot_width": 1600, "screenshot_height": 1600, "screenshot_mime_type": "image/png", "scale_factor": 1.0,
+			"agent_overlay_capture": map[string]string{"status": "excluded", "method": "hidden_before_capture"},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -441,6 +444,14 @@ func TestExecutorBoundsOversizedCuaImageBeforeGatewayFrameEncoding(t *testing.T)
 	}
 	if bounded.Content[0].MIMEType != "image/jpeg" || len(bounded.Content[0].Data) > maxCuaImageBytes || bounded.Structured["screenshot_mime_type"] == nil {
 		t.Fatalf("large image was not normalized: content=%#v structured=%#v", bounded.Content[0], bounded.Structured)
+	}
+	var overlayCapture struct {
+		Status string `json:"status"`
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal(bounded.Structured["agent_overlay_capture"], &overlayCapture); err != nil ||
+		overlayCapture.Status != "excluded" || overlayCapture.Method != "hidden_before_capture" {
+		t.Fatalf("Cua overlay capture metadata was not preserved: %s, %v", bounded.Structured["agent_overlay_capture"], err)
 	}
 }
 

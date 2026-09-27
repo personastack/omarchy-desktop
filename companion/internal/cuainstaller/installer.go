@@ -22,10 +22,10 @@ import (
 )
 
 const (
-	DriverVersion      = "0.29.1"
+	DriverVersion      = "0.30.1"
 	version            = DriverVersion
-	archiveSHA256      = "61a0c0f24d6b03e31bb7a73390db875ecf0de2ce53aa435eadb03d70979d79a5"
-	archiveURL         = "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.29.1/cua-driver-rs-0.29.1-linux-x86_64.tar.gz"
+	archiveSHA256      = "e32532d38deca0e7148fa15ba291686b1a8a4d1d3bc59fd512033892ba2e9c41"
+	archiveURL         = "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.30.1/cua-driver-rs-0.30.1-linux-x86_64.tar.gz"
 	maximumArchive     = 80 << 20
 	maximumExpanded    = 180 << 20
 	maximumFileBytes   = 60 << 20
@@ -44,11 +44,11 @@ var (
 	ErrForeignInstall   = errors.New("Cua install path is not owned by PersonaStack")
 	assetHashes         = map[string]string{
 		"LICENSE":                                   "c0779290c1d4783169aa3dbfb55feb505e563ef8a004bbf55298ceffcfbda8d9",
-		"cua-cursor-theme":                          "49cd40354577a6c6a6ff7e1954ed09787d4b2c7b6a445bb835dd0481f4e42181",
-		"cua-driver":                                "a9c3262817103cdff6c09e351f6a3410206624a6f40eea5bd14b4abb3ddf9362",
+		"cua-cursor-theme":                          "a0e8836da3e81ce40c0822876b2442d44da8066c68ed3d0d6b8521df40654fd2",
+		"cua-driver":                                "e85d02d32728b402947f1456ec901ba4f71a324f8c197a1ffe300a9ad922f353",
 		"cua_driver_abi.h":                          "e952620e41ac81b2d900886c7b0a24ebc6268a4edb8df88cc9971ae34af4ba0d",
-		"cua_driver_node_runtime.node":              "bcd60acbb89d042d25ec9f311863b89261f17771382aecf3fe2ec02538937381",
-		"libcua_driver_sdk.so":                      "d02455548901590bfe85a34aa27e7cac6c03d782e627e1f55da900194325a864",
+		"cua_driver_node_runtime.node":              "78df8494b4f3e41582dacd505693f299e455e11ff02d5187436e44adda6cfa4a",
+		"libcua_driver_sdk.so":                      "671707bccf33111356fb3379b808122919190ef3aba74d01144a2c33b598381e",
 		"wayland-helper/README.md":                  "0c38155388bdb5b3a276c4d434fbc5311ed7bb775ae6b04969f50de81c8c2703",
 		"wayland-helper/install.sh":                 "e13fc5700d281fed547fbb529a31bc1a0df250e6f9811c9cdddc99d465e219a0",
 		"wayland-helper/winrects@cua/extension.js":  "27aac56799574ecd201e810d32772d3695d8b6ace5ab4a68d026648009004eed",
@@ -88,7 +88,7 @@ type release struct {
 
 var pinnedRelease = release{
 	version:       version,
-	archivePrefix: "cua-driver-rs-0.29.1-linux-x86_64/",
+	archivePrefix: "cua-driver-rs-0.30.1-linux-x86_64/",
 	archiveURL:    archiveURL,
 	archiveSHA256: archiveSHA256,
 	assetHashes:   assetHashes,

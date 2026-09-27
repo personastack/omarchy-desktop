@@ -34,7 +34,7 @@ func TestPrepareStartsPinnedDriverAndRequiresLinuxHealth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	if state != (State{Ready: true, DriverVersion: "0.29.1", ToolCount: 2}) || runtime.State() != state {
+	if state != (State{Ready: true, DriverVersion: "0.30.1", ToolCount: 2}) || runtime.State() != state {
 		t.Fatalf("state = %#v, current = %#v", state, runtime.State())
 	}
 	if installer.calls != 1 || factoryCalls != 1 || client.starts != 1 || client.permissionReads != 1 || client.healthReads != 1 || client.stops != 0 {
@@ -502,7 +502,7 @@ func mustRuntime(t *testing.T, installer Installer, factory Factory) *Runtime {
 
 func readyReport() cuamcp.HealthReportSnapshot {
 	checks := []string{"binary_version", "platform_supported", "session_active", "ax_capability", "screen_capture_capability"}
-	report := cuamcp.HealthReportSnapshot{SchemaVersion: "1", Platform: "linux", DriverVersion: "0.29.1", Overall: "ok"}
+	report := cuamcp.HealthReportSnapshot{SchemaVersion: "1", Platform: "linux", DriverVersion: "0.30.1", Overall: "ok"}
 	for _, name := range checks {
 		report.Checks = append(report.Checks, cuamcp.HealthCheck{Name: name, Status: "pass", Message: "available"})
 	}

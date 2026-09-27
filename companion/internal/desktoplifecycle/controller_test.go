@@ -45,7 +45,7 @@ func (runtime *runtimeFake) Repair(context.Context) (cuaruntime.State, error) {
 	if runtime.repairErr != nil {
 		return runtime.state, runtime.repairErr
 	}
-	runtime.state = cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}
+	runtime.state = cuaruntime.State{Ready: true, DriverVersion: "0.30.1", ToolCount: 33}
 	return runtime.state, nil
 }
 
@@ -53,7 +53,7 @@ func (runtime *runtimeFake) Prepare(context.Context) (cuaruntime.State, error) {
 	runtime.mu.Lock()
 	runtime.prepareCalls++
 	runtime.events = append(runtime.events, "prepare")
-	runtime.state = cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}
+	runtime.state = cuaruntime.State{Ready: true, DriverVersion: "0.30.1", ToolCount: 33}
 	block := runtime.prepareBlockCall == runtime.prepareCalls
 	started, release := runtime.prepareStarted, runtime.prepareRelease
 	runtime.mu.Unlock()
@@ -61,7 +61,7 @@ func (runtime *runtimeFake) Prepare(context.Context) (cuaruntime.State, error) {
 		close(started)
 		<-release
 	}
-	return cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}, nil
+	return cuaruntime.State{Ready: true, DriverVersion: "0.30.1", ToolCount: 33}, nil
 }
 
 func (runtime *runtimeFake) Call(context.Context, agentgatewayruntime.DesktopControlOperation, string, json.RawMessage) (json.RawMessage, error) {
@@ -83,7 +83,7 @@ func (runtime *runtimeFake) State() cuaruntime.State {
 	if runtime.state.UpgradeRequired {
 		return runtime.state
 	}
-	return cuaruntime.State{Ready: true, DriverVersion: "0.29.1", ToolCount: 33}
+	return cuaruntime.State{Ready: true, DriverVersion: "0.30.1", ToolCount: 33}
 }
 
 func (runtime *runtimeFake) Close() {

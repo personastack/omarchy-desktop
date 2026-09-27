@@ -38,8 +38,8 @@ func TestHealthReportRequiresAllLinuxChecksToBeReady(t *testing.T) {
 			}
 			raw := healthEnvelope(encoded)
 			got, err := parseHealthReport(raw)
-			if err != nil || got.ReadyFor("0.29.1") != tc.ready {
-				t.Fatalf("health report = %#v, ready=%v, error=%v", got, got.ReadyFor("0.29.1"), err)
+			if err != nil || got.ReadyFor("0.30.1") != tc.ready {
+				t.Fatalf("health report = %#v, ready=%v, error=%v", got, got.ReadyFor("0.30.1"), err)
 			}
 		})
 	}
@@ -102,7 +102,7 @@ func validHealthReportFixture() HealthReportSnapshot {
 	for _, name := range requiredLinuxHealthChecks {
 		checks = append(checks, HealthCheck{Name: name, Status: "pass", Message: "ready"})
 	}
-	return HealthReportSnapshot{SchemaVersion: "1", Platform: "linux", DriverVersion: "0.29.1", Overall: "ok", Checks: checks}
+	return HealthReportSnapshot{SchemaVersion: "1", Platform: "linux", DriverVersion: "0.30.1", Overall: "ok", Checks: checks}
 }
 
 func healthEnvelope(structured json.RawMessage) json.RawMessage {
