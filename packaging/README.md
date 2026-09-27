@@ -35,7 +35,7 @@ The package owns files under `/usr`. It does not own or remove the user's Electr
 To reinstall a package file built from the reviewed source, run:
 
 ```sh
-sudo pacman -U ./personastack-0.1.0-4-x86_64.pkg.tar.zst
+sudo pacman -U ./personastack-0.1.0-5-x86_64.pkg.tar.zst
 ```
 
 This repairs package-owned files. The tray's **Repair Cua Service** action repairs only the pinned PersonaStack-managed Cua payload and leaves unrelated files untouched. It keeps remote control paused if repair fails.
