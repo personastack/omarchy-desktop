@@ -4,14 +4,14 @@
 
 Provide a desktop client for PersonaStack on Omarchy with the complete user-visible functionality of `macos-desktop`.
 
-The Electron shell and initial chat/stack bridges exist. The app is incomplete and no Omarchy profile or feature is certified. The full required behavior and completion evidence live in the active workspace plan. This spec records the repository's ownership boundaries and current desired outcome.
+The Electron shell and Go companion implement the hosted desktop session, sign-in handoffs, pop-outs, local harness setup, Desktop Control lifecycle, and bounded local executor in source. The implementation is incomplete and no Omarchy profile or feature is certified. The full parity baseline and completion evidence live in the active workspace plan. This spec records the repository's ownership boundaries and desired outcome.
 
 ## Authority
 
 - `personastack-api` owns identity, authorization, workspaces, personas, product state, enrollment and revocation.
 - `my.personastack.ai` owns authenticated hosted pages, OAuth callbacks, browser-facing composition, notifications event data and pop-out routes.
 - `mcp` and `agent-gateway` own reviewed Desktop Control tools, typed request contracts, transport and routing.
-- This client will own Linux window presentation, the finite native bridge, local harness setup, protected machine credential custody, outbound connection lifecycle, and bounded GUI, filesystem and process execution.
+- This client owns Linux window presentation, the finite native bridge, local harness setup, protected machine credential custody, outbound connection lifecycle, and bounded GUI, filesystem and process execution.
 - Hyprland and Cua own their compositor and device-control interfaces. This application must use a pinned supported driver/plugin contract and must not claim support for behavior that the tested target profile cannot provide.
 
 The client must not create a second login, authorization service, integration store, product database, realtime event authority, MCP catalog or gateway protocol.
