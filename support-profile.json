@@ -7,7 +7,7 @@
     "hyprland_version": null,
     "hyprland_abi": null,
     "electron_version": "44.4.3",
-    "window_backend": null,
+    "window_backend": "XWayland (Electron Ozone X11)",
     "secret_service_provider": null
   },
   "cua_candidate": {
