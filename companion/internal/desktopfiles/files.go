@@ -202,7 +202,11 @@ func (files *OpenFiles) Open(path string) (Opened, error) {
 		_ = file.Close()
 		return Opened{}, operationError(readErr, ErrInvalidPath)
 	}
-	textFile := readableText(sample[:n])
+	textSample := sample[:n]
+	if n == len(sample) {
+		textSample = textSample[:utf8AlignedPrefix(textSample)]
+	}
+	textFile := readableText(textSample)
 	var idBytes [16]byte
 	if _, err := rand.Read(idBytes[:]); err != nil {
 		_ = file.Close()
@@ -252,7 +256,11 @@ func (files *OpenFiles) Read(id string, offset int64, length int) (Read, error) 
 	}
 	data := buf[:n]
 	if opened.text {
-		data = data[:utf8AlignedPrefix(data)]
+		aligned := utf8AlignedPrefix(data)
+		// A byte range shorter than its first character must still make progress.
+		if aligned > 0 {
+			data = data[:aligned]
+		}
 	}
 	info, statErr := opened.file.Stat()
 	changed := statErr != nil || info.Size() != opened.size || !info.ModTime().Equal(opened.modTime)

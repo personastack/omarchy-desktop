@@ -156,7 +156,7 @@ func (m *Manager) Start(ctx context.Context, command, workingDirectory string, t
 	}
 	script := "cd -- " + shellQuote(workingDirectory) +
 		" || exit $?; trap 'wait; exit 143' TERM; trap 'wait; exit 130' INT; " +
-		command + "; _personastack_status=$?; wait; exit $_personastack_status"
+		command + "\n_personastack_status=$?; wait; exit $_personastack_status"
 	cmd := exec.Command(m.shell, "-lc", script)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = childEnvironment(os.Environ())
