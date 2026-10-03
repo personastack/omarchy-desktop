@@ -54,7 +54,7 @@ type installationService interface {
 	ReportReadiness(context.Context, string, apicontract.DesktopControlReadiness) error
 	Status(context.Context, string) (installation.Status, error)
 	LocalState(context.Context, string) (installation.LocalState, error)
-	Revoke(context.Context, string) error
+	Revoke(context.Context, string, bool) error
 }
 
 type gateway interface {
@@ -220,39 +220,9 @@ func (controller *Controller) Prepare(ctx context.Context, origin, ticket string
 	if state == desktopexecutor.SessionLockLocked {
 		return installation.LocalState{}, ErrLocked
 	}
-	if _, err := controller.runtime.Prepare(ctx); err != nil {
-		return installation.LocalState{}, fmt.Errorf("prepare Linux Cua runtime: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return installation.LocalState{}, err
-	}
-	installed, err := controller.installations.StoredInstallation(ctx, controller.origin)
-	existing := err == nil
-	if errors.Is(err, credentialstore.ErrCredentialMissing) {
-		if err := controller.installations.Enroll(ctx, ticket, apicontract.DesktopControlOperatingSystemLinux); err != nil {
-			return installation.LocalState{}, err
-		}
-		installed, err = controller.installations.StoredInstallation(ctx, controller.origin)
-	}
+	installed, err := controller.prepareInstallation(ctx, ticket)
 	if err != nil {
 		return installation.LocalState{}, err
-	}
-	if err := ctx.Err(); err != nil {
-		return installation.LocalState{}, err
-	}
-	if err := controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessReady); err != nil {
-		return installation.LocalState{}, err
-	}
-	if err := ctx.Err(); err != nil {
-		return installation.LocalState{}, err
-	}
-	if existing {
-		if err := controller.installations.Attach(ctx, controller.origin, ticket); err != nil {
-			return installation.LocalState{}, err
-		}
-		if err := ctx.Err(); err != nil {
-			return installation.LocalState{}, err
-		}
 	}
 	controller.mu.Lock()
 	controller.disconnected = false
@@ -288,6 +258,53 @@ func (controller *Controller) Prepare(ctx context.Context, origin, ticket string
 		return installation.LocalState{}, ErrSession
 	}
 	return controller.State(ctx)
+}
+
+// prepareInstallation runs only during explicit setup while prepareGate is held.
+func (controller *Controller) prepareInstallation(ctx context.Context, ticket string) (desktopcontrol.Installation, error) {
+	installed, err := controller.installations.StoredInstallation(ctx, controller.origin)
+	existing := err == nil
+	if err != nil && !errors.Is(err, credentialstore.ErrCredentialMissing) {
+		return desktopcontrol.Installation{}, err
+	}
+	if existing {
+		if _, err := controller.disconnectWithGate(ctx, false); err != nil {
+			return desktopcontrol.Installation{}, err
+		}
+	}
+	if _, prepareErr := controller.runtime.Prepare(ctx); prepareErr != nil {
+		return desktopcontrol.Installation{}, fmt.Errorf("prepare Linux Cua runtime: %w", prepareErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return desktopcontrol.Installation{}, err
+	}
+	if errors.Is(err, credentialstore.ErrCredentialMissing) {
+		if err := controller.installations.Enroll(ctx, ticket, apicontract.DesktopControlOperatingSystemLinux); err != nil {
+			return desktopcontrol.Installation{}, err
+		}
+		installed, err = controller.installations.StoredInstallation(ctx, controller.origin)
+	}
+	if err != nil {
+		return desktopcontrol.Installation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return desktopcontrol.Installation{}, err
+	}
+	if existing {
+		if err := controller.installations.Attach(ctx, controller.origin, ticket); err != nil {
+			return desktopcontrol.Installation{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return desktopcontrol.Installation{}, err
+		}
+	}
+	if err := controller.installations.ReportReadiness(ctx, controller.origin, apicontract.DesktopControlReadinessReady); err != nil {
+		return desktopcontrol.Installation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return desktopcontrol.Installation{}, err
+	}
+	return installed, nil
 }
 
 // Recover restores an enrolled installation after app restart when the API
@@ -681,8 +698,14 @@ func (controller *Controller) Disconnect(ctx context.Context) (installation.Loca
 	case <-ctx.Done():
 		return installation.LocalState{}, ctx.Err()
 	}
+	return controller.disconnectWithGate(ctx, true)
+}
+
+// disconnectWithGate also fences setup replacement while retaining its stable
+// machine credential. The caller owns prepareGate.
+func (controller *Controller) disconnectWithGate(ctx context.Context, forgetCredential bool) (installation.LocalState, error) {
 	controller.mu.Lock()
-	if controller.closed || controller.disconnecting || controller.disconnected {
+	if controller.closed || controller.disconnecting || (controller.disconnected && forgetCredential) {
 		controller.mu.Unlock()
 		return installation.LocalState{}, ErrUnavailable
 	}
@@ -767,7 +790,7 @@ func (controller *Controller) Disconnect(ctx context.Context) (installation.Loca
 		}
 		return state, ErrUnavailable
 	}
-	if err := controller.installations.Revoke(ctx, controller.origin); err != nil {
+	if err := controller.installations.Revoke(ctx, controller.origin, forgetCredential); err != nil {
 		state, stateErr := controller.LocalState(ctx, controller.origin)
 		if stateErr != nil {
 			return state, errors.Join(err, stateErr)

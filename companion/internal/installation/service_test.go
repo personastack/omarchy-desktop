@@ -278,7 +278,7 @@ func TestLifecycleOperationsPreserveAPIErrorsAndFailClosedOnInvalidStorage(t *te
 	store.loaded = installationPointer(testInstallation())
 	store.loaded.GatewayWebsocketURL = "wss://attacker.example/v1/desktop-control/ws"
 	before := len(api.calls)
-	if err := service.Revoke(context.Background(), testInstallation().EnvironmentOrigin); err != desktopcontrol.ErrInvalidRequest {
+	if err := service.Revoke(context.Background(), testInstallation().EnvironmentOrigin, true); err != desktopcontrol.ErrInvalidRequest {
 		t.Fatalf("Revoke() invalid stored credential error = %v", err)
 	}
 	if len(api.calls) != before {
@@ -353,7 +353,7 @@ func TestLifecycleOperationsDoNotReachAPIWhenCredentialStoreFails(t *testing.T) 
 		{name: "session readiness", call: func(s *Service) error {
 			return s.ReportSessionReadiness(context.Background(), installation.EnvironmentOrigin, "session", apicontract.DesktopControlReadinessLocked)
 		}},
-		{name: "revoke", call: func(s *Service) error { return s.Revoke(context.Background(), installation.EnvironmentOrigin) }},
+		{name: "revoke", call: func(s *Service) error { return s.Revoke(context.Background(), installation.EnvironmentOrigin, true) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -378,7 +378,7 @@ func TestRevokeDeletesCredentialOnlyAfterAPIRevokes(t *testing.T) {
 		apiError := errors.New("API unavailable")
 		api := &apiRecorder{errors: map[string]error{"revoke": apiError}}
 		store := &memoryStore{loaded: installationPointer(installation)}
-		if err := mustService(t, api, store).Revoke(context.Background(), installation.EnvironmentOrigin); err != apiError {
+		if err := mustService(t, api, store).Revoke(context.Background(), installation.EnvironmentOrigin, true); err != apiError {
 			t.Fatalf("Revoke() error = %v", err)
 		}
 		if len(store.deleted) != 0 {
@@ -389,7 +389,7 @@ func TestRevokeDeletesCredentialOnlyAfterAPIRevokes(t *testing.T) {
 		t.Parallel()
 		api := &apiRecorder{}
 		store := &memoryStore{loaded: installationPointer(installation), deleteErr: errors.New("keyring unavailable")}
-		if err := mustService(t, api, store).Revoke(context.Background(), installation.EnvironmentOrigin); err != credentialstore.ErrUnavailable {
+		if err := mustService(t, api, store).Revoke(context.Background(), installation.EnvironmentOrigin, true); err != credentialstore.ErrUnavailable {
 			t.Fatalf("Revoke() error = %v", err)
 		}
 		if !reflect.DeepEqual(api.calls, []string{"revoke"}) || store.deleteAttempts != 1 || len(store.deleted) != 0 {
@@ -400,7 +400,7 @@ func TestRevokeDeletesCredentialOnlyAfterAPIRevokes(t *testing.T) {
 		t.Parallel()
 		api := &apiRecorder{}
 		store := &memoryStore{loaded: installationPointer(installation)}
-		if err := mustService(t, api, store).Revoke(context.Background(), installation.EnvironmentOrigin); err != nil {
+		if err := mustService(t, api, store).Revoke(context.Background(), installation.EnvironmentOrigin, true); err != nil {
 			t.Fatalf("Revoke() error = %v", err)
 		}
 		if !reflect.DeepEqual(api.calls, []string{"revoke"}) || !reflect.DeepEqual(store.deleted, []desktopcontrol.Installation{installation}) {
@@ -531,4 +531,17 @@ func testInstallation() desktopcontrol.Installation {
 
 func installationPointer(installation desktopcontrol.Installation) *desktopcontrol.Installation {
 	return &installation
+}
+
+func TestSetupRevocationRetainsMachineCredential(t *testing.T) {
+	t.Parallel()
+	installation := testInstallation()
+	api := &apiRecorder{}
+	store := &memoryStore{loaded: installationPointer(installation)}
+	if err := mustService(t, api, store).Revoke(context.Background(), installation.EnvironmentOrigin, false); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(api.calls, []string{"revoke"}) || store.deleteAttempts != 0 || store.loaded == nil || *store.loaded != installation {
+		t.Fatalf("setup revoke did not retain its authenticated installation: calls=%v deleted=%d", api.calls, store.deleteAttempts)
+	}
 }

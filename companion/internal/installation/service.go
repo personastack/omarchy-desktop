@@ -181,7 +181,7 @@ func (s *Service) ReportSessionReadiness(ctx context.Context, origin, sessionID 
 	return s.api.ReportSessionReadiness(ctx, installation, sessionID, readiness)
 }
 
-func (s *Service) Revoke(ctx context.Context, origin string) error {
+func (s *Service) Revoke(ctx context.Context, origin string, forgetCredential bool) error {
 	installation, err := s.load(ctx, origin)
 	if err != nil {
 		return err
@@ -189,8 +189,10 @@ func (s *Service) Revoke(ctx context.Context, origin string) error {
 	if err := s.api.Revoke(ctx, installation); err != nil {
 		return err
 	}
-	if err := s.store.Delete(ctx, installation); err != nil {
-		return credentialstore.ErrUnavailable
+	if forgetCredential {
+		if err := s.store.Delete(ctx, installation); err != nil {
+			return credentialstore.ErrUnavailable
+		}
 	}
 	return nil
 }

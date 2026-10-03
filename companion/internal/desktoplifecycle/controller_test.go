@@ -159,18 +159,19 @@ func (service *installServiceFake) Enroll(_ context.Context, _ string, operating
 func (service *installServiceFake) Attach(context.Context, string, string) error {
 	service.mu.Lock()
 	service.attached++
+	service.readiness = append(service.readiness, apicontract.DesktopControlReadinessUnknown)
 	service.mu.Unlock()
 	return nil
 }
 
-func (service *installServiceFake) Revoke(context.Context, string) error {
+func (service *installServiceFake) Revoke(_ context.Context, _ string, forgetCredential bool) error {
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	service.revoked++
 	if service.revokeErr != nil {
 		return service.revokeErr
 	}
-	service.missing = true
+	service.missing = forgetCredential
 	service.active = false
 	return nil
 }
@@ -870,7 +871,7 @@ func TestRepairSerializesPauseUntilItsResumeCompletes(t *testing.T) {
 	t.Parallel()
 	preference := &pausePreferenceFake{}
 	runtime := &runtimeFake{}
-	service := &installServiceFake{active: true}
+	service := &installServiceFake{missing: true, active: true}
 	connection := &gatewayFake{closed: make(chan struct{})}
 	controller, err := New(Options{
 		Origin: testOrigin, Runtime: runtime, Installations: service,
@@ -1749,8 +1750,8 @@ func TestPrepareConnectsThroughGatewayOwnedSessionLifecycle(t *testing.T) {
 	t.Parallel()
 	runtime := &runtimeFake{}
 	service := &installServiceFake{active: true, statusErr: errors.New("API status unavailable"), record: make(chan string, 4), claimReady: make(chan struct{}), installation: desktopcontrol.Installation{
-		InstallationID: "install_01", MachineCredential: "secret", EnvironmentOrigin: testOrigin,
-		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
+		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
 	}}
 	connection := &gatewayFake{closed: make(chan struct{}), record: service.record}
 	var handler desktopgateway.CommandHandler
@@ -1806,8 +1807,8 @@ func TestGatewayHandlerScopesRevocationAndDeniesUnleasedCallsWithoutEffects(t *t
 	runtime := &runtimeFake{}
 	local := &recordingLocalOperations{}
 	service := &installServiceFake{active: true, installation: desktopcontrol.Installation{
-		InstallationID: "install_01", MachineCredential: "secret", EnvironmentOrigin: testOrigin,
-		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
+		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
 	}}
 	connection := &gatewayFake{closed: make(chan struct{})}
 	var handler desktopgateway.CommandHandler
@@ -1930,8 +1931,8 @@ func TestPrepareWaitsForGatewayHeartbeatAcknowledgement(t *testing.T) {
 	t.Parallel()
 	runtime := &runtimeFake{}
 	service := &installServiceFake{active: true, installation: desktopcontrol.Installation{
-		InstallationID: "install_01", MachineCredential: "secret", EnvironmentOrigin: testOrigin,
-		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
+		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
 	}}
 	connection := &gatewayFake{closed: make(chan struct{}), deferAck: true, readyWritten: make(chan struct{})}
 	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}}
@@ -1974,8 +1975,8 @@ func TestPrepareRejectsLockTransitionBeforeGatewayAcknowledgement(t *testing.T) 
 	t.Parallel()
 	runtime := &runtimeFake{}
 	service := &installServiceFake{active: true, installation: desktopcontrol.Installation{
-		InstallationID: "install_01", MachineCredential: "secret", EnvironmentOrigin: testOrigin,
-		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
+		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
 	}}
 	connection := &gatewayFake{closed: make(chan struct{}), deferAck: true, readyWritten: make(chan struct{})}
 	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}}
@@ -2011,16 +2012,16 @@ func TestPrepareRejectsLockTransitionBeforeGatewayAcknowledgement(t *testing.T) 
 	}
 }
 
-func TestPrepareReusesGatewayForAnotherWorkspace(t *testing.T) {
+func TestPrepareReconnectsGatewayAfterReplacingWorkspace(t *testing.T) {
 	t.Parallel()
 	runtime := &runtimeFake{}
 	service := &installServiceFake{active: true, installation: desktopcontrol.Installation{
-		InstallationID: "install_01", MachineCredential: "secret", EnvironmentOrigin: testOrigin,
-		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
+		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
 	}}
-	connection := &gatewayFake{closed: make(chan struct{}), record: make(chan string, 4)}
+	record := make(chan string, 16)
 	controller := newTestController(t, runtime, service, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, func(_ desktopcontrol.Installation, _ string, _ desktopgateway.CommandHandler, _ desktopgateway.DiagnosticsProvider) (gateway, error) {
-		return connection, nil
+		return &gatewayFake{closed: make(chan struct{}), record: record}, nil
 	})
 	for range 2 {
 		state, err := controller.Prepare(context.Background(), testOrigin, "ticket")
@@ -2032,13 +2033,13 @@ func TestPrepareReusesGatewayForAnotherWorkspace(t *testing.T) {
 		t.Fatalf("Attach calls = %d, want 2", service.attached)
 	}
 	var connects int
-	for len(connection.record) > 0 {
-		if <-connection.record == "connect" {
+	for len(record) > 0 {
+		if <-record == "connect" {
 			connects++
 		}
 	}
-	if connects != 1 {
-		t.Fatalf("Gateway connects = %d, want 1", connects)
+	if connects != 2 {
+		t.Fatalf("Gateway connects = %d, want 2", connects)
 	}
 }
 
@@ -2046,8 +2047,8 @@ func TestRecoverRestoresAnActiveInstallation(t *testing.T) {
 	t.Parallel()
 	runtime := &runtimeFake{}
 	service := &installServiceFake{active: true, installation: desktopcontrol.Installation{
-		InstallationID: "install_01", MachineCredential: "secret", EnvironmentOrigin: testOrigin,
-		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
+		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
 	}}
 	connection := &gatewayFake{closed: make(chan struct{})}
 	controller := newTestController(t, runtime, service, lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, func(_ desktopcontrol.Installation, _ string, _ desktopgateway.CommandHandler, _ desktopgateway.DiagnosticsProvider) (gateway, error) {
@@ -2211,8 +2212,8 @@ func TestStartupIdleInstallationReconnectsWhenMappingBecomesActive(t *testing.T)
 	t.Parallel()
 	runtime := &runtimeFake{}
 	service := &installServiceFake{installation: desktopcontrol.Installation{
-		InstallationID: "install_01", MachineCredential: "secret", EnvironmentOrigin: testOrigin,
-		GatewayWebsocketURL: "wss://my.personastack.ai/v1/desktop-control/gateway",
+		InstallationID: "install_01", MachineCredential: strings.Repeat("A", 43), EnvironmentOrigin: testOrigin,
+		GatewayWebsocketURL: "wss://cluster-agent.personastack.ai/v1/desktop-control/ws",
 	}}
 	connection := &gatewayFake{closed: make(chan struct{})}
 	options := Options{Origin: testOrigin, Runtime: runtime, Installations: service, LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}, ReconnectEvery: 10 * time.Millisecond}
@@ -2317,4 +2318,34 @@ func newTestControllerWithLocal(t *testing.T, runtime cuaRuntime, service *insta
 	}
 	t.Cleanup(func() { controller.Close(context.Background()) })
 	return controller
+}
+
+func TestPrepareReplacementRevokesRetainsAttachesThenReportsReady(t *testing.T) {
+	t.Parallel()
+	service := &installServiceFake{missing: true}
+	if err := service.Enroll(context.Background(), "old-ticket", apicontract.DesktopControlOperatingSystemLinux); err != nil {
+		t.Fatal(err)
+	}
+	service.active = true
+	previous := service.installation
+	options := Options{Origin: testOrigin, Runtime: &runtimeFake{}, Installations: service,
+		LockProbe: lockProbeFake{state: desktopexecutor.SessionLockUnlocked}, Local: localOperationsFake{}, PausePreference: &pausePreferenceFake{}}
+	options.NewLockMonitor = func(LockStateSink, time.Duration) (LockMonitor, error) { return lockMonitorIdle{}, nil }
+	options.NewGateway = func(got desktopcontrol.Installation, _ string, _ desktopgateway.CommandHandler, _ desktopgateway.DiagnosticsProvider) (gateway, error) {
+		service.mu.Lock()
+		defer service.mu.Unlock()
+		if got != previous || service.revoked != 1 || service.attached != 1 || service.missing ||
+			len(service.readiness) < 2 || service.readiness[len(service.readiness)-1] != apicontract.DesktopControlReadinessReady {
+			t.Errorf("replacement connected before revoke/attach/readiness: revoked=%d attached=%d missing=%t readiness=%v", service.revoked, service.attached, service.missing, service.readiness)
+		}
+		return &gatewayFake{closed: make(chan struct{})}, nil
+	}
+	controller, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controller.Close(context.Background()) })
+	if _, err := controller.Prepare(context.Background(), testOrigin, "replacement-ticket"); err != nil {
+		t.Fatal(err)
+	}
 }
