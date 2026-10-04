@@ -15,33 +15,34 @@ class WebContentsFake implements HostedChatCloseWindow {
   }
 }
 
-test("native close delegates to the hosted API-backed close path", async () => {
+test("native close retires locally without invoking hosted JavaScript", async () => {
   const contents = new WebContentsFake();
   let nativeCloseCount = 0;
 
   await delegateChatWindowClose(contents, () => { nativeCloseCount += 1; });
 
-  assert.equal(contents.scripts.length, 1);
-  assert.match(contents.scripts[0] ?? "", /personastackDesktopClose/);
-  assert.equal(nativeCloseCount, 0);
+  assert.equal(contents.scripts.length, 0);
+  assert.equal(nativeCloseCount, 1);
 });
 
-test("native close falls back when the hosted close bridge is unavailable", async () => {
+test("native close does not require a hosted close bridge", async () => {
   const contents = new WebContentsFake();
   contents.result = false;
   let nativeCloseCount = 0;
 
   await delegateChatWindowClose(contents, () => { nativeCloseCount += 1; });
 
+  assert.equal(contents.scripts.length, 0);
   assert.equal(nativeCloseCount, 1);
 });
 
-test("native close falls back when renderer execution fails", async () => {
+test("native close does not execute an unresponsive renderer", async () => {
   const contents = new WebContentsFake();
   contents.failure = new Error("renderer gone");
   let nativeCloseCount = 0;
 
   await delegateChatWindowClose(contents, () => { nativeCloseCount += 1; });
 
+  assert.equal(contents.scripts.length, 0);
   assert.equal(nativeCloseCount, 1);
 });
