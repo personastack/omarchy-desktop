@@ -9,7 +9,7 @@ If you started with only this repository, prepare the main workspace and all pee
 
 Fetch `origin` separately in every repository the task will inspect or change. Fetching `agent-root` does not fetch this repository or its peers. Inspect local changes before fetching and preserve them; do not merge or overwrite changes automatically.
 
-Read `SPEC.md` and `../plans/omarchy-desktop/in-progress/2026-09-26/full-macos-parity.md` before changing the desktop contract. The macOS desktop app, API clients, hosted UI and MCP catalog remain the behavioral and contract authorities.
+Read `SPEC.md` and `../plans/in-progress/omarchy-desktop/2026-09-26/full-macos-parity.md` before changing the desktop contract. The macOS desktop app, API clients, hosted UI and MCP catalog remain the behavioral and contract authorities.
 
 ## Current milestone
 
